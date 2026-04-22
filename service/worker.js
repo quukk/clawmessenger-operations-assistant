@@ -4,6 +4,9 @@ const path = require('path');
 const os = require('os');
 const { createLogger } = require('./logger');
 const { RongCloudClient, MessageHandler, ensurePluginsAllow } = require('./rongcloud');
+const { BusinessMessageHandler } = require('./modules/business-message-handler');
+const { OpenClawClient } = require('./rongcloud/openclaw-client');
+const { handleNormalMessage } = require('./modules/normal-message-handler');
 
 const log = createLogger('worker');
 const PORT = 33100;
@@ -67,6 +70,39 @@ async function initRongCloud() {
   await ensurePluginsAllow(log);
 
   rongcloudClient = new RongCloudClient(rongcloudConfig, log);
+
+  // 创建业务消息处理器
+  const businessMessageHandler = new BusinessMessageHandler(
+    rongcloudConfig,
+    rongcloudClient,
+    log
+  );
+
+  // 注入命令处理回调
+  // 被调用位置：rongcloud/message-handler.js 第93行
+  rongcloudConfig.onCommand = async (payload) => {
+    return await businessMessageHandler.handleCommand(payload);
+  };
+
+  // Monkey Patch: 替换 OpenClawClient.chat 方法
+  // 被调用位置：rongcloud/message-handler.js 第109行（handleNormal 方法）
+  // 原始代码：const reply = await this.openclawClient.chat(msg.content, msg.senderUserId);
+  // 由于 handleNormal 被注释掉了，但如果将来启用，会调用这个方法
+  // 我们将 chat 方法替换为直接调用我们的 handleNormalMessage
+  OpenClawClient.prototype.chat = async function(content, senderUserId) {
+    // 构造 msg 对象，与 handleNormal 的 msg 参数格式一致
+    const msg = {
+      content: content,
+      senderUserId: senderUserId,
+      targetId: senderUserId,
+      conversationType: 1, // 私聊
+      messageType: 'RC:TxtMsg',
+      isOffLineMessage: false,
+      messageUId: `local-${Date.now()}`,
+      sentTime: Date.now()
+    };
+    return await handleNormalMessage(msg);
+  };
 
   messageHandler = new MessageHandler(
     rongcloudConfig,
