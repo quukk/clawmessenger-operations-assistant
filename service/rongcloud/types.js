@@ -1,6 +1,7 @@
 const MessageType = {
   COMMAND: 'command',
-  NORMAL: 'normal'
+  NORMAL: 'normal',
+  CLAW: 'claw'
 };
 
 module.exports = {
