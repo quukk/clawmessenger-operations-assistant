@@ -66,8 +66,8 @@ class MessageHandler {
       if (type === MessageType.NORMAL) {
         // await this.handleNormal(msg);
         await this.handleNormalMessage(msg);
-      } else if (type === MessageType.CLAW) {
-        await this.handleClaw(msg);
+      } else {
+        await this.handleCommand(msg);
       }
     } catch (err) {
       this.log?.error(`[MessageHandler] 处理消息异常: ${err.message}`);
@@ -86,7 +86,6 @@ class MessageHandler {
     }
     return msg.senderUserId;
   }
-
 
   async handleCommand(msg) {
     const payload = this.parseCommand(msg.content, msg.senderUserId);
@@ -108,11 +107,11 @@ class MessageHandler {
     await this.sendFn(targetId, reply, msg.conversationType);
   }
 
-  async handleClaw(msg) {
-    const reply = await this.openclawClient.chat(msg.content, msg.senderUserId);
-    this.log?.info(`[MessageHandler] AI 回复: ${reply.substring(0, 50)}...`);
-    const targetId = this.getReplyTarget(msg);
-    await this.sendFn(targetId, reply, msg.conversationType);
+  async handleNormal(msg) {
+    // const reply = await this.openclawClient.chat(msg.content, msg.senderUserId);
+    // this.log?.info(`[MessageHandler] AI 回复: ${reply.substring(0, 50)}...`);
+    // const targetId = this.getReplyTarget(msg);
+    // await this.sendFn(targetId, reply, msg.conversationType);
   }
 
   parseCommand(raw, senderId) {

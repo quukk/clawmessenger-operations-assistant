@@ -8,7 +8,11 @@ const { BusinessMessageHandler } = require('./modules/business-message-handler')
 const { OpenClawClient } = require('./rongcloud/openclaw-client');
 const { handleNormalMessage } = require('./modules/normal-message-handler');
 const { RongyunMessageSender } = require('./modules/rongyun-message-sender');
+const { HeartbeatManager, DashboardReporter } = require('./modules/heartbeat-dashboard');
 const { getOpenClawStatus } = require('./modules/port-checker');
+const { getMacAddress } = require('./modules/mac-address');
+const { StructuredMessageRouter } = require('./modules/structured-message-router');
+const { RongyunMessageTypeEnum } = require('./modules/rongyun-message-types');
 
 const log = createLogger('worker');
 const PORT = 33100;
@@ -129,18 +133,17 @@ async function initRongCloud() {
       log.error(`[WORKER] 发送 CLIENT_CONNECTED 失败: ${err.message}`);
     }
     
-    // 启动心跳定时器
-    const heartbeatInterval = (rongcloudConfig.heartbeatInterval || 20) * 1000;
-    setInterval(async () => {
-      try {
-        const status = await getOpenClawStatus(rongcloudConfig.openclawPort || 18789);
-        await messageSender.sendHeartbeat(status);
-        log.info('[WORKER] 心跳已发送');
-      } catch (err) {
-        log.error(`[WORKER] 心跳发送失败: ${err.message}`);
-      }
-    }, heartbeatInterval);
-    log.info(`[WORKER] 心跳定时器已启动，间隔: ${heartbeatInterval}ms`);
+    // 启动心跳管理器
+    const heartbeatManager = new HeartbeatManager(rongcloudClient, rongcloudConfig, log);
+    heartbeatManager.start(getMacAddress, getOpenClawStatus);
+    
+    // 启动仪表盘上报
+    const dashboardReporter = new DashboardReporter(rongcloudClient, rongcloudConfig, log);
+    dashboardReporter.start(getMacAddress);
+    
+    // 保存引用以便关闭时停止
+    global.heartbeatManager = heartbeatManager;
+    global.dashboardReporter = dashboardReporter;
     
   } else {
     log.error('[WORKER] 融云连接失败');
@@ -148,6 +151,14 @@ async function initRongCloud() {
 }
 
 async function shutdownRongCloud() {
+  // 停止心跳和仪表盘上报
+  if (global.heartbeatManager) {
+    global.heartbeatManager.stop();
+  }
+  if (global.dashboardReporter) {
+    global.dashboardReporter.stop();
+  }
+  
   if (rongcloudClient) {
     // 发送 CLIENT_DISCONNECTED
     try {
