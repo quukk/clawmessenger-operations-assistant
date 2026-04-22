@@ -4,15 +4,12 @@ const path = require('path');
 const os = require('os');
 const { createLogger } = require('./logger');
 const { RongCloudClient, MessageHandler, ensurePluginsAllow } = require('./rongcloud');
-const { BusinessMessageHandler } = require('./modules/business-message-handler');
-const { OpenClawClient } = require('./rongcloud/openclaw-client');
-const { handleNormalMessage } = require('./modules/normal-message-handler');
+const { RongyunMessageHandler } = require('./modules/rongyun-message-handler');
 const { RongyunMessageSender } = require('./modules/rongyun-message-sender');
 const { HeartbeatManager, DashboardReporter } = require('./modules/heartbeat-dashboard');
 const { getOpenClawStatus } = require('./modules/port-checker');
 const { getMacAddress } = require('./modules/mac-address');
-const { StructuredMessageRouter } = require('./modules/structured-message-router');
-const { RongyunMessageTypeEnum } = require('./modules/rongyun-message-types');
+const { startOpencodeService, stopOpencodeService } = require('./modules/opencode-starter');
 
 const log = createLogger('worker');
 const PORT = 33100;
@@ -73,42 +70,24 @@ let messageHandler = null;
 async function initRongCloud() {
   if (!rongcloudConfig) return;
 
+  // 启动 opencode 服务（与桌面客户端对齐）
+  log.info('[WORKER] 启动 opencode 服务...');
+  try {
+    await startOpencodeService(log);
+  } catch (err) {
+    log.error(`[WORKER] 启动 opencode 服务失败: ${err.message}`);
+  }
+
   await ensurePluginsAllow(log);
 
   rongcloudClient = new RongCloudClient(rongcloudConfig, log);
 
-  // 创建业务消息处理器
-  const businessMessageHandler = new BusinessMessageHandler(
-    rongcloudConfig,
-    rongcloudClient,
-    log
-  );
+  // 创建消息发送器
+  const messageSender = new RongyunMessageSender(rongcloudClient, rongcloudConfig, log);
 
-  // 注入命令处理回调
-  // 被调用位置：rongcloud/message-handler.js 第93行
-  rongcloudConfig.onCommand = async (payload) => {
-    return await businessMessageHandler.handleCommand(payload);
-  };
-
-  // Monkey Patch: 替换 OpenClawClient.chat 方法
-  // 被调用位置：rongcloud/message-handler.js 第109行（handleNormal 方法）
-  // 原始代码：const reply = await this.openclawClient.chat(msg.content, msg.senderUserId);
-  // 由于 handleNormal 被注释掉了，但如果将来启用，会调用这个方法
-  // 我们将 chat 方法替换为直接调用我们的 handleNormalMessage
-  OpenClawClient.prototype.chat = async function(content, senderUserId) {
-    // 构造 msg 对象，与 handleNormal 的 msg 参数格式一致
-    const msg = {
-      content: content,
-      senderUserId: senderUserId,
-      targetId: senderUserId,
-      conversationType: 1, // 私聊
-      messageType: 'RC:TxtMsg',
-      isOffLineMessage: false,
-      messageUId: `local-${Date.now()}`,
-      sentTime: Date.now()
-    };
-    return await handleNormalMessage(msg);
-  };
+  // 创建新的融云消息处理器（与桌面客户端对齐）
+  const rongyunMessageHandler = new RongyunMessageHandler(rongcloudClient, rongcloudConfig, log);
+  rongyunMessageHandler.setMessageSender(messageSender);
 
   messageHandler = new MessageHandler(
     rongcloudConfig,
@@ -119,35 +98,20 @@ async function initRongCloud() {
   );
 
   // 包装 MessageHandler.handleMessage 以处理结构化消息
-  // 问题：rongcloud-client.js 现在会传递所有消息（SYSTEM_MSG_TYPES 已清空）
-  // 但 message-handler.js 的 getMessageType() 只检查 content 是否以 '/' 开头
-  // 结构化消息（如 command）的 content 是 JSON 字符串，不以 '/' 开头
-  // 导致所有结构化消息被当作 NORMAL 消息处理
-  // 解决方案：在 handleMessage 之前拦截，检查是否是结构化消息
   const originalHandleMessage = messageHandler.handleMessage.bind(messageHandler);
   
-  // 添加调试日志：确认包装器已设置
-  log.info('[WORKER-DEBUG] 包装器已设置，originalHandleMessage 类型: ' + typeof originalHandleMessage);
-  log.info('[WORKER-DEBUG] messageHandler.handleMessage 类型: ' + typeof messageHandler.handleMessage);
-  
   messageHandler.handleMessage = async (msg) => {
-    log.info(`[WORKER-DEBUG] 包装器被调用，msg.content 前50字符: ${msg.content?.substring(0, 50)}`);
-    log.info(`[WORKER-DEBUG] msg.senderUserId: ${msg.senderUserId}`);
-    
     // 检查是否是结构化消息
     if (msg.content && typeof msg.content === 'string') {
-      log.info('[WORKER-DEBUG] content 是字符串，尝试解析 JSON');
       try {
         const parsed = JSON.parse(msg.content);
-        log.info(`[WORKER-DEBUG] JSON 解析成功，parsed.msg_type: ${parsed.msg_type}`);
         
         if (parsed.msg_type) {
-          // 这是结构化消息，根据 msg_type 路由
+          // 这是结构化消息，使用 RongyunMessageHandler 处理
           log.info(`[WORKER] 收到结构化消息: type=${parsed.msg_type}, from=${parsed.source_im_id || msg.senderUserId}`);
           
           // 忽略自己发送的消息
           if (parsed.source_im_id === rongcloudConfig.accountId) {
-            log.info('[WORKER] 忽略自己发送的消息');
             return;
           }
           
@@ -156,90 +120,36 @@ async function initRongCloud() {
           if (typeof innerContent === 'string') {
             try {
               innerContent = JSON.parse(innerContent);
-              log.info('[WORKER-DEBUG] innerContent 解析为 JSON 成功');
             } catch {
-              log.info('[WORKER-DEBUG] innerContent 保持字符串');
+              // 保持字符串
             }
           }
           
+          // 构建消息数据
+          // 注意：后端发送的 command 消息中，command/command_id/request_id 在 content 字段内
           const messageData = {
             ...parsed,
+            ...innerContent,  // 展开 content 中的字段（如 command, command_id 等）
             content: innerContent,
             senderUserId: parsed.source_im_id || msg.senderUserId,
             targetId: msg.targetId,
             conversationType: msg.conversationType,
           };
           
-          // 根据 msg_type 处理
-          switch (parsed.msg_type) {
-            case RongyunMessageTypeEnum.COMMAND:
-              log.info(`[WORKER] 处理命令消息: command=${innerContent.command}`);
-              if (rongcloudConfig.onCommand) {
-                // 后端发送的 command 是数字枚举值（1=start, 2=stop, 3=restart, 4=status）
-                // 与桌面客户端保持一致
-                const payload = {
-                  command: innerContent.command,  // 直接传递数字
-                  args: innerContent.args || [],
-                  rawMessage: msg.content,
-                  senderId: messageData.senderUserId,
-                  commandId: innerContent.command_id,
-                };
-                try {
-                  const reply = await rongcloudConfig.onCommand(payload);
-                  // 发送回复
-                  const targetId = msg.conversationType === 3 ? msg.targetId : msg.senderUserId;
-                  await rongcloudClient.sendMessage(targetId, reply, msg.conversationType);
-                } catch (err) {
-                  log.error(`[WORKER] 命令处理异常: ${err.message}`);
-                }
-              }
-              return;
-              
-            case RongyunMessageTypeEnum.CHAT_MESSAGE:
-              log.info(`[WORKER] 处理聊天消息`);
-              // 调用 normal message handler
-              try {
-                const reply = await handleNormalMessage({
-                  content: typeof innerContent === 'string' ? innerContent : JSON.stringify(innerContent),
-                  senderUserId: messageData.senderUserId,
-                  targetId: msg.targetId,
-                  conversationType: msg.conversationType,
-                  messageType: 'RC:TxtMsg',
-                });
-                // 发送回复
-                const targetId = msg.conversationType === 3 ? msg.targetId : msg.senderUserId;
-                await rongcloudClient.sendMessage(targetId, reply, msg.conversationType);
-              } catch (err) {
-                log.error(`[WORKER] 聊天消息处理异常: ${err.message}`);
-              }
-              return;
-              
-            case RongyunMessageTypeEnum.CREATE_OPENCODE_SESSION:
-              log.info(`[WORKER] 处理创建会话消息`);
-              // TODO: 实现创建会话逻辑
-              return;
-              
-            case RongyunMessageTypeEnum.DELETE_OPENCODE_SESSION:
-              log.info(`[WORKER] 处理删除会话消息`);
-              // TODO: 实现删除会话逻辑
-              return;
-              
-            default:
-              log.warn(`[WORKER] 未知消息类型: ${parsed.msg_type}`);
-              // 继续传给原始 handler
+          // 使用 RongyunMessageHandler 处理
+          try {
+            await rongyunMessageHandler.handle(messageData);
+          } catch (err) {
+            log.error(`[WORKER] RongyunMessageHandler 处理异常: ${err.message}`);
           }
-        } else {
-          log.info('[WORKER-DEBUG] parsed.msg_type 不存在，不是结构化消息');
+          return;
         }
-      } catch (err) {
-        log.info(`[WORKER-DEBUG] JSON 解析失败，是普通消息: ${err.message}`);
+      } catch {
+        // 不是 JSON，是普通消息，继续传给原始 handler
       }
-    } else {
-      log.info(`[WORKER-DEBUG] content 不是字符串或为空: ${typeof msg.content}`);
     }
     
-    log.info('[WORKER-DEBUG] 调用原始 handleMessage');
-    // 调用原始的 handleMessage
+    // 调用原始的 handleMessage（处理普通消息）
     return originalHandleMessage(msg);
   };
   
@@ -249,9 +159,6 @@ async function initRongCloud() {
   const connected = await rongcloudClient.connect(messageHandler);
   if (connected) {
     log.info('[WORKER] 融云连接成功');
-    
-    // 创建消息发送器
-    const messageSender = new RongyunMessageSender(rongcloudClient, rongcloudConfig, log);
     
     // 发送 CLIENT_CONNECTED
     try {
@@ -300,6 +207,9 @@ async function shutdownRongCloud() {
     await rongcloudClient.disconnect();
     log.info('[WORKER] 融云已断开');
   }
+  
+  // 停止 opencode 服务
+  stopOpencodeService(log);
 }
 
 initRongCloud().catch(err => {
