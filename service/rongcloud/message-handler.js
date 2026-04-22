@@ -29,7 +29,8 @@ class MessageHandler {
       return false;
     }
 
-    if (msg.messageType !== 'RC:TxtMsg') {
+    const allowedTypes = ['RC:TxtMsg', 'claw'];
+    if (!allowedTypes.includes(msg.messageType)) {
       this.log?.info(`[MessageHandler] 忽略非文本消息: ${msg.messageType}`);
       return false;
     }
@@ -60,14 +61,13 @@ class MessageHandler {
     }
 
     try {
-      const type = this.getMessageType(msg.content);
+      const type = this.getMessageType(msg);
       this.log?.info(`[MessageHandler] 收到消息 from=${msg.senderUserId}, type=${type}, content=${msg.content.substring(0, 50)}`);
-
-      if (type === MessageType.NORMAL) {
-        // await this.handleNormal(msg);
-        await this.handleNormalMessage(msg);
+      if (msg.messageType === 'claw') {
+        this.log?.info(`收到龙虾消息，交由 OpenClawClient 处理`);
+        await this.handleClaw(msg);
       } else {
-        await this.handleCommand(msg);
+        await this.handleNormalMessage(msg);
       }
     } catch (err) {
       this.log?.error(`[MessageHandler] 处理消息异常: ${err.message}`);
@@ -76,8 +76,14 @@ class MessageHandler {
     }
   }
 
-  getMessageType(content) {
-    return content.startsWith('/') ? MessageType.COMMAND : MessageType.NORMAL;
+  getMessageType(msg) {
+    if (msg.messageType === 'claw') {
+      return MessageType.CLAW;
+    }
+    if (msg.content && msg.content.startsWith('/')) {
+      return MessageType.COMMAND;
+    }
+    return MessageType.NORMAL;
   }
 
   getReplyTarget(msg) {
@@ -107,11 +113,11 @@ class MessageHandler {
     await this.sendFn(targetId, reply, msg.conversationType);
   }
 
-  async handleNormal(msg) {
-    // const reply = await this.openclawClient.chat(msg.content, msg.senderUserId);
-    // this.log?.info(`[MessageHandler] AI 回复: ${reply.substring(0, 50)}...`);
-    // const targetId = this.getReplyTarget(msg);
-    // await this.sendFn(targetId, reply, msg.conversationType);
+  async handleClaw(msg) {
+    const reply = await this.openclawClient.chat(msg.content, msg.senderUserId);
+    this.log?.info(`[MessageHandler] AI 回复: ${reply.substring(0, 50)}...`);
+    const targetId = this.getReplyTarget(msg);
+    await this.sendFn(targetId, reply, msg.conversationType);
   }
 
   parseCommand(raw, senderId) {

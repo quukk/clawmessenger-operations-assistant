@@ -96,13 +96,24 @@ class RongCloudClient {
   }
 
   handleReceivedMessage(message) {
+    if (message.isOffLineMessage) {
+      return;
+    }
+
     try {
       const msgType = message.messageType;
-      const content = message.content?.content || message.content || '';
+      let rawContent = message.content;
+
+      // 自定义消息 content 可能是对象，提取文本内容
+      if (rawContent && typeof rawContent === 'object') {
+        rawContent = rawContent.content || rawContent.text || JSON.stringify(rawContent);
+      }
+
+      const content = rawContent || '';
 
       this.log?.info(`[RongCloudClient] 收到消息: type=${msgType}, from=${message.senderUserId}`);
 
-      if (!content || !content.trim()) {
+      if (!content || !content.trim || !content.trim()) {
         return;
       }
 
@@ -124,7 +135,7 @@ class RongCloudClient {
         ? (parsed.content || parsed.text || JSON.stringify(parsed))
         : content;
 
-      if (!userContent || !userContent.trim()) {
+      if (!userContent || !userContent.trim || !userContent.trim()) {
         return;
       }
 

@@ -9,10 +9,11 @@
     "dev": "nodemon cli.js --run"
   },
   "dependencies": {
-    "node-windows": "^1.0.0-beta.8",
     "@rongcloud/imlib-next": "^5.36.6",
+    "axios": "^1.15.2",
     "fake-indexeddb": "^6.2.5",
     "jsdom": "^24.0.0",
+    "node-windows": "^1.0.0-beta.8",
     "ws": "^8.16.0"
   },
   "engines": {
