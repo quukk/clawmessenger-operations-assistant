@@ -6,7 +6,7 @@
   "scripts": {
     "install-service": "node scripts/install-silent.js",
     "uninstall-service": "node scripts/uninstall.js",
-    "dev": "node service/daemon.js"
+    "dev": "nodemon cli.js --run"
   },
   "dependencies": {
     "node-windows": "^1.0.0-beta.8",
