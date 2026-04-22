@@ -35,15 +35,25 @@ class BusinessMessageHandler {
     this.log?.info(`[BusinessMessageHandler] 收到命令: ${payload.command}, args=${JSON.stringify(payload.args)}`);
     
     try {
-      // 将命令名称映射到枚举值
+      // 将命令名称或枚举值映射到枚举值
+      // 后端可能发送字符串（如 "start"）或整数（如 1）
       const commandMap = {
         'start': OpenClawCommandEnum.START,
         'stop': OpenClawCommandEnum.STOP,
         'status': OpenClawCommandEnum.STATUS,
-        'restart': OpenClawCommandEnum.RESTART
+        'restart': OpenClawCommandEnum.RESTART,
+        1: OpenClawCommandEnum.START,
+        2: OpenClawCommandEnum.STOP,
+        3: OpenClawCommandEnum.RESTART,
+        4: OpenClawCommandEnum.STATUS
       };
       
-      const command = commandMap[payload.command.toLowerCase()];
+      // 支持字符串和整数命令
+      const commandKey = typeof payload.command === 'string' 
+        ? payload.command.toLowerCase() 
+        : payload.command;
+      
+      const command = commandMap[commandKey];
       if (!command) {
         return `未知命令: ${payload.command}\n可用命令: start, stop, status, restart`;
       }
