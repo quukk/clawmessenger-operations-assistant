@@ -331,7 +331,8 @@ class Updater {
           }
         }
       } catch (err) {
-        log.error(`[UPDATER] 定时检查异常: ${err.message}`);
+        // log.error(`[UPDATER] 定时检查异常: ${err.message}`);
+        log.error(`[UPDATER] 定时检查异常: ${err}`);
       }
     };
 
