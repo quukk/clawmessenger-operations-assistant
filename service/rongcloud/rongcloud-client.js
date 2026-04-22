@@ -51,6 +51,14 @@ class RongCloudClient {
     this.log?.info('[RongCloudClient] 初始化 SDK...');
     RongIMLib.init({ appkey: this.config.appKey });
 
+    // 注册自定义消息类型（必须在 connect 之前注册）
+    try {
+      RongIMLib.registerMessageType('claw', true, true);
+      this.log?.info('[RongCloudClient] claw 消息类型注册成功');
+    } catch (error) {
+      this.log?.error('[RongCloudClient] claw 消息类型注册失败:', error);
+    }
+
     this.log?.info(`[RongCloudClient] SDK Events: ${JSON.stringify(Object.keys(RongIMLib.Events || {}))}`);
     this.log?.info(`[RongCloudClient] has addEventListener: ${typeof RongIMLib.addEventListener === 'function'}`);
 
