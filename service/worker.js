@@ -1,0 +1,158 @@
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { createLogger } = require('./logger');
+const { RongCloudClient, MessageHandler, ensurePluginsAllow } = require('./rongcloud');
+
+const log = createLogger('worker');
+const PORT = 33100;
+
+log.info(`[WORKER] 业务进程启动，PID: ${process.pid}`);
+
+const clawBridgeConfigPath = path.join(os.homedir(), '.claw-bridge', 'config.json');
+const localConfigPath = path.join(__dirname, '..', 'rongcloud-config.json');
+let rongcloudConfig = null;
+
+function loadRongCloudConfig() {
+  let config = {};
+
+  try {
+    if (fs.existsSync(clawBridgeConfigPath)) {
+      const clawConfig = JSON.parse(fs.readFileSync(clawBridgeConfigPath, 'utf8'));
+      config.token = clawConfig.token;
+      config.accountId = clawConfig.nodeId;
+      config.nodeName = clawConfig.nodeName;
+      log.info(`[WORKER] 从 claw-bridge 加载配置: nodeId=${clawConfig.nodeId}, nodeName=${clawConfig.nodeName}`);
+    } else {
+      log.warn('[WORKER] 未找到 ~/.claw-bridge/config.json');
+    }
+  } catch (err) {
+    log.error(`[WORKER] 加载 claw-bridge 配置失败: ${err.message}`);
+  }
+
+  try {
+    if (fs.existsSync(localConfigPath)) {
+      const localConfig = JSON.parse(fs.readFileSync(localConfigPath, 'utf8'));
+      config.appKey = localConfig.appKey || config.appKey;
+      if (localConfig.token) config.token = localConfig.token;
+      if (localConfig.accountId) config.accountId = localConfig.accountId;
+      log.info(`[WORKER] 从本地配置加载: appKey=${config.appKey?.substring(0, 8)}...`);
+    }
+  } catch (err) {
+    log.error(`[WORKER] 加载本地配置失败: ${err.message}`);
+  }
+
+  if (!config.appKey) {
+    config.appKey = process.env.DM_APP_KEY || 'bmdehs6pbyyks';
+    log.info(`[WORKER] 使用默认 appKey: ${config.appKey}`);
+  }
+
+  if (config.token && config.accountId) {
+    return config;
+  }
+
+  log.warn('[WORKER] 缺少必要配置(token/accountId)，融云功能未启用');
+  return null;
+}
+
+rongcloudConfig = loadRongCloudConfig();
+
+let rongcloudClient = null;
+let messageHandler = null;
+
+async function initRongCloud() {
+  if (!rongcloudConfig) return;
+
+  await ensurePluginsAllow(log);
+
+  rongcloudClient = new RongCloudClient(rongcloudConfig, log);
+
+  messageHandler = new MessageHandler(
+    rongcloudConfig,
+    async (targetId, content, conversationType) => {
+      return rongcloudClient.sendMessage(targetId, content, conversationType);
+    },
+    log
+  );
+
+  const connected = await rongcloudClient.connect(messageHandler);
+  if (connected) {
+    log.info('[WORKER] 融云连接成功');
+  } else {
+    log.error('[WORKER] 融云连接失败');
+  }
+}
+
+async function shutdownRongCloud() {
+  if (rongcloudClient) {
+    await rongcloudClient.disconnect();
+    log.info('[WORKER] 融云已断开');
+  }
+}
+
+initRongCloud().catch(err => {
+  log.error(`[WORKER] 融云初始化异常: ${err.message}`);
+});
+
+const server = http.createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('alive');
+    return;
+  }
+  if (req.url === '/version') {
+    try {
+      const versionFile = path.join(__dirname, '..', 'version.json');
+      const data = JSON.parse(fs.readFileSync(versionFile, 'utf8'));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(data));
+    } catch (e) {
+      res.writeHead(500);
+      res.end('version read error');
+    }
+    return;
+  }
+  if (req.url === '/rongcloud/status') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      enabled: !!rongcloudConfig,
+      connected: rongcloudClient?.isConnected || false
+    }));
+    return;
+  }
+  res.writeHead(404);
+  res.end('not found');
+});
+
+server.listen(PORT, '127.0.0.1', () => {
+  log.info(`[WORKER] HTTP 服务已启动: http://127.0.0.1:${PORT}/health`);
+});
+
+process.on('message', (msg) => {
+  if (msg?.type === 'prepare-shutdown') {
+    log.info(`[WORKER] 收到${msg.reason || 'unknown'}通知，准备优雅退出...`);
+    shutdownRongCloud().then(() => {
+      server.close(() => {
+        log.info('[WORKER] HTTP 服务已关闭');
+        setTimeout(() => process.exit(0), 1000);
+      });
+    }).catch(err => {
+      log.error(`[WORKER] 关闭融云异常: ${err.message}`);
+      server.close(() => process.exit(0));
+    });
+  }
+});
+
+process.on('uncaughtException', (err) => {
+  log.error(`[WORKER] 未捕获异常: ${err.message}\n${err.stack}`);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  log.error(`[WORKER] 未捕获 Promise: ${reason}`);
+});
+
+setInterval(() => {
+  log.info('[WORKER] 业务心跳...');
+}, 60000);
