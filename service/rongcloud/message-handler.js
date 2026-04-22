@@ -62,10 +62,10 @@ class MessageHandler {
       const type = this.getMessageType(msg.content);
       this.log?.info(`[MessageHandler] 收到消息 from=${msg.senderUserId}, type=${type}, content=${msg.content.substring(0, 50)}`);
 
-      if (type === MessageType.COMMAND) {
-        await this.handleCommand(msg);
-      } else {
+      if (type === MessageType.NORMAL) {
         await this.handleNormal(msg);
+      } else {
+        await this.handleCommand(msg);
       }
     } catch (err) {
       this.log?.error(`[MessageHandler] 处理消息异常: ${err.message}`);
