@@ -7,6 +7,8 @@ const { RongCloudClient, MessageHandler, ensurePluginsAllow } = require('./rongc
 const { BusinessMessageHandler } = require('./modules/business-message-handler');
 const { OpenClawClient } = require('./rongcloud/openclaw-client');
 const { handleNormalMessage } = require('./modules/normal-message-handler');
+const { RongyunMessageSender } = require('./modules/rongyun-message-sender');
+const { getOpenClawStatus } = require('./modules/port-checker');
 
 const log = createLogger('worker');
 const PORT = 33100;
@@ -115,6 +117,31 @@ async function initRongCloud() {
   const connected = await rongcloudClient.connect(messageHandler);
   if (connected) {
     log.info('[WORKER] 融云连接成功');
+    
+    // 创建消息发送器
+    const messageSender = new RongyunMessageSender(rongcloudClient, rongcloudConfig, log);
+    
+    // 发送 CLIENT_CONNECTED
+    try {
+      await messageSender.sendClientConnected();
+      log.info('[WORKER] CLIENT_CONNECTED 已发送');
+    } catch (err) {
+      log.error(`[WORKER] 发送 CLIENT_CONNECTED 失败: ${err.message}`);
+    }
+    
+    // 启动心跳定时器
+    const heartbeatInterval = (rongcloudConfig.heartbeatInterval || 20) * 1000;
+    setInterval(async () => {
+      try {
+        const status = await getOpenClawStatus(rongcloudConfig.openclawPort || 18789);
+        await messageSender.sendHeartbeat(status);
+        log.info('[WORKER] 心跳已发送');
+      } catch (err) {
+        log.error(`[WORKER] 心跳发送失败: ${err.message}`);
+      }
+    }, heartbeatInterval);
+    log.info(`[WORKER] 心跳定时器已启动，间隔: ${heartbeatInterval}ms`);
+    
   } else {
     log.error('[WORKER] 融云连接失败');
   }
@@ -122,6 +149,15 @@ async function initRongCloud() {
 
 async function shutdownRongCloud() {
   if (rongcloudClient) {
+    // 发送 CLIENT_DISCONNECTED
+    try {
+      const messageSender = new RongyunMessageSender(rongcloudClient, rongcloudConfig, log);
+      await messageSender.sendClientDisconnected();
+      log.info('[WORKER] CLIENT_DISCONNECTED 已发送');
+    } catch (err) {
+      log.error(`[WORKER] 发送 CLIENT_DISCONNECTED 失败: ${err.message}`);
+    }
+    
     await rongcloudClient.disconnect();
     log.info('[WORKER] 融云已断开');
   }
