@@ -1,6 +1,6 @@
 const { MessageType } = require('./types');
 const { OpenClawClient } = require('./openclaw-client');
-
+const { handleNormalMessage } = require('../modules/normal-message-handler');
 const MENTION_REGEX = /@(claw_[a-zA-Z0-9]+)/g;
 
 class MessageHandler {
@@ -10,6 +10,7 @@ class MessageHandler {
     this.log = log;
     this.openclawClient = new OpenClawClient(log);
     this.nodeId = config.accountId || '';
+    this.handleNormalMessage = handleNormalMessage;
   }
 
   extractMentions(content) {
@@ -63,7 +64,8 @@ class MessageHandler {
       this.log?.info(`[MessageHandler] 收到消息 from=${msg.senderUserId}, type=${type}, content=${msg.content.substring(0, 50)}`);
 
       if (type === MessageType.NORMAL) {
-        await this.handleNormal(msg);
+        // await this.handleNormal(msg);
+        await this.handleNormalMessage(msg);
       } else {
         await this.handleCommand(msg);
       }

@@ -50,14 +50,14 @@ class OpenClawClient {
   cleanOutput(output) {
     const lines = output.split('\n');
     const cleanLines = [];
-    
+
     for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed) continue;
-      
+
       // 移除 ANSI 颜色代码
       const cleanLine = trimmed.replace(/\x1B\[[0-9;]*m/g, '');
-      
+
       // 跳过所有调试/配置日志行
       if (cleanLine.startsWith('[ws]')) continue;
       if (cleanLine.startsWith('[health-monitor]')) continue;
@@ -75,10 +75,10 @@ class OpenClawClient {
       if (cleanLine.includes('models.list')) continue;
       if (cleanLine.includes('node.list')) continue;
       if (/^\d{2}:\d{2}:\d{2}/.test(cleanLine)) continue; // 时间戳开头的日志
-      
+
       cleanLines.push(cleanLine);
     }
-    
+
     return cleanLines.join('\n').trim() || 'OpenClaw 未返回有效响应';
   }
 }
