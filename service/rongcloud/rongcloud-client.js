@@ -10,24 +10,7 @@ const ConversationType = {
 };
 
 const SYSTEM_MSG_TYPES = new Set([
-  'client_connected',
-  'client_disconnected',
-  'heartbeat',
-  'heartbeat_ack',
-  'dashboard_report',
-  'dashboard_report_ack',
-  'dashboard_sessions',
-  'dashboard_jobs',
-  'dashboard_projects',
-  'dashboard_summaries',
-  'dashboard_sessions_contexts',
-  'dashboard_usage_events',
-  'command',
-  'command_result',
-  'chat_message',
-  'create_opencode_session',
-  'opencode_session_created',
-  'delete_opencode_session'
+
 ]);
 
 class RongCloudClient {
