@@ -106,10 +106,10 @@ class MessageHandler {
   }
 
   async handleNormal(msg) {
-    const reply = await this.openclawClient.chat(msg.content, msg.senderUserId);
-    this.log?.info(`[MessageHandler] AI 回复: ${reply.substring(0, 50)}...`);
-    const targetId = this.getReplyTarget(msg);
-    await this.sendFn(targetId, reply, msg.conversationType);
+    // const reply = await this.openclawClient.chat(msg.content, msg.senderUserId);
+    // this.log?.info(`[MessageHandler] AI 回复: ${reply.substring(0, 50)}...`);
+    // const targetId = this.getReplyTarget(msg);
+    // await this.sendFn(targetId, reply, msg.conversationType);
   }
 
   parseCommand(raw, senderId) {
