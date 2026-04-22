@@ -1,4 +1,5 @@
 const http = require('http');
+const os = require('os');
 
 const GATEWAY_URL = 'http://127.0.0.1:4096';
 
@@ -22,6 +23,62 @@ function httpGet(url) {
       reject(new Error('timeout'));
     });
   });
+}
+
+function buildDiagnostics(sessions = []) {
+  const recentIssues = sessions
+    .slice(0, 5)
+    .map((s) => {
+      const updatedAt = s.updatedAt || s.lastMessageAt;
+      if (!updatedAt) return null;
+      return {
+        timestamp: typeof updatedAt === 'number' ? new Date(updatedAt).toISOString() : updatedAt,
+        action: '会话活动',
+        detail: `${s.label || s.sessionKey || 'Unknown'} - ${s.state || 'idle'}`
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+
+  // 检测网关状态
+  let gatewayStatus = 'unknown';
+  try {
+    const net = require('net');
+    const sock = new net.Socket();
+    sock.setTimeout(2000);
+    sock.once('connect', () => {
+      gatewayStatus = 'ok';
+      sock.destroy();
+    });
+    sock.once('error', () => {
+      sock.destroy();
+    });
+    sock.connect(18789, '127.0.0.1');
+  } catch {}
+
+  return {
+    generatedAt: new Date().toISOString(),
+    app: { name: 'OpenClaw', version: 'unknown' },
+    runtime: {
+      platform: os.platform(),
+      arch: process.arch,
+      cpuCount: os.cpus().length,
+      totalMemoryBytes: os.totalmem(),
+      freeMemoryBytes: os.freemem(),
+      uptimeSeconds: Math.floor(os.uptime())
+    },
+    gateway: {
+      configuredUrl: 'ws://127.0.0.1:18789',
+      overallStatus: gatewayStatus
+    },
+    openclaw: {
+      status: 'ok',
+      currentVersion: 'unknown',
+      updateAvailable: false
+    },
+    tokens: { redacted: true, localTokenAuthRequired: false, entries: [] },
+    recentIssues
+  };
 }
 
 async function collectDashboardData() {
@@ -69,8 +126,9 @@ async function collectDashboardData() {
     }
   }
 
-  if (!data.diagnostics || typeof data.diagnostics !== 'object') {
-    data.diagnostics = {};
+  // 确保 diagnostics 包含必要的字段
+  if (!data.diagnostics || typeof data.diagnostics !== 'object' || !data.diagnostics.gateway) {
+    data.diagnostics = buildDiagnostics(data.sessions);
   }
   data.diagnostics.generatedAt = new Date().toISOString();
   return data;

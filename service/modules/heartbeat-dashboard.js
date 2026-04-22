@@ -1,5 +1,6 @@
 const { RongyunMessageTypeEnum } = require('./rongyun-message-types');
 const { collectDashboardData } = require('./dashboard-collector');
+const { RongyunMessageSender } = require('./rongyun-message-sender');
 
 class HeartbeatManager {
   constructor(rongcloudClient, config, log) {
@@ -7,6 +8,7 @@ class HeartbeatManager {
     this.config = config;
     this.log = log;
     this.timer = null;
+    this.messageSender = new RongyunMessageSender(rongcloudClient, config, log);
   }
 
   start(getMacAddress, getOpenClawStatus) {
@@ -19,7 +21,7 @@ class HeartbeatManager {
       try {
         const mac = getMacAddress();
         const status = await getOpenClawStatus(this.config.openclawPort || 18789);
-        const sent = await this.rongcloudClient.sendStructuredMessage(
+        const sent = await this.messageSender.sendProtocolMessage(
           RongyunMessageTypeEnum.HEARTBEAT,
           {
             mac_address: mac,
@@ -54,6 +56,7 @@ class DashboardReporter {
     this.config = config;
     this.log = log;
     this.timer = null;
+    this.messageSender = new RongyunMessageSender(rongcloudClient, config, log);
   }
 
   start(getMacAddress) {
@@ -120,7 +123,7 @@ class DashboardReporter {
 
   async sendChunk(msgType, data, delayMs) {
     try {
-      const sent = await this.rongcloudClient.sendStructuredMessage(msgType, data);
+      const sent = await this.messageSender.sendProtocolMessage(msgType, data);
       if (sent) {
         this.log?.info(`[DashboardReporter] ${msgType} 发送成功`);
       } else {
