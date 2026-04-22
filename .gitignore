@@ -1,0 +1,8 @@
+node_modules/
+logs/
+update/
+backup/
+*.log
+*.tmp
+*.old
+rongcloud-config.json

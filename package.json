@@ -1,0 +1,30 @@
+{
+  "name": "silent-service",
+  "version": "1.0.0",
+  "description": "Node.js 静默后台服务，开机自启，崩溃自动恢复，支持自动更新和融云消息监听",
+  "main": "service/daemon.js",
+  "scripts": {
+    "start": "node service/daemon.js",
+    "dev": "nodemon service/daemon.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "install-service": "node scripts/install-silent.js",
+    "uninstall-service": "node scripts/uninstall.js"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "nodemon": "^3.1.0"
+  },
+  "dependencies": {
+    "@rongcloud/imlib-next": "^5.36.6",
+    "axios": "^1.15.1",
+    "fake-indexeddb": "^6.2.5",
+    "jsdom": "^24.0.0",
+    "node-windows": "^1.0.0-beta.8",
+    "ws": "^8.16.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "license": "MIT"
+}
