@@ -37,7 +37,6 @@ class OpenClawClient {
     } catch (err) {
       this.log?.error(`[OpenClawClient] 执行异常: ${err.message}`);
       this.log?.error(`[OpenClawClient] 错误码: ${err.code}`);
-
       if (err.killed) {
         return 'OpenClaw 响应超时';
       }
