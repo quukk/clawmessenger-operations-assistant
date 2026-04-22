@@ -1,26 +1,18 @@
 /**
- * 普通消息处理器 - 接收 rongcloud 转发的普通消息
+ * 普通消息处理器 - 接收 rongcloud 转发的普通消息并调用 AI 服务
  * 
- * 被调用位置：rongcloud/message-handler.js 第108行 handleNormal() 方法
- * 调用方式：通过 Monkey Patch 替换 OpenClawClient.chat
- * 
- * 原始代码（被注释）：
- * async handleNormal(msg) {
- *     const reply = await this.openclawClient.chat(msg.content, msg.senderUserId);
- *     ...
- * }
+ * 被调用位置：rongcloud/message-handler.js 第68行
+ * 调用方式：await this.handleNormalMessage(msg)
  * 
  * @param {Object} msg - 消息对象
  * @param {string} msg.content - 消息内容
  * @param {string} msg.senderUserId - 发送者ID
  * @param {string} msg.targetId - 目标ID
  * @param {number} msg.conversationType - 会话类型 (1=私聊, 3=群聊)
- * @param {string} msg.messageType - 消息类型
- * @param {boolean} msg.isOffLineMessage - 是否离线消息
- * @param {string} msg.messageUId - 消息唯一ID
- * @param {number} msg.sentTime - 发送时间戳
  * @returns {string} 回复内容
  */
+const { forwardChatMessage } = require('./opencode-service');
+
 async function handleNormalMessage(msg) {
   console.log(`[NormalMessageHandler] 收到普通消息:`, {
     from: msg.senderUserId,
@@ -29,15 +21,33 @@ async function handleNormalMessage(msg) {
   });
 
   try {
-    // TODO: 在这里实现普通消息处理逻辑
-    // 例如：
-    // - AI 聊天回复
-    // - 调用 opencode 服务
-    // - 查询知识库
-    // - 其他业务逻辑
+    // 使用 senderUserId 作为 session ID，确保每个用户有独立的会话
+    const sessionId = msg.senderUserId || 'default';
+    const content = msg.content;
+    
+    if (!content || !content.trim()) {
+      return '消息内容为空';
+    }
 
-    // 示例：简单回复
-    return `收到您的消息: ${msg.content}`;
+    // 调用 opencode 服务进行 AI 聊天
+    let fullResponse = '';
+    
+    await forwardChatMessage(
+      sessionId,
+      content,
+      async (delta) => {
+        // 收集响应片段
+        fullResponse += delta;
+      },
+      (level, message) => {
+        // 日志回调
+        console.log(`[CHAT-${level}] ${message}`);
+      },
+      600000 // 10分钟超时
+    );
+
+    console.log(`[NormalMessageHandler] AI 回复: ${fullResponse.substring(0, 50)}...`);
+    return fullResponse;
 
   } catch (err) {
     console.error(`[NormalMessageHandler] 处理异常:`, err.message);
