@@ -20,9 +20,6 @@ if not errorlevel 1 (
     echo [INFO] OpenClaw is already running
     echo [INFO] Dashboard URL: http://127.0.0.1:18789/
     echo.
-    echo Opening dashboard in browser...
-    start openclaw dashboard
-    echo.
     echo Success
     exit /b 0
 )
@@ -61,9 +58,6 @@ if not errorlevel 1 (
     echo [INFO] Dashboard URL: http://127.0.0.1:18789/
     echo.
     echo Success
-    echo.
-    echo Opening dashboard in browser...
-    start openclaw dashboard
     exit /b 0
 )
 

@@ -39,19 +39,26 @@ class CommandHandler {
       [OpenClawCommandEnum.START]: 'start',
       [OpenClawCommandEnum.STOP]: 'stop',
       [OpenClawCommandEnum.RESTART]: 'restart',
-      [OpenClawCommandEnum.STATUS]: 'status'
+      [OpenClawCommandEnum.STATUS]: 'status',
+      [OpenClawCommandEnum.CONFIG_FIX]: null  // 配置修复不需要脚本，直接执行命令
     };
-    return (names[command] || 'unknown') + ext;
+    const name = names[command];
+    return name ? name + ext : null;
   }
 
   /**
    * 执行命令
-   * @param {number} command - 命令枚举值 (1=start, 2=stop, 3=restart, 4=status)
+   * @param {number} command - 命令枚举值 (1=start, 2=stop, 3=restart, 4=status, 5=config_fix)
    * @returns {Object} { status, message }
    */
   async execute(command) {
     const scriptName = this.getScriptName(command);
     const commandName = this.getCommandName(command);
+    
+    // 配置修复命令特殊处理：直接执行 openclaw doctor --fix
+    if (command === OpenClawCommandEnum.CONFIG_FIX) {
+      return await this.executeConfigFix();
+    }
     
     this.log?.info(`[CommandHandler] 执行 ${commandName} 命令，脚本: ${scriptName}`);
     
@@ -69,6 +76,26 @@ class CommandHandler {
   }
 
   /**
+   * 执行配置修复命令
+   * 直接运行 openclaw doctor --fix
+   */
+  async executeConfigFix() {
+    this.log?.info('[CommandHandler] 执行配置修复命令: openclaw doctor --fix');
+    
+    try {
+      const result = await this.executor.executeCommandDirect('openclaw doctor --fix', 120); // 2分钟超时
+      this.log?.info(`[CommandHandler] 配置修复结果: ${result.status} - ${result.message}`);
+      return result;
+    } catch (err) {
+      this.log?.error(`[CommandHandler] 配置修复异常: ${err.message}`);
+      return {
+        status: OpenClawServiceStatus.ERROR,
+        message: `配置修复异常: ${err.message}`
+      };
+    }
+  }
+
+  /**
    * 获取命令名称
    */
   getCommandName(command) {
@@ -76,7 +103,8 @@ class CommandHandler {
       [OpenClawCommandEnum.START]: '启动',
       [OpenClawCommandEnum.STOP]: '停止',
       [OpenClawCommandEnum.RESTART]: '重启',
-      [OpenClawCommandEnum.STATUS]: '状态检查'
+      [OpenClawCommandEnum.STATUS]: '状态检查',
+      [OpenClawCommandEnum.CONFIG_FIX]: '配置修复'
     };
     return names[command] || '未知命令';
   }
@@ -107,6 +135,13 @@ class CommandHandler {
    */
   async status() {
     return await this.execute(OpenClawCommandEnum.STATUS);
+  }
+
+  /**
+   * 配置修复
+   */
+  async configFix() {
+    return await this.execute(OpenClawCommandEnum.CONFIG_FIX);
   }
 }
 
