@@ -94,7 +94,10 @@ async function initRongCloud() {
     async (targetId, content, conversationType) => {
       return rongcloudClient.sendMessage(targetId, content, conversationType);
     },
-    log
+    log,
+    async (msg) => {
+      return rongcloudClient.sendReadReceipt(msg);
+    }
   );
 
   // 包装 MessageHandler.handleMessage 以处理结构化消息

@@ -36,6 +36,8 @@ class RongCloudClient {
 
     this.log?.info(`[RongCloudClient] SDK Events: ${JSON.stringify(Object.keys(RongIMLib.Events || {}))}`);
     this.log?.info(`[RongCloudClient] has addEventListener: ${typeof RongIMLib.addEventListener === 'function'}`);
+    this.log?.info(`[RongCloudClient] has sendReadReceiptMessage: ${typeof RongIMLib.sendReadReceiptMessage === 'function'}`);
+    this.log?.info(`[RongCloudClient] has sendReadReceiptResponseV2: ${typeof RongIMLib.sendReadReceiptResponseV2 === 'function'}`);
 
     if (RongIMLib.addEventListener) {
       this.log?.info('[RongCloudClient] 使用 addEventListener 模式');
@@ -193,6 +195,55 @@ class RongCloudClient {
       }
     } catch (err) {
       this.log?.error(`[RongCloudClient] 发送异常: ${err.message}`);
+      return false;
+    }
+  }
+
+  async sendReadReceipt(msg) {
+    if (!this.isConnected) {
+      this.log?.warn('[RongCloudClient] 未连接，无法发送已读回执');
+      return false;
+    }
+
+    const { conversationType, senderUserId, targetId, messageUId, sentTime } = msg;
+    if (!messageUId || !sentTime) {
+      this.log?.warn('[RongCloudClient] 消息缺少 messageUId 或 sentTime，无法发送已读回执');
+      return false;
+    }
+
+    // 本地生成的 messageUId 无法发送已读回执
+    if (String(messageUId).startsWith('local-')) {
+      this.log?.warn('[RongCloudClient] messageUId 为本地生成，跳过已读回执');
+      return false;
+    }
+
+    this.log?.info(`[RongCloudClient] 准备发送已读回执: conversationType=${conversationType}, senderUserId=${senderUserId}, targetId=${targetId}, messageUId=${messageUId}, sentTime=${sentTime}`);
+
+    try {
+      if (conversationType === ConversationType.GROUP) {
+        if (typeof RongIMLib.sendReadReceiptResponseV2 !== 'function') {
+          this.log?.warn('[RongCloudClient] SDK 不支持群聊已读回执');
+          return false;
+        }
+        this.log?.info(`[RongCloudClient] 发送群聊已读回执 -> ${targetId}, messageUId=${messageUId}`);
+        // sendReadReceiptResponseV2 参数格式: (targetId, Record<senderUserId, messageUId[]>)
+        const result = await RongIMLib.sendReadReceiptResponseV2(targetId, {
+          [senderUserId]: [messageUId]
+        });
+        this.log?.info(`[RongCloudClient] 群聊已读回执结果: code=${result.code}, msg=${result.msg || ''}`);
+        return result.code === 0 || result.code === 200;
+      } else {
+        if (typeof RongIMLib.sendReadReceiptMessage !== 'function') {
+          this.log?.warn('[RongCloudClient] SDK 不支持单聊已读回执');
+          return false;
+        }
+        this.log?.info(`[RongCloudClient] 发送单聊已读回执 -> ${senderUserId}, messageUId=${messageUId}`);
+        const result = await RongIMLib.sendReadReceiptMessage(senderUserId, messageUId, sentTime);
+        this.log?.info(`[RongCloudClient] 单聊已读回执结果: code=${result.code}, msg=${result.msg || ''}`);
+        return result.code === 0 || result.code === 200;
+      }
+    } catch (err) {
+      this.log?.error(`[RongCloudClient] 发送已读回执异常: ${err.message}`);
       return false;
     }
   }

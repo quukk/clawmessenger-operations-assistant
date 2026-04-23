@@ -4,10 +4,11 @@ const { handleNormalMessage } = require('../modules/normal-message-handler');
 const MENTION_REGEX = /@(claw_[a-zA-Z0-9]+)/g;
 
 class MessageHandler {
-  constructor(config, sendFn, log) {
+  constructor(config, sendFn, log, sendReadReceiptFn) {
     this.config = config;
     this.sendFn = sendFn;
     this.log = log;
+    this.sendReadReceiptFn = sendReadReceiptFn;
     this.openclawClient = new OpenClawClient(log);
     this.nodeId = config.accountId || '';
     this.handleNormalMessage = handleNormalMessage;
@@ -116,6 +117,16 @@ class MessageHandler {
   async handleClaw(msg) {
     const reply = await this.openclawClient.chat(msg.content, msg.senderUserId);
     this.log?.info(`[MessageHandler] AI 回复: ${reply.substring(0, 50)}...`);
+
+    // 龙虾调用成功，发送已读回执
+    if (this.sendReadReceiptFn) {
+      try {
+        await this.sendReadReceiptFn(msg);
+      } catch (err) {
+        this.log?.error(`[MessageHandler] 发送已读回执失败: ${err.message}`);
+      }
+    }
+
     const targetId = this.getReplyTarget(msg);
     await this.sendFn(targetId, reply, msg.conversationType);
   }

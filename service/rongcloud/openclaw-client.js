@@ -12,21 +12,27 @@ class OpenClawClient {
     if (!message || !message.trim()) {
       return '消息内容为空';
     }
-
+    this.log?.info(`[OpenClawClient] 准备发送消息到 OpenClaw，from=${fromUser}, message=${message.substring(0, 50)}`);
     const sessionId = `rongcloud-${fromUser}-${Date.now()}`;
     const isWindows = process.platform === 'win32';
     const escapedMessage = message.replace(/"/g, '\\"');
     // 使用默认 agent (main) 处理消息，不指定 --agent 参数
+    const gatewayUrl = 'http://127.0.0.1:5678';
     const cmd = isWindows
       ? `cmd /c openclaw agent -m "${escapedMessage}" --session-id ${sessionId}`
       : `openclaw agent -m "${escapedMessage}" --session-id ${sessionId}`;
 
     this.log?.info(`[OpenClawClient] 执行命令: ${cmd}`);
+    this.log?.info(`[OpenClawClient] Gateway URL: ${gatewayUrl}`);
 
     try {
       const { stdout, stderr } = await execAsync(cmd, {
         timeout: 1200000,
         maxBuffer: 1024 * 1024,
+        env: {
+          ...process.env,
+          OPENCLAW_GATEWAY_URL: gatewayUrl,
+        },
       });
 
       this.log?.info(`[OpenClawClient] stdout: ${stdout?.substring(0, 200) || '(empty)'}`);
