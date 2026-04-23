@@ -20,14 +20,21 @@ async function deleteOpencodeSession(sessionId) {
 }
 
 async function getOrCreateGatewaySession(fallbackSessionId) {
+  console.log(`[CHAT-DEBUG] getOrCreateGatewaySession called with fallback: ${fallbackSessionId}`);
+  
   try {
     const response = await axios.get(`${GATEWAY_URL}/api/sessions`, { timeout: 5000 });
     const sessions = response.data;
+    console.log(`[CHAT-DEBUG] Existing sessions: ${JSON.stringify(sessions)}`);
     if (Array.isArray(sessions) && sessions.length > 0) {
-      return sessions[0].id || sessions[0].session_id || fallbackSessionId;
+      const sessionId = sessions[0].id || sessions[0].session_id;
+      if (sessionId) {
+        console.log(`[CHAT-DEBUG] Using existing session: ${sessionId}`);
+        return sessionId;
+      }
     }
   } catch (e) {
-    // ignore
+    console.log(`[CHAT-DEBUG] Failed to get sessions: ${e.message}`);
   }
 
   try {
@@ -36,10 +43,21 @@ async function getOrCreateGatewaySession(fallbackSessionId) {
       { title: 'Chat session' },
       { headers: { 'Content-Type': 'application/json' }, timeout: 5000 }
     );
-    return response.data?.id || response.data?.session_id || fallbackSessionId;
-  } catch {
+    const newSessionId = response.data?.id || response.data?.session_id;
+    console.log(`[CHAT-DEBUG] Created new session: ${newSessionId}`);
+    if (newSessionId) {
+      return newSessionId;
+    }
+  } catch (e) {
+    console.log(`[CHAT-DEBUG] Failed to create session: ${e.message}`);
+  }
+  
+  if (fallbackSessionId) {
+    console.log(`[CHAT-DEBUG] Using fallback session: ${fallbackSessionId}`);
     return fallbackSessionId;
   }
+  
+  throw new Error('无法获取或创建有效的 session ID');
 }
 
 async function forwardChatMessage(sessionId, content, onDelta, logFn, timeoutMs = 600000) {
