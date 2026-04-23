@@ -66,6 +66,11 @@ function loadRongCloudConfig() {
     log.info(`[WORKER] 使用默认 appKey: ${config.appKey}`);
   }
 
+  // 设置默认心跳间隔为20秒
+  if (!config.heartbeatInterval) {
+    config.heartbeatInterval = 20;
+  }
+
   if (config.token && config.accountId) {
     return config;
   }
@@ -292,13 +297,75 @@ process.on('message', (msg) => {
   }
 });
 
-process.on('uncaughtException', (err) => {
+// 标记是否正在关闭，避免重复执行
+let isShuttingDown = false;
+
+// 优雅退出处理函数
+async function gracefulShutdown(signal) {
+  if (isShuttingDown) {
+    log.warn(`[WORKER] 已经在关闭中，忽略 ${signal} 信号`);
+    return;
+  }
+  isShuttingDown = true;
+  
+  log.info(`[WORKER] 收到 ${signal} 信号，开始优雅退出...`);
+  
+  try {
+    await shutdownRongCloud();
+  } catch (err) {
+    log.error(`[WORKER] 关闭融云异常: ${err.message}`);
+  }
+  
+  // 关闭 HTTP 服务
+  server.close(() => {
+    log.info('[WORKER] HTTP 服务已关闭');
+  });
+  
+  // 给 3 秒时间完成关闭操作
+  setTimeout(() => {
+    log.info('[WORKER] 退出进程');
+    process.exit(0);
+  }, 3000);
+}
+
+// 处理正常退出信号
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+
+// 处理 Windows 的 SIGINT（Ctrl+C）
+if (process.platform === 'win32') {
+  process.on('SIGBREAK', () => gracefulShutdown('SIGBREAK'));
+}
+
+// 处理未捕获的异常
+process.on('uncaughtException', async (err) => {
   log.error(`[WORKER] 未捕获异常: ${err.message}\n${err.stack}`);
-  process.exit(1);
+  if (!isShuttingDown) {
+    await gracefulShutdown('uncaughtException');
+  }
 });
 
-process.on('unhandledRejection', (reason) => {
+// 处理未处理的 Promise 拒绝
+process.on('unhandledRejection', async (reason) => {
   log.error(`[WORKER] 未捕获 Promise: ${reason}`);
+  if (!isShuttingDown) {
+    await gracefulShutdown('unhandledRejection');
+  }
+});
+
+// 处理进程退出事件（最后的机会）
+process.on('exit', (code) => {
+  if (!isShuttingDown && rongcloudClient?.isConnected) {
+    log.warn(`[WORKER] 进程即将退出 (code=${code})，尝试发送 CLIENT_DISCONNECTED...`);
+    // 同步发送，因为 exit 事件不支持异步
+    try {
+      const messageSender = new RongyunMessageSender(rongcloudClient, rongcloudConfig, log);
+      // 使用同步方式发送（如果可能）
+      messageSender.sendClientDisconnected().catch(() => {});
+    } catch (e) {
+      // 忽略错误
+    }
+  }
 });
 
 setInterval(() => {
