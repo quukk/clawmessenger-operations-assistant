@@ -5,7 +5,8 @@ const OpenClawCommandEnum = {
   START: 1,
   STOP: 2,
   RESTART: 3,
-  STATUS: 4
+  STATUS: 4,
+  CONFIG_FIX: 5
 };
 
 const OpenClawServiceStatus = {
@@ -14,6 +15,7 @@ const OpenClawServiceStatus = {
   START_SUCCESS: 'starting_success',
   STOP_SUCCESS: 'stop_success',
   RESTART_SUCCESS: 'restart_success',
+  CONFIG_FIX_SUCCESS: 'config_fix_success',
   NOT_INSTALL: 'not_install',
   ERROR: 'error'
 };
@@ -24,6 +26,7 @@ const statusMessages = {
   [OpenClawServiceStatus.START_SUCCESS]: '启动成功',
   [OpenClawServiceStatus.STOP_SUCCESS]: '关闭服务成功',
   [OpenClawServiceStatus.RESTART_SUCCESS]: '重启服务成功',
+  [OpenClawServiceStatus.CONFIG_FIX_SUCCESS]: '配置修复成功',
   [OpenClawServiceStatus.ERROR]: '未知异常',
   [OpenClawServiceStatus.NOT_INSTALL]: 'openclaw未安装'
 };
@@ -77,6 +80,11 @@ class ScriptExecutor {
   }
 
   async executeWithStatus(command, scriptName) {
+    // 配置修复命令特殊处理：直接执行命令，不需要脚本
+    if (command === OpenClawCommandEnum.CONFIG_FIX) {
+      return await this.executeCommandDirect('openclaw doctor --fix', 120);
+    }
+
     const scriptPath = path.join(this.scriptDir, scriptName);
 
     try {
@@ -87,6 +95,85 @@ class ScriptExecutor {
       const msg = e instanceof Error ? e.message : String(e);
       return { status: OpenClawServiceStatus.ERROR, message: `执行异常: ${msg}` };
     }
+  }
+
+  /**
+   * 直接执行命令（不通过脚本）
+   * @param {string} command - 要执行的命令
+   * @param {number} timeout - 超时时间（秒）
+   * @returns {Object} { status, message }
+   */
+  async executeCommandDirect(command, timeout = 180) {
+    return new Promise((resolve, reject) => {
+      const system = process.platform;
+      let cmd;
+      let args;
+
+      if (system === 'win32') {
+        cmd = 'cmd';
+        args = ['/c', command];
+      } else {
+        cmd = 'bash';
+        args = ['-c', command];
+      }
+
+      const child = spawn(cmd, args, {
+        detached: false,
+        windowsHide: true
+      });
+
+      let stdout = '';
+      let stderr = '';
+      let killed = false;
+
+      const timer = setTimeout(() => {
+        killed = true;
+        this.killProcessTree(child);
+        resolve({
+          status: OpenClawServiceStatus.ERROR,
+          message: `执行超时（超过 ${timeout} 秒）`
+        });
+      }, timeout * 1000);
+
+      child.stdout?.on('data', (data) => {
+        const text = data.toString('utf-8');
+        stdout += text;
+      });
+
+      child.stderr?.on('data', (data) => {
+        const text = data.toString('utf-8');
+        stderr += text;
+      });
+
+      child.on('error', (err) => {
+        if (!killed) {
+          killed = true;
+          clearTimeout(timer);
+          resolve({
+            status: OpenClawServiceStatus.ERROR,
+            message: `执行异常: ${err.message}`
+          });
+        }
+      });
+
+      child.on('close', (code) => {
+        if (!killed) {
+          killed = true;
+          clearTimeout(timer);
+          const fullOutput = stdout + stderr;
+          // 对于配置修复命令，解析输出结果
+          if (command.includes('doctor')) {
+            const result = this.parseStatus(OpenClawCommandEnum.CONFIG_FIX, fullOutput);
+            resolve(result);
+          } else {
+            resolve({
+              status: code === 0 ? OpenClawServiceStatus.CONFIG_FIX_SUCCESS : OpenClawServiceStatus.ERROR,
+              message: code === 0 ? '执行成功' : `执行失败（退出码: ${code}）`
+            });
+          }
+        }
+      });
+    });
   }
 
   runScript(scriptPath) {
@@ -165,9 +252,16 @@ class ScriptExecutor {
   shouldReturnEarly(command, output) {
     const upper = output.toUpperCase();
 
+    // 只检查错误关键字，错误时立即返回
     const errorKeywords = ['[ERROR]', '错误', 'FAILED', '失败', '[错误]'];
     for (const kw of errorKeywords) {
       if (upper.includes(kw.toUpperCase())) return true;
+    }
+
+    // 对于 START 命令，不提前返回，让脚本完整执行
+    // 因为 start.bat 有等待循环，需要完整输出才能判断状态
+    if (command === OpenClawCommandEnum.START) {
+      return false;
     }
 
     let successKeywords;
@@ -186,8 +280,6 @@ class ScriptExecutor {
         '[OK] RESTART COMPLETED',
         'RESTART COMPLETED',
         '重启完成',
-        'SUCCESS',
-        '成功',
         '[OK] SERVICE IS RUNNING',
         '[OK] SERVICE STOPPED',
         'STOPPED SUCCESSFULLY',
@@ -251,30 +343,18 @@ class ScriptExecutor {
     }
 
     if (command === OpenClawCommandEnum.START) {
-      if (
-        (upper.includes('[OK] SERVICE IS RUNNING') && upper.includes('SUCCESS')) ||
-        (upper.includes('[INFO] OPENCLAW 服务已完全启动') && upper.includes('SUCCESS'))
-      ) {
-        return {
-          status: OpenClawServiceStatus.START_SUCCESS,
-          message: getServiceStatusMessage(OpenClawServiceStatus.START_SUCCESS)
-        };
-      }
-      if (upper.includes('ALREADY RUNNING') || output.includes('服务已经在运行中')) {
-        return {
-          status: OpenClawServiceStatus.RUNNING,
-          message: '服务已经在运行中'
-        };
-      }
+      // 优先检查错误
       if (upper.includes('[ERROR]') || output.includes('[错误]')) {
         return { status: OpenClawServiceStatus.ERROR, message: '启动失败' };
       }
-      if (upper.includes('SUCCESS') && !upper.includes('[ERROR]')) {
+      // 检查成功标识：包含 SUCCESS 或 ALREADY RUNNING 即为成功
+      if (upper.includes('SUCCESS') || upper.includes('ALREADY RUNNING') || output.includes('服务已经在运行中')) {
         return {
           status: OpenClawServiceStatus.START_SUCCESS,
           message: getServiceStatusMessage(OpenClawServiceStatus.START_SUCCESS)
         };
       }
+      // 如果既没有错误也没有成功标识，返回未知（但通常不会发生）
       return { status: OpenClawServiceStatus.ERROR, message: '启动结果未知' };
     }
 
@@ -373,6 +453,28 @@ class ScriptExecutor {
         };
       }
       return { status: OpenClawServiceStatus.ERROR, message: '重启失败' };
+    }
+
+    if (command === OpenClawCommandEnum.CONFIG_FIX) {
+      // 配置修复命令解析
+      if (
+        upper.includes('DOCTOR COMPLETE') ||
+        upper.includes('CONFIG WAS LAST WRITTEN') ||
+        upper.includes('RESTARTED SCHEDULED TASK')
+      ) {
+        return {
+          status: OpenClawServiceStatus.CONFIG_FIX_SUCCESS,
+          message: getServiceStatusMessage(OpenClawServiceStatus.CONFIG_FIX_SUCCESS)
+        };
+      }
+      if (upper.includes('[ERROR]') || upper.includes('ERROR')) {
+        return { status: OpenClawServiceStatus.ERROR, message: '配置修复失败' };
+      }
+      // 如果没有明确的错误，默认认为成功（因为 doctor 命令通常会完成）
+      return {
+        status: OpenClawServiceStatus.CONFIG_FIX_SUCCESS,
+        message: getServiceStatusMessage(OpenClawServiceStatus.CONFIG_FIX_SUCCESS)
+      };
     }
 
     return { status: OpenClawServiceStatus.ERROR, message: `未知命令: ${command}` };

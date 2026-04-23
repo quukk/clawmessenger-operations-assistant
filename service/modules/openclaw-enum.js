@@ -6,7 +6,8 @@ const OpenClawCommandEnum = {
   START: 1,
   STOP: 2,
   RESTART: 3,
-  STATUS: 4
+  STATUS: 4,
+  CONFIG_FIX: 5
 };
 
 const OpenClawServiceStatus = {
@@ -15,6 +16,7 @@ const OpenClawServiceStatus = {
   START_SUCCESS: 'starting_success',
   STOP_SUCCESS: 'stop_success',
   RESTART_SUCCESS: 'restart_success',
+  CONFIG_FIX_SUCCESS: 'config_fix_success',
   NOT_INSTALL: 'not_install',
   ERROR: 'error'
 };
@@ -25,6 +27,7 @@ const statusMessages = {
   [OpenClawServiceStatus.START_SUCCESS]: '启动成功',
   [OpenClawServiceStatus.STOP_SUCCESS]: '关闭服务成功',
   [OpenClawServiceStatus.RESTART_SUCCESS]: '重启服务成功',
+  [OpenClawServiceStatus.CONFIG_FIX_SUCCESS]: '配置修复成功',
   [OpenClawServiceStatus.ERROR]: '未知异常',
   [OpenClawServiceStatus.NOT_INSTALL]: 'openclaw未安装'
 };
