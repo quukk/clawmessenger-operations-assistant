@@ -14,6 +14,18 @@ const { startOpencodeService, stopOpencodeService } = require('./modules/opencod
 const log = createLogger('worker');
 const PORT = 33100;
 
+// Timestamp 校验专用日志
+const timestampLogPath = path.join(__dirname, '..', 'logs', 'timestamp-validation.log');
+const logTimestampValidation = (message) => {
+  const line = `[${new Date().toISOString()}] [WARN] ${message}\n`;
+  try {
+    fs.appendFileSync(timestampLogPath, line);
+  } catch (e) {
+    // 忽略写入错误
+  }
+  log.warn(`[TIMESTAMP-VALIDATION] ${message}`);  // 同时记录到主日志
+};
+
 log.info(`[WORKER] 业务进程启动，PID: ${process.pid}`);
 
 const clawBridgeConfigPath = path.join(os.homedir(), '.claw-bridge', 'config.json');
@@ -115,6 +127,20 @@ async function initRongCloud() {
             return;
           }
           
+          // Timestamp 校验（5分钟有效期）
+          const msgTimestamp = parsed.timestamp;
+          if (msgTimestamp) {
+            const currentTime = Math.floor(Date.now() / 1000);
+            const timeDiff = Math.abs(currentTime - msgTimestamp);
+            if (timeDiff > 300) { // 5分钟 = 300秒
+              logTimestampValidation(
+                `消息时间戳过期: msg_time=${msgTimestamp}, current_time=${currentTime}, ` +
+                `diff=${timeDiff}s, type=${parsed.msg_type}, source=${parsed.source_im_id}`
+              );
+              return;
+            }
+          }
+          
           // 解析 content 字段（它本身可能是 JSON 字符串）
           let innerContent = parsed.content;
           if (typeof innerContent === 'string') {
@@ -127,10 +153,11 @@ async function initRongCloud() {
           
           // 构建消息数据
           // 注意：后端发送的 command 消息中，command/command_id/request_id 在 content 字段内
+          // 保留原始 content（用户消息内容），同时展开其他字段
           const messageData = {
             ...parsed,
             ...innerContent,  // 展开 content 中的字段（如 command, command_id 等）
-            content: innerContent,
+            content: typeof innerContent === 'object' ? innerContent.content : innerContent,
             senderUserId: parsed.source_im_id || msg.senderUserId,
             targetId: msg.targetId,
             conversationType: msg.conversationType,
