@@ -38,14 +38,14 @@ class RongCloudClient {
     this.log?.info(`[RongCloudClient] has addEventListener: ${typeof RongIMLib.addEventListener === 'function'}`);
     this.log?.info(`[RongCloudClient] has sendReadReceiptMessage: ${typeof RongIMLib.sendReadReceiptMessage === 'function'}`);
     this.log?.info(`[RongCloudClient] has sendReadReceiptResponseV2: ${typeof RongIMLib.sendReadReceiptResponseV2 === 'function'}`);
+    this.log?.info(`[RongCloudClient] has sendReadReceiptResponseV5: ${typeof RongIMLib.sendReadReceiptResponseV5 === 'function'}`);
 
     if (RongIMLib.addEventListener) {
       this.log?.info('[RongCloudClient] 使用 addEventListener 模式');
-      
+
       RongIMLib.addEventListener(RongIMLib.Events?.MESSAGES || 'MESSAGES', (event) => {
         this.log?.info(`[RongCloudClient] 收到消息事件: ${JSON.stringify(event).substring(0, 200)}`);
         event.messages?.forEach(msg => {
-          this.log?.info(`[RongCloudClient] 消息详情: messageType=${msg.messageType}, senderUserId=${msg.senderUserId}`);
           this.handleReceivedMessage(msg);
         });
       });
@@ -61,7 +61,7 @@ class RongCloudClient {
       });
     } else {
       this.log?.info('[RongCloudClient] 使用 setOnReceiveMessageListener 模式');
-      
+
       RongIMLib.setConnectionStatusListener({
         onChanged: (status) => {
           this.log?.info(`[RongCloudClient] 连接状态变化: ${status}`);
@@ -122,7 +122,7 @@ class RongCloudClient {
       let parsed = null;
       try {
         parsed = JSON.parse(content);
-      } catch {}
+      } catch { }
 
       if (parsed && parsed.msg_type) {
         if (SYSTEM_MSG_TYPES.has(parsed.msg_type)) {
@@ -184,7 +184,7 @@ class RongCloudClient {
         { content }
       );
 
-      this.log?.info(`[RongCloudClient] 发送结果: code=${result.code}`);
+      // this.log?.info(`[RongCloudClient] 发送结果: code=${result.code}`);
 
       if (result.code === 0 || result.code === 200) {
         this.log?.info(`[RongCloudClient] 发送成功, messageUId: ${result.data?.messageUId}`);
@@ -220,13 +220,23 @@ class RongCloudClient {
     this.log?.info(`[RongCloudClient] 准备发送已读回执: conversationType=${conversationType}, senderUserId=${senderUserId}, targetId=${targetId}, messageUId=${messageUId}, sentTime=${sentTime}`);
 
     try {
+      // 优先使用 V5 已读回执 API（与前端 enableReadV5 对齐）
+      if (typeof RongIMLib.sendReadReceiptResponseV5 === 'function') {
+        this.log?.info(`[RongCloudClient] 发送 V5 已读回执 -> targetId=${targetId}, messageUId=${messageUId}`);
+        const result = await RongIMLib.sendReadReceiptResponseV5(
+          { conversationType, targetId },
+          [messageUId]
+        );
+        this.log?.info(`[RongCloudClient] V5 已读回执结果: code=${result.code}, msg=${result.msg || ''}`);
+        return result.code === 0 || result.code === 200;
+      }
+
       if (conversationType === ConversationType.GROUP) {
         if (typeof RongIMLib.sendReadReceiptResponseV2 !== 'function') {
           this.log?.warn('[RongCloudClient] SDK 不支持群聊已读回执');
           return false;
         }
         this.log?.info(`[RongCloudClient] 发送群聊已读回执 -> ${targetId}, messageUId=${messageUId}`);
-        // sendReadReceiptResponseV2 参数格式: (targetId, Record<senderUserId, messageUId[]>)
         const result = await RongIMLib.sendReadReceiptResponseV2(targetId, {
           [senderUserId]: [messageUId]
         });

@@ -115,17 +115,18 @@ class MessageHandler {
   }
 
   async handleClaw(msg) {
-    const reply = await this.openclawClient.chat(msg.content, msg.senderUserId);
-    this.log?.info(`[MessageHandler] AI 回复: ${reply.substring(0, 50)}...`);
-
-    // 龙虾调用成功，发送已读回执
+    // 先发送已读回执（表示消息已被接收和处理）
     if (this.sendReadReceiptFn) {
       try {
         await this.sendReadReceiptFn(msg);
+        this.log?.info(`[MessageHandler] 已读回执已发送`);
       } catch (err) {
         this.log?.error(`[MessageHandler] 发送已读回执失败: ${err.message}`);
       }
     }
+
+    const reply = await this.openclawClient.chat(msg.content, msg.senderUserId);
+    this.log?.info(`[MessageHandler] AI 回复: ${reply.substring(0, 50)}...`);
 
     const targetId = this.getReplyTarget(msg);
     await this.sendFn(targetId, reply, msg.conversationType);

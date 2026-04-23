@@ -15,7 +15,13 @@ class OpenClawClient {
     this.log?.info(`[OpenClawClient] 准备发送消息到 OpenClaw，from=${fromUser}, message=${message.substring(0, 50)}`);
     const sessionId = `rongcloud-${fromUser}-${Date.now()}`;
     const isWindows = process.platform === 'win32';
-    const escapedMessage = message.replace(/"/g, '\\"');
+    // 转义消息中的特殊字符：双引号和换行符
+    const escapedMessage = message
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"')
+      .replace(/\r\n/g, ' ')
+      .replace(/\n/g, ' ')
+      .replace(/\r/g, ' ');
     // 使用默认 agent (main) 处理消息，不指定 --agent 参数
     const gatewayUrl = 'http://127.0.0.1:5678';
     const cmd = isWindows

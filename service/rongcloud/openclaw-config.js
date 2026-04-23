@@ -5,7 +5,8 @@ const { mkdirSync, readFileSync, writeFileSync, existsSync } = require('fs');
 const OPENCLAW_DIR = join(homedir(), '.openclaw');
 const SETTINGS_FILE = join(OPENCLAW_DIR, 'openclaw.json');
 
-const DEFAULT_PLUGINS = ['claw_messenger', 'openclaw-weixin', 'openclaw-wechat'];
+const DEFAULT_PLUGINS = ['claw_messenger'];
+const REMOVED_PLUGINS = ['openclaw-weixin', 'openclaw-wechat'];
 
 function ensurePluginsAllow(log) {
   try {
@@ -28,18 +29,25 @@ function ensurePluginsAllow(log) {
   if (!settings.plugins) settings.plugins = {};
 
   const existing = settings.plugins.allow || [];
-  const missing = DEFAULT_PLUGINS.filter(p => !existing.includes(p));
+  const cleaned = existing.filter(p => !REMOVED_PLUGINS.includes(p));
+  const removedCount = existing.length - cleaned.length;
+  const missing = DEFAULT_PLUGINS.filter(p => !cleaned.includes(p));
 
-  if (missing.length === 0) {
+  if (missing.length === 0 && removedCount === 0) {
     log?.info('[OpenClawConfig] plugins.allow 已完整');
     return true;
   }
 
-  settings.plugins.allow = [...new Set([...existing, ...DEFAULT_PLUGINS])];
+  settings.plugins.allow = [...new Set([...cleaned, ...DEFAULT_PLUGINS])];
 
   try {
     writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), 'utf-8');
-    log?.info(`[OpenClawConfig] 已添加: ${missing.join(', ')}`);
+    if (missing.length > 0) {
+      log?.info(`[OpenClawConfig] 已添加: ${missing.join(', ')}`);
+    }
+    if (removedCount > 0) {
+      log?.info(`[OpenClawConfig] 已清理无效插件: ${REMOVED_PLUGINS.join(', ')}`);
+    }
     return true;
   } catch (err) {
     log?.error(`[OpenClawConfig] 写入失败: ${err.message}`);
