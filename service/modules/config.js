@@ -37,8 +37,7 @@ function loadConfig() {
     openclawPort: localConfig.openclawPort || 18789,
     scriptTimeout: localConfig.scriptTimeout || 180,
     successKeyword: localConfig.successKeyword || 'Success',
-    chatTimeout: localConfig.chatTimeout || 600,
-    backendUrl: localConfig.backendUrl || 'http://127.0.0.1:8003'
+    chatTimeout: localConfig.chatTimeout || 600
   };
 }
 
