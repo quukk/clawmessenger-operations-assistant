@@ -239,6 +239,15 @@ class ScriptExecutor {
         }
       });
 
+      child.on('exit', (code) => {
+        if (!killed) {
+          killed = true;
+          clearTimeout(timer);
+          resolve({ stdout, stderr });
+        }
+      });
+      
+      // 备用：如果 exit 没有被触发，使用 close
       child.on('close', () => {
         if (!killed) {
           killed = true;
