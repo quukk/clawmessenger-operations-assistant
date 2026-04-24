@@ -44,7 +44,7 @@ class RongCloudClient {
       this.log?.info('[RongCloudClient] 使用 addEventListener 模式');
 
       RongIMLib.addEventListener(RongIMLib.Events?.MESSAGES || 'MESSAGES', (event) => {
-        this.log?.info(`[RongCloudClient] 收到消息事件: ${JSON.stringify(event).substring(0, 200)}`);
+        // this.log?.info(`[RongCloudClient] 收到消息事件: ${JSON.stringify(event).substring(0, 200)}`);
         event.messages?.forEach(msg => {
           this.handleReceivedMessage(msg);
         });

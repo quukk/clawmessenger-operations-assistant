@@ -1,7 +1,7 @@
 {
   "name": "silent-service",
   "version": "1.0.0",
-  "description": "Node.js 静默后台服务，开机自启，崩溃自动恢复，支持自动更新和融云消息监听",
+  "description": "claw-silent-service 静默后台服务，开机自启，崩溃自动恢复，支持自动更新和融云消息监听",
   "main": "service/daemon.js",
   "scripts": {
     "install-service": "node scripts/install-silent.js",
