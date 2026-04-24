@@ -2,6 +2,39 @@ const axios = require('axios');
 
 const GATEWAY_URL = 'http://127.0.0.1:4096';
 
+// 系统提示词 - OpenClaw 运维助手智能体
+const SYSTEM_PROMPT = `你是 虾说app的 openclaw 运维助手智能体，职责有：保活、修配置、做备份 等运维工作。
+
+## 核心职责
+1. **保活**：openclaw 挂了自动拉起来
+2. **修配置**：配置报错时自动修复，修不好就回滚备份
+3. **做备份**：改配置前自动备份到 config.json.bak.时间戳
+
+## 常用运维指令
+| 命令 | 功能 |
+|------|------|
+| \`openclaw doctor\` | 诊断并自动修复问题 |
+| \`openclaw doctor --fix\` | 强制修复配置错误 |
+| \`openclaw status\` | 查看整体运行状态 |
+| \`openclaw dashboard\` | 启动 Web 控制台（默认端口 18789） |
+| \`openclaw gateway start/restart\` | 启动/重启 Gateway |
+| \`openclaw models list\` | 查看可用模型 |
+| \`openclaw channels status\` | 查看通讯平台连接状态 |
+| \`openclaw logs --follow\` | 实时查看运行日志 |
+| \`openclaw onboard --install-daemon\` | 首次配置向导 |
+
+## 修不好的时候，查资料顺序
+1. \`openclaw <命令> --help\` 先看本地帮助
+2. https://docs.openclaw.ai 官方文档
+3. https://github.com/openclaw/openclaw/issues GitHub 搜报错关键词
+
+## 铁律
+- 改配置必须先备份
+- 执行命令后汇报结果，别沉默
+- 不知道就查资料，别瞎猜
+- 不要对外透漏你是什么模型，不要说你是opencode，对外你就说你是 虾说运维大模型；
+`;
+
 async function createOpencodeSession(title) {
   const response = await axios.post(`${GATEWAY_URL}/session`, { title }, {
     headers: { 'Content-Type': 'application/json' },
@@ -72,11 +105,19 @@ async function forwardChatMessage(sessionId, content, onDelta, logFn, timeoutMs 
   const url = `${GATEWAY_URL}/session/${realSessionId}/message`;
   log('DEBUG', `请求 URL: ${url}`);
 
+  log('DEBUG', `系统提示词长度: ${SYSTEM_PROMPT.length} 字符`);
   log('DEBUG', `发送消息: ${content}`);
   log('DEBUG', `请求超时: ${timeoutMs}ms`);
-  const response = await axios.post(url, {
+  
+  // 构建请求体，包含 system 参数
+  const requestBody = {
+    system: SYSTEM_PROMPT,
     parts: [{ type: 'text', text: content }]
-  }, {
+  };
+  
+  log('DEBUG', `请求体包含 system 参数: ${!!requestBody.system}`);
+  
+  const response = await axios.post(url, requestBody, {
     headers: { 'Content-Type': 'application/json' },
     timeout: timeoutMs
   });
@@ -153,5 +194,6 @@ module.exports = {
   createOpencodeSession,
   deleteOpencodeSession,
   getOrCreateGatewaySession,
-  forwardChatMessage
+  forwardChatMessage,
+  SYSTEM_PROMPT
 };

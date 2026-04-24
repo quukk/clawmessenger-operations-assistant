@@ -232,6 +232,7 @@ class ScriptExecutor {
       });
 
       child.on('error', (err) => {
+        console.error(`[ScriptExecutor] 子进程错误: ${err.message}`);
         if (!killed) {
           killed = true;
           clearTimeout(timer);
@@ -243,16 +244,28 @@ class ScriptExecutor {
         if (!killed) {
           killed = true;
           clearTimeout(timer);
+          console.log(`[ScriptExecutor] 脚本退出，code=${code}, stdout长度=${stdout.length}`);
           resolve({ stdout, stderr });
         }
       });
       
       // 备用：如果 exit 没有被触发，使用 close
-      child.on('close', () => {
+      child.on('close', (code) => {
         if (!killed) {
           killed = true;
           clearTimeout(timer);
+          console.log(`[ScriptExecutor] 脚本关闭，code=${code}, stdout长度=${stdout.length}`);
           resolve({ stdout, stderr });
+        }
+      });
+      
+      // 错误处理
+      child.on('error', (err) => {
+        console.error(`[ScriptExecutor] 子进程错误: ${err.message}`);
+        if (!killed) {
+          killed = true;
+          clearTimeout(timer);
+          reject(err);
         }
       });
     });
