@@ -2,12 +2,23 @@
   "name": "silent-service",
   "version": "1.0.0",
   "description": "claw-silent-service 静默后台服务，开机自启，崩溃自动恢复，支持自动更新和融云消息监听",
-  "main": "service/daemon.js",
+  "main": "cli.js",
+  "bin": {
+    "silent-service": "cli.js"
+  },
   "scripts": {
     "install-service": "node scripts/install-silent.js",
     "uninstall-service": "node scripts/uninstall.js",
     "dev": "nodemon cli.js --run"
   },
+  "files": [
+    "cli.js",
+    "service/",
+    "scripts/",
+    "command/",
+    "version.json",
+    "README.md"
+  ],
   "dependencies": {
     "@rongcloud/imlib-next": "^5.36.6",
     "axios": "^1.15.2",

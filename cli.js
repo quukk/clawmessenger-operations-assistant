@@ -25,7 +25,7 @@ const command = args[0] || '--run';
 
 function runDaemon() {
   console.log('[CLI] 启动 Daemon...');
-  
+
   const daemon = spawn('node', [DAEMON_PATH], {
     stdio: 'inherit',
     detached: false
@@ -44,12 +44,14 @@ function runDaemon() {
 
 function installService() {
   console.log('[CLI] 安装系统服务...');
-  
+
   const platform = process.platform;
-  
+  const execPath = process.execPath;
+
   if (platform === 'win32') {
-    // Windows: 使用 node-windows
+    // Windows: 优先使用 node-windows，失败时回退 sc 命令（兼容 pkg 打包）
     try {
+      if (process.pkg) throw new Error('pkg 环境');
       const Service = require('node-windows').Service;
       const svc = new Service({
         name: SERVICE_NAME,
@@ -57,23 +59,26 @@ function installService() {
         script: DAEMON_PATH,
         nodeOptions: ['--harmony', '--max_old_space_size=4096']
       });
-      
-      svc.on('install', () => {
-        console.log('[CLI] 服务安装成功');
-        svc.start();
-      });
-      
-      svc.on('error', (err) => {
-        console.error(`[CLI] 服务安装失败: ${err.message}`);
-      });
-      
+      svc.on('install', () => { console.log('[CLI] 服务安装成功'); svc.start(); });
+      svc.on('error', (err) => { console.error(`[CLI] 服务安装失败: ${err.message}`); });
       svc.install();
     } catch (err) {
-      console.error(`[CLI] 安装失败: ${err.message}`);
-      console.log('请先安装 node-windows: npm install node-windows --save');
+      // 回退到 sc 命令（pkg 或无 node-windows 环境）
+      console.log('[CLI] 使用 sc 命令安装服务...');
+      const binPath = process.pkg
+        ? `"${execPath}" --run`
+        : `"${execPath}" "${DAEMON_PATH}"`;
+      exec(`sc create ${SERVICE_NAME} binPath= "${binPath}" start= auto displayname= "OpenClaw Guard"`, (err2) => {
+        if (err2) return console.error(`[CLI] 服务安装失败: ${err2.message}`);
+        console.log('[CLI] 服务安装成功');
+        exec(`net start ${SERVICE_NAME}`, (err3) => {
+          if (err3) console.error(`[CLI] 启动服务失败: ${err3.message}`);
+        });
+      });
     }
   } else if (platform === 'linux') {
     // Linux: systemd
+    const execStart = `/usr/bin/node ${DAEMON_PATH}`;
     const serviceFile = `/etc/systemd/system/${SERVICE_NAME}.service`;
     const serviceContent = `[Unit]
 Description=OpenClaw Guard CLI Client
@@ -81,7 +86,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/node ${DAEMON_PATH}
+ExecStart=${execStart}
 Restart=always
 RestartSec=10
 WorkingDirectory=${path.dirname(DAEMON_PATH)}
@@ -89,16 +94,19 @@ WorkingDirectory=${path.dirname(DAEMON_PATH)}
 [Install]
 WantedBy=multi-user.target
 `;
-    
-    fs.writeFileSync(serviceFile, serviceContent);
-    exec('systemctl daemon-reload && systemctl enable ' + SERVICE_NAME, (err) => {
-      if (err) {
-        console.error(`[CLI] 安装失败: ${err.message}`);
-      } else {
-        console.log('[CLI] 服务安装成功');
-        exec('systemctl start ' + SERVICE_NAME);
-      }
-    });
+
+    try {
+      fs.writeFileSync(serviceFile, serviceContent);
+      exec('systemctl daemon-reload && systemctl enable ' + SERVICE_NAME, (err) => {
+        if (err) console.error(`[CLI] 安装失败: ${err.message}`);
+        else {
+          console.log('[CLI] 服务安装成功');
+          exec('systemctl start ' + SERVICE_NAME);
+        }
+      });
+    } catch (err) {
+      console.error(`[CLI] 写入 service 文件失败: ${err.message}`);
+    }
   } else if (platform === 'darwin') {
     // macOS: launchd
     const plistFile = `/Library/LaunchDaemons/${SERVICE_NAME}.plist`;
@@ -119,38 +127,38 @@ WantedBy=multi-user.target
     <true/>
 </dict>
 </plist>`;
-    
-    fs.writeFileSync(plistFile, plistContent);
-    exec(`launchctl load ${plistFile} && launchctl start ${SERVICE_NAME}`, (err) => {
-      if (err) {
-        console.error(`[CLI] 安装失败: ${err.message}`);
-      } else {
-        console.log('[CLI] 服务安装成功');
-      }
-    });
+
+    try {
+      fs.writeFileSync(plistFile, plistContent);
+      exec(`launchctl load ${plistFile} && launchctl start ${SERVICE_NAME}`, (err) => {
+        if (err) console.error(`[CLI] 安装失败: ${err.message}`);
+        else console.log('[CLI] 服务安装成功');
+      });
+    } catch (err) {
+      console.error(`[CLI] 写入 plist 文件失败: ${err.message}`);
+    }
   }
 }
 
 function uninstallService() {
   console.log('[CLI] 卸载系统服务...');
-  
+
   const platform = process.platform;
-  
+
   if (platform === 'win32') {
+    // Windows: 优先使用 node-windows，失败回退 sc 命令
     try {
+      if (process.pkg) throw new Error('pkg 环境');
       const Service = require('node-windows').Service;
-      const svc = new Service({
-        name: SERVICE_NAME,
-        script: DAEMON_PATH
-      });
-      
-      svc.on('uninstall', () => {
-        console.log('[CLI] 服务卸载成功');
-      });
-      
+      const svc = new Service({ name: SERVICE_NAME, script: DAEMON_PATH });
+      svc.on('uninstall', () => console.log('[CLI] 服务卸载成功'));
       svc.uninstall();
     } catch (err) {
-      console.error(`[CLI] 卸载失败: ${err.message}`);
+      console.log('[CLI] 使用 sc 命令卸载服务...');
+      exec(`sc stop ${SERVICE_NAME} 2>nul & sc delete ${SERVICE_NAME}`, (err2) => {
+        if (err2) console.error(`[CLI] 卸载失败: ${err2.message}`);
+        else console.log('[CLI] 服务卸载成功');
+      });
     }
   } else if (platform === 'linux') {
     exec(`systemctl stop ${SERVICE_NAME} && systemctl disable ${SERVICE_NAME} && rm -f /etc/systemd/system/${SERVICE_NAME}.service && systemctl daemon-reload`, (err) => {

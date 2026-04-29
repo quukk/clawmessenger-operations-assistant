@@ -20,7 +20,14 @@ function startWorker(isAfterUpdate = false, backupDirForRollback = null) {
 
   log.info(`[DAEMON] 启动 Worker，PID: ${process.pid}，更新后重启: ${isAfterUpdate}`);
 
-  worker = fork(WORKER_PATH, [], { stdio: 'pipe' });
+  // Windows 服务中需要使用 detached: true 避免控制台关联问题
+  const forkOptions = {
+    stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
+    detached: process.platform === 'win32',
+    windowsHide: process.platform === 'win32'
+  };
+
+  worker = fork(WORKER_PATH, [], forkOptions);
 
   worker.stdout?.on('data', d => log.info(`[WORKER] ${d.toString().trim()}`));
   worker.stderr?.on('data', d => log.error(`[WORKER] ${d.toString().trim()}`));
@@ -80,10 +87,25 @@ function restartWorkerWithUpdate(backupDir) {
 
   worker.send({ type: 'prepare-shutdown', reason: 'update' });
 
+  // Windows 上等待时间稍长
+  const waitTime = process.platform === 'win32' ? 5000 : 3000;
+
   setTimeout(() => {
     if (worker) {
       worker.removeAllListeners('exit');
-      worker.kill('SIGTERM');
+
+      // Windows 上使用 taskkill 确保进程树被终止
+      if (process.platform === 'win32' && worker.pid) {
+        try {
+          const { execSync } = require('child_process');
+          execSync(`taskkill /pid ${worker.pid} /T /F 2>nul`, { windowsHide: true });
+        } catch (e) {
+          // 忽略错误，使用 kill 作为后备
+          worker.kill('SIGTERM');
+        }
+      } else {
+        worker.kill('SIGTERM');
+      }
 
       const waitKill = setInterval(() => {
         if (!worker || worker.killed) {
@@ -91,13 +113,23 @@ function restartWorkerWithUpdate(backupDir) {
           worker = null;
           setTimeout(() => startWorker(true, backupDir), 1000);
         } else {
-          worker.kill('SIGKILL');
+          // 再次尝试强制终止
+          if (process.platform === 'win32' && worker.pid) {
+            try {
+              const { execSync } = require('child_process');
+              execSync(`taskkill /pid ${worker.pid} /T /F 2>nul`, { windowsHide: true });
+            } catch (e) {
+              worker.kill('SIGKILL');
+            }
+          } else {
+            worker.kill('SIGKILL');
+          }
         }
       }, 500);
     } else {
       startWorker(true, backupDir);
     }
-  }, 3000);
+  }, waitTime);
 }
 
 function gracefulShutdown() {
@@ -106,14 +138,34 @@ function gracefulShutdown() {
   log.info('[DAEMON] 收到停止信号，正在终止 Worker...');
 
   if (worker) {
-    worker.kill('SIGTERM');
+    // 先尝试优雅地通知 Worker 退出
+    try {
+      worker.send({ type: 'prepare-shutdown', reason: 'daemon-stopping' });
+    } catch (e) {
+      // 忽略发送失败
+    }
+
+    // Windows 上等待时间稍长，给子进程时间清理
+    const waitTime = process.platform === 'win32' ? 8000 : 5000;
+
     setTimeout(() => {
       if (worker && !worker.killed) {
         log.error('[DAEMON] Worker 未响应，强制杀死');
-        worker.kill('SIGKILL');
+        // Windows 上使用 taskkill 确保进程树被终止
+        if (process.platform === 'win32' && worker.pid) {
+          try {
+            const { execSync } = require('child_process');
+            execSync(`taskkill /pid ${worker.pid} /T /F 2>nul`, { windowsHide: true });
+          } catch (e) {
+            // 忽略错误，使用 kill 作为后备
+            worker.kill('SIGKILL');
+          }
+        } else {
+          worker.kill('SIGKILL');
+        }
       }
       process.exit(0);
-    }, 5000);
+    }, waitTime);
   } else {
     process.exit(0);
   }

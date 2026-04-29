@@ -12,7 +12,7 @@ const { getMacAddress } = require('./modules/mac-address');
 const { startOpencodeService, stopOpencodeService } = require('./modules/opencode-starter');
 
 const log = createLogger('worker');
-const PORT = 33100;
+const PORT = process.env.SILENT_SERVICE_PORT ? parseInt(process.env.SILENT_SERVICE_PORT, 10) : 28765;
 
 // Timestamp 校验专用日志
 const timestampLogPath = path.join(__dirname, '..', 'logs', 'timestamp-validation.log');
