@@ -15,9 +15,10 @@
 const { spawn, exec } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 
 const DAEMON_PATH = path.join(__dirname, 'service', 'daemon.js');
-const SERVICE_NAME = 'openclaw-guard-cli';
+const SERVICE_NAME = 'claw-subagent-service';
 
 // 解析命令行参数
 const args = process.argv.slice(2);
@@ -57,6 +58,7 @@ function installService() {
         name: SERVICE_NAME,
         description: 'OpenClaw Guard CLI Client',
         script: DAEMON_PATH,
+        workingdirectory: os.homedir(),
         nodeOptions: ['--harmony', '--max_old_space_size=4096']
       });
       svc.on('install', () => { console.log('[CLI] 服务安装成功'); svc.start(); });

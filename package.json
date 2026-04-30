@@ -1,15 +1,18 @@
 {
-  "name": "silent-service",
-  "version": "1.0.0",
-  "description": "claw-silent-service 静默后台服务，开机自启，崩溃自动恢复，支持自动更新和融云消息监听",
+  "name": "claw-subagent-service",
+  "version": "0.0.7",
+  "description": "虾说静态服务",
   "main": "cli.js",
   "bin": {
-    "silent-service": "cli.js"
+    "claw-subagent-service": "cli.js"
   },
   "scripts": {
     "install-service": "node scripts/install-silent.js",
     "uninstall-service": "node scripts/uninstall.js",
-    "dev": "nodemon cli.js --run"
+    "dev": "nodemon cli.js --run",
+    "publish:patch": "npm version patch && npm publish",
+    "publish:minor": "npm version minor && npm publish",
+    "publish:major": "npm version major && npm publish"
   },
   "files": [
     "cli.js",

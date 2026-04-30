@@ -8,7 +8,7 @@ const path = require('path');
 
 class ServiceManager {
   constructor(serviceName, serviceDesc, scriptPath, log) {
-    this.serviceName = serviceName || 'openclaw-guard-cli';
+    this.serviceName = serviceName || 'claw-subagent-service';
     this.serviceDesc = serviceDesc || 'OpenClaw Guard CLI Client';
     this.scriptPath = scriptPath || process.argv[1];
     this.log = log;

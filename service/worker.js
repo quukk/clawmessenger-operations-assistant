@@ -2,6 +2,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { execSync } = require('child_process');
 const { createLogger } = require('./logger');
 const { RongCloudClient, MessageHandler, ensurePluginsAllow } = require('./rongcloud');
 const { RongyunMessageHandler } = require('./modules/rongyun-message-handler');
@@ -13,6 +14,70 @@ const { startOpencodeService, stopOpencodeService } = require('./modules/opencod
 
 const log = createLogger('worker');
 const PORT = process.env.SILENT_SERVICE_PORT ? parseInt(process.env.SILENT_SERVICE_PORT, 10) : 28765;
+
+/**
+ * 查找占用指定端口的进程 PID
+ * Windows 下检查本地地址（第二列）是否匹配目标端口，不限于 LISTENING 状态
+ */
+function findPidOnPort(port) {
+  try {
+    if (process.platform === 'win32') {
+      const out = execSync(`netstat -ano | findstr ":${port}"`, {
+        encoding: 'utf8', timeout: 5000, windowsHide: true,
+      });
+      for (const line of out.split('\n')) {
+        const parts = line.trim().split(/\s+/);
+        // netstat -ano 格式: Proto LocalAddress ForeignAddress State PID
+        // 检查本地地址是否以目标端口结尾（避免匹配到 ForeignAddress）
+        const localAddr = parts[1] || '';
+        if (localAddr.endsWith(`:${port}`) || localAddr.endsWith(`]:${port}`)) {
+          const pid = parseInt(parts[parts.length - 1], 10);
+          if (!isNaN(pid)) return pid;
+        }
+      }
+    } else {
+      const out = execSync(`lsof -i :${port} -t 2>/dev/null`, { encoding: 'utf8', timeout: 5000 });
+      const pid = parseInt(out.trim(), 10);
+      if (!isNaN(pid)) return pid;
+    }
+  } catch { /* port is free */ }
+  return null;
+}
+
+/**
+ * 强制终止进程
+ */
+function forceKill(pid) {
+  try {
+    if (process.platform === 'win32') {
+      execSync(`taskkill /F /PID ${pid}`, { timeout: 5000, windowsHide: true });
+    } else {
+      process.kill(pid, 'SIGKILL');
+    }
+    return true;
+  } catch { return false; }
+}
+
+/**
+ * 确保端口未被占用：如果端口被占用，尝试杀死占用进程
+ * 最多重试 3 轮，每轮间隔 1 秒
+ */
+function ensurePortFree(port) {
+  for (let i = 0; i < 3; i++) {
+    const pid = findPidOnPort(port);
+    if (!pid) return true;
+    log.warn(`[WORKER] 端口 ${port} 被进程 ${pid} 占用，正在释放...`);
+    forceKill(pid);
+    // 同步等待端口释放（最多 1.5s）
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500);
+  }
+  const finalPid = findPidOnPort(port);
+  if (finalPid) {
+    log.error(`[WORKER] 端口 ${port} 被进程 ${finalPid} 占用，无法释放`);
+    return false;
+  }
+  return true;
+}
 
 // Timestamp 校验专用日志
 const timestampLogPath = path.join(__dirname, '..', 'logs', 'timestamp-validation.log');
@@ -281,6 +346,33 @@ const server = http.createServer((req, res) => {
   res.end('not found');
 });
 
+// 启动前确保端口未被占用（防止 EADDRINUSE 导致崩溃循环）
+if (!ensurePortFree(PORT)) {
+  log.error(`[WORKER] 端口 ${PORT} 无法使用，进程退出`);
+  process.exit(1);
+}
+
+// 错误处理器必须先注册，再调用 listen，避免 EADDRINUSE 成为未捕获异常
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    log.error(`[WORKER] 端口 ${PORT} 被占用，尝试释放并重启监听...`);
+    // 尝试杀死占用进程后重试
+    const pid = findPidOnPort(PORT);
+    if (pid) {
+      log.warn(`[WORKER] 发现占用进程 ${pid}，强制终止...`);
+      forceKill(pid);
+    }
+    // 延迟 2 秒后重试
+    setTimeout(() => {
+      log.info(`[WORKER] 重新尝试监听端口 ${PORT}...`);
+      server.close(() => {});
+      server.listen(PORT, '127.0.0.1');
+    }, 2000);
+    return;
+  }
+  log.error(`[WORKER] HTTP 服务错误: ${err.message}`);
+});
+
 server.listen(PORT, '127.0.0.1', () => {
   log.info(`[WORKER] HTTP 服务已启动: http://127.0.0.1:${PORT}/health`);
 });
@@ -342,6 +434,11 @@ if (process.platform === 'win32') {
 
 // 处理未捕获的异常
 process.on('uncaughtException', async (err) => {
+  // EADDRINUSE 已由 server.on('error') 处理，这里避免重复触发优雅关闭
+  if (err.code === 'EADDRINUSE' && err.message && err.message.includes(String(PORT))) {
+    log.warn(`[WORKER] 捕获到 EADDRINUSE（端口 ${PORT}），交由 server 错误处理器重试`);
+    return;
+  }
   log.error(`[WORKER] 未捕获异常: ${err.message}\n${err.stack}`);
   if (!isShuttingDown) {
     await gracefulShutdown('uncaughtException');
@@ -356,14 +453,21 @@ process.on('unhandledRejection', async (reason) => {
   }
 });
 
+// 拦截 process.exit 以定位调用来源
+const originalExit = process.exit;
+process.exit = function(code) {
+  const stack = new Error('process.exit called from:').stack;
+  log.error(`[WORKER] process.exit(${code}) 被调用:\n${stack}`);
+  originalExit.call(process, code);
+};
+
 // 处理进程退出事件（最后的机会）
 process.on('exit', (code) => {
+  log.warn(`[WORKER] 进程即将退出 (code=${code}), isShuttingDown=${isShuttingDown}`);
   if (!isShuttingDown && rongcloudClient?.isConnected) {
-    log.warn(`[WORKER] 进程即将退出 (code=${code})，尝试发送 CLIENT_DISCONNECTED...`);
     // 同步发送，因为 exit 事件不支持异步
     try {
       const messageSender = new RongyunMessageSender(rongcloudClient, rongcloudConfig, log);
-      // 使用同步方式发送（如果可能）
       messageSender.sendClientDisconnected().catch(() => {});
     } catch (e) {
       // 忽略错误

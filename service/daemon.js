@@ -1,30 +1,148 @@
-const { fork } = require('child_process');
+const { fork, execSync } = require('child_process');
 const path = require('path');
+const fs = require('fs');
+const os = require('os');
 const { createLogger } = require('./logger');
 const { Updater } = require('./updater');
+const { checkPortListening } = require('./modules/port-checker');
 
 const log = createLogger('daemon');
 const WORKER_PATH = path.join(__dirname, 'worker.js');
+const PORT = process.env.SILENT_SERVICE_PORT ? parseInt(process.env.SILENT_SERVICE_PORT, 10) : 28765;
+// 使用全局 PID 文件，防止不同安装路径的多个实例同时运行
+const PID_FILE = path.join(os.homedir(), '.claw-subagent-service.pid');
 
 let worker = null;
 let stopping = false;
 let isRollingBack = false;
 let healthTimer = null;
 let currentBackupDir = null;
+let crashCount = 0;
+let lastCrashTime = 0;
 const updater = new Updater();
 
 process.chdir(__dirname);
 
+/**
+ * 检查是否有其他 Daemon 实例在运行
+ */
+function checkSingleton() {
+  try {
+    if (fs.existsSync(PID_FILE)) {
+      const pid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10);
+      if (!isNaN(pid)) {
+        try {
+          // 发送信号 0 检查进程是否存在（Windows 也支持）
+          process.kill(pid, 0);
+          log.error(`[DAEMON] 另一个 Daemon 实例已在运行 (PID: ${pid})，当前实例退出`);
+          return false;
+        } catch {
+          // 进程不存在，继续启动
+        }
+      }
+    }
+  } catch {
+    // PID 文件读取失败，继续启动
+  }
+
+  try {
+    fs.writeFileSync(PID_FILE, String(process.pid));
+  } catch (err) {
+    log.warn(`[DAEMON] 写入 PID 文件失败: ${err.message}`);
+  }
+  return true;
+}
+
+/**
+ * 清理 PID 文件
+ */
+function cleanupPidFile() {
+  try {
+    if (fs.existsSync(PID_FILE)) {
+      const pid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10);
+      if (pid === process.pid) {
+        fs.unlinkSync(PID_FILE);
+      }
+    }
+  } catch {
+    // 忽略清理错误
+  }
+}
+
+if (!checkSingleton()) {
+  process.exit(0);
+}
+
+process.on('exit', cleanupPidFile);
+process.on('SIGINT', cleanupPidFile);
+process.on('SIGTERM', cleanupPidFile);
+
+/**
+ * 尝试释放占用的端口（杀死占用进程）
+ * Windows 下检查本地地址（第二列）是否匹配目标端口，不限于 LISTENING 状态
+ */
+function freePortIfNeeded(port) {
+  try {
+    if (process.platform === 'win32') {
+      const out = execSync(`netstat -ano | findstr ":${port}"`, {
+        encoding: 'utf8', timeout: 5000, windowsHide: true,
+      });
+      for (const line of out.split('\n')) {
+        const parts = line.trim().split(/\s+/);
+        const localAddr = parts[1] || '';
+        if (localAddr.endsWith(`:${port}`) || localAddr.endsWith(`]:${port}`)) {
+          const pid = parseInt(parts[parts.length - 1], 10);
+          if (pid && pid > 0) {
+            log.warn(`[DAEMON] 端口 ${port} 被进程 ${pid} 占用，正在释放...`);
+            try {
+              execSync(`taskkill /F /PID ${pid}`, { timeout: 5000, windowsHide: true });
+            } catch (e) {
+              log.warn(`[DAEMON] 终止进程 ${pid} 失败: ${e.message}`);
+            }
+          }
+        }
+      }
+    } else {
+      const out = execSync(`lsof -i :${port} -t 2>/dev/null`, { encoding: 'utf8', timeout: 5000 });
+      const pid = parseInt(out.trim(), 10);
+      if (pid && pid > 0) {
+        log.warn(`[DAEMON] 端口 ${port} 被进程 ${pid} 占用，正在释放...`);
+        process.kill(pid, 'SIGKILL');
+      }
+    }
+  } catch { /* 端口已被释放或无法查询 */ }
+}
+
+/**
+ * 获取重启延迟（指数退避，最大 60 秒）
+ */
+function getRestartDelay() {
+  const now = Date.now();
+  // 如果距离上次崩溃超过 30 秒，重置计数器
+  if (now - lastCrashTime > 30000) {
+    crashCount = 0;
+  }
+  lastCrashTime = now;
+  crashCount++;
+  // 指数退避: 1s, 2s, 4s, 8s, 16s, 32s, 60s(封顶)
+  const delay = Math.min(1000 * Math.pow(2, crashCount - 1), 60000);
+  log.info(`[DAEMON] Worker 连续崩溃 ${crashCount} 次，等待 ${delay/1000}s 后重启`);
+  return delay;
+}
+
 function startWorker(isAfterUpdate = false, backupDirForRollback = null) {
   if (stopping || isRollingBack) return;
 
-  log.info(`[DAEMON] 启动 Worker，PID: ${process.pid}，更新后重启: ${isAfterUpdate}`);
+  log.info(`[DAEMON] 启动 Worker，daemon PID: ${process.pid}，更新后重启: ${isAfterUpdate}`);
 
-  // Windows 服务中需要使用 detached: true 避免控制台关联问题
+  // 启动前释放旧端口，防止旧 worker 残留占用
+  freePortIfNeeded(PORT);
+
   const forkOptions = {
     stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
-    detached: process.platform === 'win32',
-    windowsHide: process.platform === 'win32'
+    // Windows 服务中 detached:true 会导致 worker 成为孤儿进程，
+    // 服务重启后旧 worker 依然占着端口引发 EADDRINUSE，因此使用默认 detached:false
+    windowsHide: true
   };
 
   worker = fork(WORKER_PATH, [], forkOptions);
@@ -68,7 +186,10 @@ function startWorker(isAfterUpdate = false, backupDirForRollback = null) {
     }
 
     if (!stopping && !isRollingBack) {
-      setTimeout(() => startWorker(false, null), 3000);
+      // 释放端口后使用指数退避重启
+      freePortIfNeeded(PORT);
+      const delay = getRestartDelay();
+      setTimeout(() => startWorker(false, null), delay);
     }
   });
 
@@ -138,37 +259,22 @@ function gracefulShutdown() {
   log.info('[DAEMON] 收到停止信号，正在终止 Worker...');
 
   if (worker) {
-    // 先尝试优雅地通知 Worker 退出
-    try {
-      worker.send({ type: 'prepare-shutdown', reason: 'daemon-stopping' });
-    } catch (e) {
-      // 忽略发送失败
-    }
-
-    // Windows 上等待时间稍长，给子进程时间清理
-    const waitTime = process.platform === 'win32' ? 8000 : 5000;
-
-    setTimeout(() => {
-      if (worker && !worker.killed) {
-        log.error('[DAEMON] Worker 未响应，强制杀死');
-        // Windows 上使用 taskkill 确保进程树被终止
-        if (process.platform === 'win32' && worker.pid) {
-          try {
-            const { execSync } = require('child_process');
-            execSync(`taskkill /pid ${worker.pid} /T /F 2>nul`, { windowsHide: true });
-          } catch (e) {
-            // 忽略错误，使用 kill 作为后备
-            worker.kill('SIGKILL');
-          }
-        } else {
-          worker.kill('SIGKILL');
-        }
+    // Windows 上直接使用 taskkill /T 杀死整个进程树
+    if (process.platform === 'win32' && worker.pid) {
+      try {
+        execSync(`taskkill /pid ${worker.pid} /T /F 2>nul`, { timeout: 5000, windowsHide: true });
+      } catch (e) {
+        try { worker.kill('SIGKILL'); } catch { /* 忽略 */ }
       }
-      process.exit(0);
-    }, waitTime);
-  } else {
-    process.exit(0);
+    } else {
+      try { worker.kill('SIGKILL'); } catch { /* 忽略 */ }
+    }
+    worker = null;
   }
+
+  // 释放端口，确保下次启动时端口可用
+  freePortIfNeeded(PORT);
+  process.exit(0);
 }
 
 process.on('SIGINT', gracefulShutdown);
