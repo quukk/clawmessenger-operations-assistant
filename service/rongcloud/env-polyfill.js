@@ -78,6 +78,7 @@ defineWinProp('onLine', true);
 defineWinProp('language', 'zh-CN');
 defineGlobalProp('navigator', win.navigator);
 
+defineWinProp('WebSocket', WebSocket);
 defineGlobalProp('WebSocket', WebSocket);
 defineGlobalProp('XMLHttpRequest', win.XMLHttpRequest);
 defineGlobalProp('window', win);

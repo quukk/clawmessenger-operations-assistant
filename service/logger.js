@@ -13,11 +13,15 @@ function createLogger(name) {
   };
 
   const write = (level, msg) => {
-    const line = `[${new Date().toISOString()}] [${level}] ${msg}\n`;
+    const line = `[${new Date().toISOString()}] [${level}] ${msg}`;
     try {
-      fs.appendFileSync(getFile(), line);
+      fs.appendFileSync(getFile(), line + '\n');
     } catch (e) {
       // ignore write errors
+    }
+    if (process.stdout && process.stdout.isTTY) {
+      const fn = level === 'ERROR' ? 'error' : level === 'WARN' ? 'warn' : 'log';
+      console[fn](line);
     }
   };
 

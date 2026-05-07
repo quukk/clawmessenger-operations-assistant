@@ -41,7 +41,20 @@ class MessageHandler {
       return false;
     }
 
-    const mentions = this.extractMentions(msg.content);
+    // 优先从融云 mentionedInfo 提取被@用户列表（用户界面 @昵称，但融云底层存的是 userId）
+    let mentions = [];
+    if (msg.mentionedInfo && Array.isArray(msg.mentionedInfo.userIdList)) {
+      mentions = msg.mentionedInfo.userIdList;
+      if (mentions.length > 0) {
+        this.log?.info(`[MessageHandler] 融云 mentionedInfo: ${mentions.join(', ')}，本节点: ${this.nodeId}`);
+      }
+    }
+
+    // 兜底：从文本内容中正则匹配 @claw_xxx
+    if (mentions.length === 0) {
+      const textContent = typeof msg.content === 'string' ? msg.content : (msg.content?.content || '');
+      mentions = this.extractMentions(textContent);
+    }
 
     if (mentions.length > 0) {
       if (!mentions.includes(this.nodeId)) {
@@ -49,8 +62,11 @@ class MessageHandler {
         return false;
       }
       this.log?.info(`[MessageHandler] 消息提及本节点(${this.nodeId})，处理`);
+    } else if (msg.conversationType === 3) {
+      this.log?.info(`[MessageHandler] 群聊消息未 @ 本节点(${this.nodeId})，忽略`);
+      return false;
     } else {
-      this.log?.info(`[MessageHandler] 消息未指定节点，本节点(${this.nodeId})处理`);
+      this.log?.info(`[MessageHandler] 单聊消息未指定节点，本节点(${this.nodeId})处理`);
     }
 
     return true;
@@ -63,12 +79,17 @@ class MessageHandler {
 
     try {
       const type = this.getMessageType(msg);
-      this.log?.info(`[MessageHandler] 收到消息 from=${msg.senderUserId}, type=${type}, content=${msg.content.substring(0, 50)}`);
+      const logContent = typeof msg.content === 'string' ? msg.content : (msg.content?.content || '');
+      this.log?.info(`[MessageHandler] 收到消息 from=${msg.senderUserId}, type=${type}, content=${logContent.substring(0, 50)}`);
       if (msg.messageType === 'claw') {
         this.log?.info(`收到龙虾消息，交由 OpenClawClient 处理`);
         await this.handleClaw(msg);
       } else {
-        await this.handleNormalMessage(msg);
+        const reply = await this.handleNormalMessage(msg);
+        if (reply) {
+          const targetId = this.getReplyTarget(msg);
+          await this.sendFn(targetId, reply, msg.conversationType);
+        }
       }
     } catch (err) {
       this.log?.error(`[MessageHandler] 处理消息异常: ${err.message}`);
@@ -81,7 +102,8 @@ class MessageHandler {
     if (msg.messageType === 'claw') {
       return MessageType.CLAW;
     }
-    if (msg.content && msg.content.startsWith('/')) {
+    const text = typeof msg.content === 'string' ? msg.content : (msg.content?.content || '');
+    if (text.startsWith('/')) {
       return MessageType.COMMAND;
     }
     return MessageType.NORMAL;
@@ -115,21 +137,23 @@ class MessageHandler {
   }
 
   async handleClaw(msg) {
-    // 先发送已读回执（表示消息已被接收和处理）
+    const targetId = this.getReplyTarget(msg);
+
+    // 发送已读回执（fire-and-forget，不阻塞）
     if (this.sendReadReceiptFn) {
-      try {
-        await this.sendReadReceiptFn(msg);
-        this.log?.info(`[MessageHandler] 已读回执已发送`);
-      } catch (err) {
-        this.log?.error(`[MessageHandler] 发送已读回执失败: ${err.message}`);
-      }
+      this.sendReadReceiptFn(msg).catch(() => {});
     }
 
-    const reply = await this.openclawClient.chat(msg.content, msg.senderUserId);
-    this.log?.info(`[MessageHandler] AI 回复: ${reply.substring(0, 50)}...`);
-
-    const targetId = this.getReplyTarget(msg);
-    await this.sendFn(targetId, reply, msg.conversationType);
+    // 后台执行 openclaw，不阻塞消息队列
+    this.openclawClient.chat(msg.content, msg.senderUserId)
+      .then(reply => {
+        this.log?.info(`[MessageHandler] AI 回复: ${reply.substring(0, 50)}...`);
+        this.sendFn(targetId, reply, msg.conversationType).catch(() => {});
+      })
+      .catch(err => {
+        this.log?.error(`[MessageHandler] OpenClaw 调用失败: ${err.message}`);
+        this.sendFn(targetId, `❌ 处理失败: ${err.message}`, msg.conversationType).catch(() => {});
+      });
   }
 
   parseCommand(raw, senderId) {

@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { execSync } = require('child_process');
+const axios = require('axios');
 const { createLogger } = require('./logger');
 const { RongCloudClient, MessageHandler, ensurePluginsAllow } = require('./rongcloud');
 const { RongyunMessageHandler } = require('./modules/rongyun-message-handler');
@@ -14,6 +15,23 @@ const { startOpencodeService, stopOpencodeService } = require('./modules/opencod
 
 const log = createLogger('worker');
 const PORT = process.env.SILENT_SERVICE_PORT ? parseInt(process.env.SILENT_SERVICE_PORT, 10) : 28765;
+
+
+// 捕获所有异常，强制打印到控制台（绕过 logger）
+process.on('uncaughtException', (err) => {
+  console.error('[WORKER_FATAL] 未捕获异常:', err);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[WORKER_FATAL] 未捕获Promise:', reason);
+});
+
+// 如果 logger 初始化后，也同步写到 logger
+const originalStderr = process.stderr.write.bind(process.stderr);
+process.stderr.write = (chunk, encoding, callback) => {
+  originalStderr(chunk, encoding, callback);
+};
 
 /**
  * 查找占用指定端口的进程 PID
@@ -93,9 +111,41 @@ const logTimestampValidation = (message) => {
 
 log.info(`[WORKER] 业务进程启动，PID: ${process.pid}`);
 
-const clawBridgeConfigPath = path.join(os.homedir(), '.claw-bridge', 'config.json');
 const localConfigPath = path.join(__dirname, '..', 'rongcloud-config.json');
 let rongcloudConfig = null;
+
+/**
+ * 获取实际用户主目录
+ * Windows 服务以 SYSTEM 运行时 os.homedir() 返回 systemprofile，
+ * 优先使用 CLAW_SERVICE_HOME / USERPROFILE 环境变量，最后扫描 C:\Users
+ */
+function getRealHomeDir() {
+  const envHome = process.env.CLAW_SERVICE_HOME || process.env.USERPROFILE || process.env.HOME;
+  if (envHome && !envHome.includes('systemprofile')) {
+    return envHome;
+  }
+  const homeDir = os.homedir();
+  if (!homeDir.includes('systemprofile')) {
+    return homeDir;
+  }
+  // SYSTEM 账户兜底：扫描 C:\Users 找包含 .claw-bridge 的实际用户目录
+  const usersDir = 'C:\\Users';
+  if (fs.existsSync(usersDir)) {
+    const entries = fs.readdirSync(usersDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory() && !['Public', 'Default', 'All Users', 'Default User'].includes(entry.name)) {
+        const candidate = path.join(usersDir, entry.name);
+        if (fs.existsSync(path.join(candidate, '.claw-bridge', 'config.json'))) {
+          return candidate;
+        }
+      }
+    }
+  }
+  return homeDir;
+}
+
+const homeDir = getRealHomeDir();
+const clawBridgeConfigPath = path.join(homeDir, '.claw-bridge', 'config.json');
 
 function loadRongCloudConfig() {
   let config = {};
@@ -108,7 +158,7 @@ function loadRongCloudConfig() {
       config.nodeName = clawConfig.nodeName;
       log.info(`[WORKER] 从 claw-bridge 加载配置: nodeId=${clawConfig.nodeId}, nodeName=${clawConfig.nodeName}`);
     } else {
-      log.warn('[WORKER] 未找到 ~/.claw-bridge/config.json');
+      log.warn(`[WORKER] 未找到 ${clawBridgeConfigPath}`);
     }
   } catch (err) {
     log.error(`[WORKER] 加载 claw-bridge 配置失败: ${err.message}`);
@@ -149,6 +199,53 @@ rongcloudConfig = loadRongCloudConfig();
 let rongcloudClient = null;
 let messageHandler = null;
 
+/**
+ * 向服务端刷新融云 token
+ */
+async function refreshRongCloudToken() {
+  const nodeId = rongcloudConfig?.accountId;
+  if (!nodeId) {
+    log.error('[WORKER] 无法刷新 token: 缺少 nodeId');
+    return false;
+  }
+
+  const serverUrl = process.env.DM_SERVER_URL || 'https://newsradar.dreamdt.cn/im';
+  try {
+    log.info(`[WORKER] 正在向服务端刷新 token, nodeId=${nodeId}`);
+    const resp = await axios.get(`${serverUrl}/api/claw/token/${nodeId}`, { timeout: 15000 });
+    if (resp.data?.code === 200) {
+      const newToken = resp.data.data?.token || resp.data.token || '';
+      if (!newToken) {
+        log.error('[WORKER] 服务端返回了空 token');
+        return false;
+      }
+      log.info('[WORKER] token 刷新成功');
+
+      // 更新内存配置
+      rongcloudConfig.token = newToken;
+
+      // 保存到 config.json
+      try {
+        if (fs.existsSync(clawBridgeConfigPath)) {
+          const clawConfig = JSON.parse(fs.readFileSync(clawBridgeConfigPath, 'utf8'));
+          clawConfig.token = newToken;
+          clawConfig.expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7天
+          fs.writeFileSync(clawBridgeConfigPath, JSON.stringify(clawConfig, null, 2));
+          log.info('[WORKER] 新 token 已保存到 config.json');
+        }
+      } catch (err) {
+        log.error(`[WORKER] 保存新 token 失败: ${err.message}`);
+      }
+      return true;
+    }
+    log.error(`[WORKER] 刷新 token 失败: ${resp.data?.message || '未知错误'}`);
+    return false;
+  } catch (err) {
+    log.error(`[WORKER] 刷新 token 异常: ${err.message}`);
+    return false;
+  }
+}
+
 async function initRongCloud() {
   if (!rongcloudConfig) return;
 
@@ -184,22 +281,22 @@ async function initRongCloud() {
 
   // 包装 MessageHandler.handleMessage 以处理结构化消息
   const originalHandleMessage = messageHandler.handleMessage.bind(messageHandler);
-  
+
   messageHandler.handleMessage = async (msg) => {
     // 检查是否是结构化消息
     if (msg.content && typeof msg.content === 'string') {
       try {
         const parsed = JSON.parse(msg.content);
-        
+
         if (parsed.msg_type) {
           // 这是结构化消息，使用 RongyunMessageHandler 处理
           log.info(`[WORKER] 收到结构化消息: type=${parsed.msg_type}, from=${parsed.source_im_id || msg.senderUserId}`);
-          
+
           // 忽略自己发送的消息
           if (parsed.source_im_id === rongcloudConfig.accountId) {
             return;
           }
-          
+
           // Timestamp 校验（5分钟有效期）
           const msgTimestamp = parsed.timestamp;
           if (msgTimestamp) {
@@ -213,7 +310,7 @@ async function initRongCloud() {
               return;
             }
           }
-          
+
           // 解析 content 字段（它本身可能是 JSON 字符串）
           let innerContent = parsed.content;
           if (typeof innerContent === 'string') {
@@ -223,7 +320,7 @@ async function initRongCloud() {
               // 保持字符串
             }
           }
-          
+
           // 构建消息数据
           // 注意：后端发送的 command 消息中，command/command_id/request_id 在 content 字段内
           // 保留原始 content（用户消息内容），同时展开其他字段
@@ -235,7 +332,7 @@ async function initRongCloud() {
             targetId: msg.targetId,
             conversationType: msg.conversationType,
           };
-          
+
           // 使用 RongyunMessageHandler 处理
           try {
             await rongyunMessageHandler.handle(messageData);
@@ -248,18 +345,30 @@ async function initRongCloud() {
         // 不是 JSON，是普通消息，继续传给原始 handler
       }
     }
-    
+
     // 调用原始的 handleMessage（处理普通消息）
     return originalHandleMessage(msg);
   };
-  
+
   // 添加调试日志：确认替换后的方法
   log.info('[WORKER-DEBUG] 替换后 messageHandler.handleMessage 类型: ' + typeof messageHandler.handleMessage);
 
-  const connected = await rongcloudClient.connect(messageHandler);
+  let connected = await rongcloudClient.connect(messageHandler);
+
+  // 连接失败时尝试刷新 token 并重试一次
+  if (!connected) {
+    log.warn('[WORKER] 首次融云连接失败，尝试刷新 token...');
+    const refreshed = await refreshRongCloudToken();
+    if (refreshed) {
+      // 使用新 token 重新创建客户端并连接
+      rongcloudClient = new RongCloudClient(rongcloudConfig, log);
+      connected = await rongcloudClient.connect(messageHandler);
+    }
+  }
+
   if (connected) {
     log.info('[WORKER] 融云连接成功');
-    
+
     // 发送 CLIENT_CONNECTED
     try {
       await messageSender.sendClientConnected();
@@ -267,21 +376,21 @@ async function initRongCloud() {
     } catch (err) {
       log.error(`[WORKER] 发送 CLIENT_CONNECTED 失败: ${err.message}`);
     }
-    
+
     // 启动心跳管理器
     const heartbeatManager = new HeartbeatManager(rongcloudClient, rongcloudConfig, log);
     heartbeatManager.start(getMacAddress, getOpenClawStatus);
-    
+
     // 启动仪表盘上报
     const dashboardReporter = new DashboardReporter(rongcloudClient, rongcloudConfig, log);
     dashboardReporter.start(getMacAddress);
-    
+
     // 保存引用以便关闭时停止
     global.heartbeatManager = heartbeatManager;
     global.dashboardReporter = dashboardReporter;
-    
+
   } else {
-    log.error('[WORKER] 融云连接失败');
+    log.error('[WORKER] 融云连接失败，token 刷新后仍无法连接');
   }
 }
 

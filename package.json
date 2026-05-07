@@ -1,18 +1,21 @@
 {
   "name": "claw-subagent-service",
-  "version": "0.0.7",
+  "version": "0.0.38",
   "description": "虾说静态服务",
   "main": "cli.js",
   "bin": {
     "claw-subagent-service": "cli.js"
   },
   "scripts": {
+    "postinstall": "node scripts/post-install.js",
+    "preuninstall": "node scripts/pre-uninstall.js",
     "install-service": "node scripts/install-silent.js",
     "uninstall-service": "node scripts/uninstall.js",
     "dev": "nodemon cli.js --run",
     "publish:patch": "npm version patch && npm publish",
     "publish:minor": "npm version minor && npm publish",
-    "publish:major": "npm version major && npm publish"
+    "publish:major": "npm version major && npm publish",
+    "sync": "node scripts/sync-local.js"
   },
   "files": [
     "cli.js",

@@ -5,6 +5,7 @@
 const { spawn, exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 class ServiceManager {
   constructor(serviceName, serviceDesc, scriptPath, log) {
@@ -141,7 +142,7 @@ class ServiceManager {
     try {
       switch (this.platform) {
         case 'win32':
-          return await this.execCommand(`sc query ${this.serviceName}`);
+          return await this.execCommand(`sc.exe query ${this.serviceName}`);
         case 'linux':
           return await this.execCommand(`systemctl status ${this.serviceName}`);
         case 'darwin':
@@ -155,43 +156,56 @@ class ServiceManager {
     }
   }
 
-  // Windows 服务安装
+  // Windows 服务安装（使用 node-windows，正确处理路径引号）
   async installWindows() {
-    // 使用 node-windows 或手动创建服务
-    const nodeWindowsPath = path.join(__dirname, '..', '..', 'node_modules', 'node-windows');
-    
-    if (!fs.existsSync(nodeWindowsPath)) {
-      this.log?.warn('[ServiceManager] node-windows 未安装，尝试安装...');
-      await this.execCommand('npm install node-windows --save');
-    }
-    
-    const Service = require('node-windows').Service;
-    const svc = new Service({
-      name: this.serviceName,
-      description: this.serviceDesc,
-      script: this.scriptPath,
-      nodeOptions: ['--harmony', '--max_old_space_size=4096']
-    });
-    
     return new Promise((resolve, reject) => {
-      svc.on('install', () => {
-        this.log?.info('[ServiceManager] Windows 服务安装成功');
-        svc.start();
-        resolve(true);
-      });
-      
-      svc.on('error', (err) => {
-        this.log?.error(`[ServiceManager] Windows 服务安装失败: ${err.message}`);
+      try {
+        const Service = require('node-windows').Service;
+        const userHome = process.env.USERPROFILE || os.homedir();
+        const svc = new Service({
+          name: this.serviceName,
+          description: this.serviceDesc,
+          script: this.scriptPath,
+          nodeOptions: ['--harmony', '--max_old_space_size=4096'],
+          env: {
+            USERPROFILE: userHome,
+            HOME: userHome,
+            CLAW_SERVICE_HOME: userHome
+          }
+        });
+
+        svc.on('install', () => {
+          this.log?.info('[ServiceManager] Windows 服务注册成功');
+          svc.start();
+        });
+
+        svc.on('start', () => {
+          this.log?.info('[ServiceManager] Windows 服务已启动');
+          resolve(true);
+        });
+
+        svc.on('error', (err) => {
+          this.log?.error(`[ServiceManager] Windows 服务安装失败: ${err.message}`);
+          reject(err);
+        });
+
+        svc.on('alreadyinstalled', () => {
+          this.log?.info('[ServiceManager] 服务已存在，尝试启动...');
+          svc.start();
+        });
+
+        svc.install();
+      } catch (err) {
+        this.log?.error(`[ServiceManager] 安装异常: ${err.message}`);
         reject(err);
-      });
-      
-      svc.install();
+      }
     });
   }
 
   // Linux 服务安装 (systemd)
   async installLinux() {
     const serviceFile = `/etc/systemd/system/${this.serviceName}.service`;
+    const pathEnv = process.env.PATH || '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
     const serviceContent = `[Unit]
 Description=${this.serviceDesc}
 After=network.target
@@ -199,10 +213,11 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/node ${this.scriptPath}
+ExecStart=${process.execPath} ${this.scriptPath}
 Restart=always
 RestartSec=10
 Environment=NODE_ENV=production
+Environment="PATH=${pathEnv}"
 
 [Install]
 WantedBy=multi-user.target
@@ -228,7 +243,7 @@ WantedBy=multi-user.target
     <string>${this.serviceName}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/node</string>
+        <string>${process.execPath}</string>
         <string>${this.scriptPath}</string>
     </array>
     <key>RunAtLoad</key>

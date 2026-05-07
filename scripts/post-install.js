@@ -1,0 +1,116 @@
+/**
+ * npm postinstall 钩子
+ * 全局安装完成后自动注册并启动 Windows 服务
+ */
+const { execSync } = require('child_process');
+const path = require('path');
+const os = require('os');
+
+const SERVICE_NAME = 'claw-subagent-service';
+const DAEMON_PATH = path.join(__dirname, '..', 'service', 'daemon.js');
+
+function isGlobalInstall() {
+  const pkgPath = path.normalize(__dirname).toLowerCase();
+  const cwd = process.cwd().toLowerCase();
+  const inNodeModules = pkgPath.includes('node_modules');
+  const notInCwd = !pkgPath.startsWith(cwd);
+
+  console.log(`[postinstall] 安装检测: inNodeModules=${inNodeModules}, notInCwd=${notInCwd}`);
+
+  if (inNodeModules && notInCwd) {
+    console.log('[postinstall] 检测到全局安装');
+    return true;
+  }
+
+  // 兜底 - postinstall 只在安装时触发，默认按全局安装处理
+  console.log('[postinstall] 兜底检测通过，默认按全局安装处理');
+  return true;
+}
+
+function isWindowsAdmin() {
+  if (process.platform !== 'win32') return false;
+  try {
+    execSync('net session', { stdio: 'ignore', timeout: 5000 });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function installAndStartService() {
+  if (process.platform !== 'win32') {
+    console.log(`[postinstall] 跳过（非 Windows: ${process.platform}）`);
+    return;
+  }
+
+  if (!isWindowsAdmin()) {
+    console.log('[postinstall] 非管理员权限，跳过自动注册');
+    console.log('[postinstall] 请运行: claw-subagent-service --install');
+    return;
+  }
+
+  console.log('[postinstall] 正在注册系统服务...');
+
+  // 强制删除可能存在的旧服务（确保配置更新，包括环境变量）
+  try {
+    console.log('[postinstall] 清理旧服务...');
+    execSync(`net stop "${SERVICE_NAME}" 2>nul`, { stdio: 'ignore', timeout: 10000 });
+  } catch (e) {}
+  try {
+    execSync(`sc.exe delete "${SERVICE_NAME}" 2>nul`, { stdio: 'ignore', timeout: 10000 });
+    console.log('[postinstall] 旧服务已删除');
+  } catch (e) {}
+  try {
+    execSync('timeout /t 2 /nobreak >nul 2>&1', { stdio: 'ignore', timeout: 5000 });
+  } catch (e) {}
+
+  try {
+    // 使用 node-windows 注册服务（正确处理路径引号）
+    const Service = require('node-windows').Service;
+    const userHome = process.env.USERPROFILE || os.homedir();
+    const svc = new Service({
+      name: SERVICE_NAME,
+      description: 'OpenClaw Guard',
+      script: DAEMON_PATH,
+      nodeOptions: ['--harmony', '--max_old_space_size=4096'],
+      env: {
+        USERPROFILE: userHome,
+        HOME: userHome,
+        CLAW_SERVICE_HOME: userHome
+      }
+    });
+    console.log(`[postinstall] 服务环境变量 USERPROFILE=${userHome}, CLAW_SERVICE_HOME=${userHome}`);
+
+    svc.on('install', () => {
+      console.log('[postinstall] 服务注册成功，正在启动...');
+      svc.start();
+    });
+
+    svc.on('start', () => {
+      console.log('[postinstall] 服务已启动');
+    });
+
+    svc.on('error', (err) => {
+      console.error(`[postinstall] 服务错误: ${err.message}`);
+    });
+
+    svc.on('alreadyinstalled', () => {
+      console.log('[postinstall] 服务已存在，尝试启动...');
+      svc.start();
+    });
+
+    svc.install();
+  } catch (err) {
+    console.error(`[postinstall] 注册服务异常: ${err.message}`);
+  }
+}
+
+// 主逻辑
+console.log('[postinstall] 脚本开始执行...');
+
+if (isGlobalInstall()) {
+  console.log('[postinstall] 准备自动注册服务...');
+  installAndStartService();
+} else {
+  console.log('[postinstall] 本地安装模式，跳过自动注册');
+}

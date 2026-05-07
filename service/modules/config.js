@@ -2,9 +2,41 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+/**
+ * 获取实际用户主目录
+ * Windows 服务以 SYSTEM 运行时 os.homedir() 返回 systemprofile，
+ * 优先使用 CLAW_SERVICE_HOME / USERPROFILE 环境变量，最后扫描 C:\Users
+ */
+function getRealHomeDir() {
+  const envHome = process.env.CLAW_SERVICE_HOME || process.env.USERPROFILE || process.env.HOME;
+  if (envHome && !envHome.includes('systemprofile')) {
+    return envHome;
+  }
+  const homeDir = os.homedir();
+  if (!homeDir.includes('systemprofile')) {
+    return homeDir;
+  }
+  // SYSTEM 账户兜底：扫描 C:\Users 找包含 .claw-bridge 的实际用户目录
+  const usersDir = 'C:\\Users';
+  if (fs.existsSync(usersDir)) {
+    const entries = fs.readdirSync(usersDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory() && !['Public', 'Default', 'All Users', 'Default User'].includes(entry.name)) {
+        const candidate = path.join(usersDir, entry.name);
+        if (fs.existsSync(path.join(candidate, '.claw-bridge', 'config.json'))) {
+          return candidate;
+        }
+      }
+    }
+  }
+  return homeDir;
+}
+
 function loadConfig() {
+  const homeDir = getRealHomeDir();
+
   // Read from ~/.claw-bridge/config.json
-  const clawBridgePath = path.join(os.homedir(), '.claw-bridge', 'config.json');
+  const clawBridgePath = path.join(homeDir, '.claw-bridge', 'config.json');
   let clawBridgeConfig = {};
   if (fs.existsSync(clawBridgePath)) {
     try {
@@ -12,6 +44,9 @@ function loadConfig() {
     } catch (e) {
       console.error('读取 claw-bridge 配置失败:', e);
     }
+  }
+  if (!fs.existsSync(clawBridgePath)) {
+    console.warn(`[CONFIG] 未找到 ${clawBridgePath} (home=${homeDir})`);
   }
 
   // Read from local rongcloud-config.json
@@ -41,4 +76,4 @@ function loadConfig() {
   };
 }
 
-module.exports = { loadConfig };
+module.exports = { loadConfig, getRealHomeDir };

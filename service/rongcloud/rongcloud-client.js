@@ -20,6 +20,8 @@ class RongCloudClient {
     this.isConnected = false;
     this.handler = null;
     this.processingQueue = Promise.resolve();
+    this.processedMessageUIds = new Set();
+    this.messageDedupMaxSize = 1000;
   }
 
   async connect(handler) {
@@ -98,16 +100,39 @@ class RongCloudClient {
   }
 
   handleReceivedMessage(message) {
+    // 1. 过滤离线消息
     if (message.isOffLineMessage) {
       return;
+    }
+
+    // 2. 过滤自己发送的消息（融云 SDK 可能将发送消息回传）
+    // messageDirection: 1=发送, 2=接收
+    if (message.messageDirection === 1) {
+      return;
+    }
+    if (message.senderUserId === this.config.accountId) {
+      return;
+    }
+
+    // 3. 消息去重：防止同一条消息被多次触发（融云重推或多端同步）
+    const dedupKey = message.messageUId || `${message.senderUserId}-${message.sentTime}-${message.messageType}`;
+    if (this.processedMessageUIds.has(dedupKey)) {
+      return;
+    }
+    this.processedMessageUIds.add(dedupKey);
+    if (this.processedMessageUIds.size > this.messageDedupMaxSize) {
+      const first = this.processedMessageUIds.values().next().value;
+      this.processedMessageUIds.delete(first);
     }
 
     try {
       const msgType = message.messageType;
       let rawContent = message.content;
+      let mentionedInfo = null;
 
-      // 自定义消息 content 可能是对象，提取文本内容
+      // 自定义消息 content 可能是对象，提取文本内容并保留 mentionedInfo
       if (rawContent && typeof rawContent === 'object') {
+        mentionedInfo = rawContent.mentionedInfo || null;
         rawContent = rawContent.content || rawContent.text || JSON.stringify(rawContent);
       }
 
@@ -151,16 +176,16 @@ class RongCloudClient {
         messageType: msgType || 'RC:TxtMsg',
         isOffLineMessage: message.isOffLineMessage || false,
         messageUId: message.messageUId || `local-${Date.now()}`,
-        sentTime: message.sentTime || Date.now()
+        sentTime: message.sentTime || Date.now(),
+        mentionedInfo
       };
 
-      this.processingQueue = this.processingQueue.then(async () => {
-        if (this.handler) {
-          await this.handler.handleMessage(rongCloudMsg);
-        }
-      }).catch(err => {
-        this.log?.error(`[RongCloudClient] 消息处理异常: ${err.message}`);
-      });
+      // 并行处理消息，不等待上一条完成（避免 openclaw 长耗时调用阻塞后续消息）
+      if (this.handler) {
+        this.handler.handleMessage(rongCloudMsg).catch(err => {
+          this.log?.error(`[RongCloudClient] 消息处理异常: ${err.message}`);
+        });
+      }
     } catch (err) {
       this.log?.error(`[RongCloudClient] 解析消息失败: ${err.message}`);
     }

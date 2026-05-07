@@ -6,3 +6,4 @@ backup/
 *.tmp
 *.old
 rongcloud-config.json
+dist

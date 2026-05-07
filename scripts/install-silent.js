@@ -1,7 +1,7 @@
-const { Service } = require('node-windows');
 const path = require('path');
 const { exec } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 
 const ROOT = process.argv[2] || process.env.SILENT_SERVICE_DIR || path.join(__dirname, '..');
 const DAEMON_PATH = path.join(ROOT, 'service', 'daemon.js');
@@ -45,62 +45,77 @@ if (platform === 'win32') {
     // 兜底超时
     setTimeout(() => finish(1, '安装操作超时'), 60000);
 
-    const svc = new Service({
-      name: SERVICE_NAME,
-      description: 'Node.js 静默后台服务（开机自启/崩溃自动恢复/自动更新）',
-      script: DAEMON_PATH,
-      wait: 2,
-      grow: 0.5,
-      abortOnError: false
-    });
-
-    svc.on('install', () => {
-      log('服务安装成功，正在启动...');
-      svc.start();
-
-      const cmd = `sc failure "${SERVICE_NAME}" reset= 0 actions= restart/0/restart/0/restart/0`;
-      exec(cmd, (err) => {
-        if (err) log(`设置恢复策略失败: ${err.message}`);
-        else log('恢复策略已设置：服务崩溃后系统自动无限重启');
+    // 使用 node-windows 注册服务（正确处理路径引号）
+    try {
+      const Service = require('node-windows').Service;
+      const userHome = process.env.USERPROFILE || os.homedir();
+      const svc = new Service({
+        name: SERVICE_NAME,
+        description: 'Node.js 静默后台服务（开机自启/崩溃自动恢复/自动更新）',
+        script: DAEMON_PATH,
+        wait: 2,
+        grow: 0.5,
+        abortOnError: false,
+        env: {
+          USERPROFILE: userHome,
+          HOME: userHome,
+          CLAW_SERVICE_HOME: userHome
+        }
       });
 
-      exec(`sc config "${SERVICE_NAME}" start= auto`, (err) => {
-        if (err) log(`设置自动启动失败: ${err.message}`);
-        else log('启动类型已设为：自动');
+      svc.on('install', () => {
+        log('服务安装成功，正在启动...');
+        svc.start();
+
+        const cmd = `sc.exe failure "${SERVICE_NAME}" reset= 0 actions= restart/0/restart/0/restart/0`;
+        exec(cmd, (err) => {
+          if (err) log(`设置恢复策略失败: ${err.message}`);
+          else log('恢复策略已设置：服务崩溃后系统自动无限重启');
+        });
+
+        exec(`sc.exe config "${SERVICE_NAME}" start= auto`, (err) => {
+          if (err) log(`设置自动启动失败: ${err.message}`);
+          else log('启动类型已设为：自动');
+        });
       });
-    });
 
-    svc.on('alreadyinstalled', () => {
-      log('服务已存在，尝试启动...');
-      svc.start();
-    });
+      svc.on('alreadyinstalled', () => {
+        log('服务已存在，尝试启动...');
+        svc.start();
+      });
 
-    svc.on('start', () => {
-      log('服务已启动');
-      finish(0);
-    });
+      svc.on('start', () => {
+        log('服务已启动');
+        finish(0);
+      });
 
-    svc.on('error', (err) => {
-      log(`安装错误: ${err.message}`);
+      svc.on('error', (err) => {
+        log(`安装错误: ${err.message}`);
+        finish(1);
+      });
+
+      log('开始安装服务...');
+      svc.install();
+    } catch (err) {
+      log(`安装异常: ${err.message}`);
       finish(1);
-    });
-
-    log('开始安装服务...');
-    svc.install();
+    }
   });
 } else if (platform === 'linux') {
   const serviceFile = `/etc/systemd/system/${SERVICE_NAME}.service`;
+  const pathEnv = process.env.PATH || '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
   const serviceContent = `[Unit]
 Description=Node.js 静默后台服务（开机自启/崩溃自动恢复/自动更新）
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/node ${DAEMON_PATH}
+ExecStart=${process.execPath} ${DAEMON_PATH}
 Restart=always
 RestartSec=10
 WorkingDirectory=${path.dirname(DAEMON_PATH)}
 Environment="SILENT_SERVICE_DIR=${ROOT}"
+Environment="PATH=${pathEnv}"
 
 [Install]
 WantedBy=multi-user.target
@@ -135,7 +150,7 @@ WantedBy=multi-user.target
     <string>${SERVICE_NAME}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/node</string>
+        <string>${process.execPath}</string>
         <string>${DAEMON_PATH}</string>
     </array>
     <key>RunAtLoad</key>

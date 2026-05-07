@@ -47,41 +47,67 @@ function installService() {
   console.log('[CLI] 安装系统服务...');
 
   const platform = process.platform;
-  const execPath = process.execPath;
 
   if (platform === 'win32') {
-    // Windows: 优先使用 node-windows，失败时回退 sc 命令（兼容 pkg 打包）
+    // Windows: 使用 node-windows 注册服务（正确处理路径引号）
+    console.log('[CLI] 使用 node-windows 安装服务...');
+
+    // 强制删除可能存在的旧服务（确保配置更新，包括环境变量）
     try {
-      if (process.pkg) throw new Error('pkg 环境');
+      console.log('[CLI] 清理旧服务...');
+      execSync(`net stop "${SERVICE_NAME}" 2>nul`, { stdio: 'ignore', timeout: 10000 });
+    } catch (e) {}
+    try {
+      execSync(`sc.exe delete "${SERVICE_NAME}" 2>nul`, { stdio: 'ignore', timeout: 10000 });
+      console.log('[CLI] 旧服务已删除');
+    } catch (e) {}
+    try {
+      execSync('timeout /t 2 /nobreak >nul 2>&1', { stdio: 'ignore', timeout: 5000 });
+    } catch (e) {}
+
+    try {
+      const userHome = process.env.USERPROFILE || os.homedir();
       const Service = require('node-windows').Service;
       const svc = new Service({
         name: SERVICE_NAME,
-        description: 'OpenClaw Guard CLI Client',
+        description: 'OpenClaw Guard',
         script: DAEMON_PATH,
-        workingdirectory: os.homedir(),
-        nodeOptions: ['--harmony', '--max_old_space_size=4096']
+        nodeOptions: ['--harmony', '--max_old_space_size=4096'],
+        env: {
+          USERPROFILE: userHome,
+          HOME: userHome,
+          CLAW_SERVICE_HOME: userHome
+        }
       });
-      svc.on('install', () => { console.log('[CLI] 服务安装成功'); svc.start(); });
-      svc.on('error', (err) => { console.error(`[CLI] 服务安装失败: ${err.message}`); });
+      console.log(`[CLI] 服务环境变量 USERPROFILE=${userHome}, CLAW_SERVICE_HOME=${userHome}`);
+
+      svc.on('install', () => {
+        console.log('[CLI] 服务安装成功');
+        svc.start();
+      });
+
+      svc.on('start', () => {
+        console.log('[CLI] 服务已启动');
+      });
+
+      svc.on('error', (err) => {
+        console.error(`[CLI] 服务安装失败: ${err.message}`);
+      });
+
+      svc.on('alreadyinstalled', () => {
+        console.log('[CLI] 服务已存在，尝试启动...');
+        svc.start();
+      });
+
       svc.install();
     } catch (err) {
-      // 回退到 sc 命令（pkg 或无 node-windows 环境）
-      console.log('[CLI] 使用 sc 命令安装服务...');
-      const binPath = process.pkg
-        ? `"${execPath}" --run`
-        : `"${execPath}" "${DAEMON_PATH}"`;
-      exec(`sc create ${SERVICE_NAME} binPath= "${binPath}" start= auto displayname= "OpenClaw Guard"`, (err2) => {
-        if (err2) return console.error(`[CLI] 服务安装失败: ${err2.message}`);
-        console.log('[CLI] 服务安装成功');
-        exec(`net start ${SERVICE_NAME}`, (err3) => {
-          if (err3) console.error(`[CLI] 启动服务失败: ${err3.message}`);
-        });
-      });
+      console.error(`[CLI] 安装服务异常: ${err.message}`);
     }
   } else if (platform === 'linux') {
     // Linux: systemd
-    const execStart = `/usr/bin/node ${DAEMON_PATH}`;
+    const execStart = `${process.execPath} ${DAEMON_PATH}`;
     const serviceFile = `/etc/systemd/system/${SERVICE_NAME}.service`;
+    const pathEnv = process.env.PATH || '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
     const serviceContent = `[Unit]
 Description=OpenClaw Guard CLI Client
 After=network.target
@@ -92,6 +118,7 @@ ExecStart=${execStart}
 Restart=always
 RestartSec=10
 WorkingDirectory=${path.dirname(DAEMON_PATH)}
+Environment="PATH=${pathEnv}"
 
 [Install]
 WantedBy=multi-user.target
@@ -120,7 +147,7 @@ WantedBy=multi-user.target
     <string>${SERVICE_NAME}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/node</string>
+        <string>${process.execPath}</string>
         <string>${DAEMON_PATH}</string>
     </array>
     <key>RunAtLoad</key>
@@ -148,19 +175,15 @@ function uninstallService() {
   const platform = process.platform;
 
   if (platform === 'win32') {
-    // Windows: 优先使用 node-windows，失败回退 sc 命令
+    // Windows: 使用 node-windows 卸载服务
     try {
-      if (process.pkg) throw new Error('pkg 环境');
       const Service = require('node-windows').Service;
       const svc = new Service({ name: SERVICE_NAME, script: DAEMON_PATH });
       svc.on('uninstall', () => console.log('[CLI] 服务卸载成功'));
+      svc.on('error', (err) => console.error(`[CLI] 卸载失败: ${err.message}`));
       svc.uninstall();
     } catch (err) {
-      console.log('[CLI] 使用 sc 命令卸载服务...');
-      exec(`sc stop ${SERVICE_NAME} 2>nul & sc delete ${SERVICE_NAME}`, (err2) => {
-        if (err2) console.error(`[CLI] 卸载失败: ${err2.message}`);
-        else console.log('[CLI] 服务卸载成功');
-      });
+      console.error(`[CLI] 卸载服务异常: ${err.message}`);
     }
   } else if (platform === 'linux') {
     exec(`systemctl stop ${SERVICE_NAME} && systemctl disable ${SERVICE_NAME} && rm -f /etc/systemd/system/${SERVICE_NAME}.service && systemctl daemon-reload`, (err) => {
@@ -213,7 +236,7 @@ function checkStatus() {
   let cmd;
   
   if (platform === 'win32') {
-    cmd = `sc query ${SERVICE_NAME}`;
+    cmd = `sc.exe query ${SERVICE_NAME}`;
   } else if (platform === 'linux') {
     cmd = `systemctl status ${SERVICE_NAME}`;
   } else if (platform === 'darwin') {

@@ -10,9 +10,16 @@ const log = createLogger('daemon');
 const WORKER_PATH = path.join(__dirname, 'worker.js');
 const PORT = process.env.SILENT_SERVICE_PORT ? parseInt(process.env.SILENT_SERVICE_PORT, 10) : 28765;
 // 使用全局 PID 文件，防止不同安装路径的多个实例同时运行
-const PID_FILE = path.join(os.homedir(), '.claw-subagent-service.pid');
+const PID_FILE = (() => {
+  if (process.platform === 'win32') {
+    const programData = process.env.PROGRAMDATA || process.env.ALLUSERSPROFILE || 'C:\\ProgramData';
+    return path.join(programData, 'claw-subagent-service', 'daemon.pid');
+  }
+  return path.join(os.tmpdir(), '.claw-subagent-service.pid');
+})();
 
 let worker = null;
+let currentWorkerPid = null;
 let stopping = false;
 let isRollingBack = false;
 let healthTimer = null;
@@ -36,7 +43,12 @@ function checkSingleton() {
           process.kill(pid, 0);
           log.error(`[DAEMON] 另一个 Daemon 实例已在运行 (PID: ${pid})，当前实例退出`);
           return false;
-        } catch {
+        } catch (err) {
+          if (err.code === 'EPERM') {
+            // 进程存在但无权限发送信号，视为仍在运行
+            log.error(`[DAEMON] 另一个 Daemon 实例已在运行 (PID: ${pid}, 权限不足)，当前实例退出`);
+            return false;
+          }
           // 进程不存在，继续启动
         }
       }
@@ -46,6 +58,10 @@ function checkSingleton() {
   }
 
   try {
+    const pidDir = path.dirname(PID_FILE);
+    if (!fs.existsSync(pidDir)) {
+      fs.mkdirSync(pidDir, { recursive: true });
+    }
     fs.writeFileSync(PID_FILE, String(process.pid));
   } catch (err) {
     log.warn(`[DAEMON] 写入 PID 文件失败: ${err.message}`);
@@ -92,7 +108,7 @@ function freePortIfNeeded(port) {
         const localAddr = parts[1] || '';
         if (localAddr.endsWith(`:${port}`) || localAddr.endsWith(`]:${port}`)) {
           const pid = parseInt(parts[parts.length - 1], 10);
-          if (pid && pid > 0) {
+          if (pid && pid > 0 && pid !== currentWorkerPid && pid !== process.pid) {
             log.warn(`[DAEMON] 端口 ${port} 被进程 ${pid} 占用，正在释放...`);
             try {
               execSync(`taskkill /F /PID ${pid}`, { timeout: 5000, windowsHide: true });
@@ -126,7 +142,7 @@ function getRestartDelay() {
   crashCount++;
   // 指数退避: 1s, 2s, 4s, 8s, 16s, 32s, 60s(封顶)
   const delay = Math.min(1000 * Math.pow(2, crashCount - 1), 60000);
-  log.info(`[DAEMON] Worker 连续崩溃 ${crashCount} 次，等待 ${delay/1000}s 后重启`);
+  log.info(`[DAEMON] Worker 连续崩溃 ${crashCount} 次，等待 ${delay / 1000}s 后重启`);
   return delay;
 }
 
@@ -146,9 +162,13 @@ function startWorker(isAfterUpdate = false, backupDirForRollback = null) {
   };
 
   worker = fork(WORKER_PATH, [], forkOptions);
+  currentWorkerPid = worker.pid || null;
 
-  worker.stdout?.on('data', d => log.info(`[WORKER] ${d.toString().trim()}`));
-  worker.stderr?.on('data', d => log.error(`[WORKER] ${d.toString().trim()}`));
+  // 只有 pipe 模式才需要手动转发到 logger
+  if (forkOptions.stdio !== 'inherit') {
+    worker.stdout?.on('data', d => log.info(`[WORKER] ${d.toString().trim()}`));
+    worker.stderr?.on('data', d => log.error(`[WORKER] ${d.toString().trim()}`));
+  }
 
   if (isAfterUpdate && backupDirForRollback) {
     currentBackupDir = backupDirForRollback;
@@ -166,6 +186,7 @@ function startWorker(isAfterUpdate = false, backupDirForRollback = null) {
 
     log.error(`[DAEMON] Worker 退出，code=${code}, signal=${signal}`);
     worker = null;
+    currentWorkerPid = null;
 
     if (isAfterUpdate && code !== 0 && currentBackupDir && !isRollingBack) {
       isRollingBack = true;
@@ -186,8 +207,8 @@ function startWorker(isAfterUpdate = false, backupDirForRollback = null) {
     }
 
     if (!stopping && !isRollingBack) {
-      // 释放端口后使用指数退避重启
-      freePortIfNeeded(PORT);
+      // 使用指数退避延迟后重启；端口释放交由 startWorker 中的 freePortIfNeeded 处理，
+      // 避免此处误杀刚刚由其他实例启动的 worker
       const delay = getRestartDelay();
       setTimeout(() => startWorker(false, null), delay);
     }
