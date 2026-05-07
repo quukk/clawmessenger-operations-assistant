@@ -52,7 +52,7 @@ check_port() {
 
 # 获取 openclaw 进程 PID
 get_openclaw_pid() {
-    # 优先通过端口查找进程（最可靠）
+    # 只通过端口查找进程（最可靠，避免僵尸进程和误匹配）
     if command -v netstat &>/dev/null; then
         local pid
         pid=$(netstat -tnlp 2>/dev/null | grep ":18789 " | head -1 | awk '{print $7}' | cut -d'/' -f1)
@@ -62,8 +62,8 @@ get_openclaw_pid() {
         fi
     fi
     
-    # 降级：通过进程名查找
-    pgrep openclaw | head -1 || echo ""
+    # 没有监听端口，返回空（不再使用 pgrep 避免误匹配）
+    echo ""
 }
 
 # Docker 模式：停止服务

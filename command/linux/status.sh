@@ -44,7 +44,7 @@ is_docker() {
 
 # 获取 openclaw 进程 PID
 get_openclaw_pid() {
-    # 优先通过端口查找进程（最可靠）
+    # 只通过端口查找进程（最可靠，避免僵尸进程和误匹配）
     if command -v netstat &>/dev/null; then
         local pid
         pid=$(netstat -tnlp 2>/dev/null | grep ":18789 " | head -1 | awk '{print $7}' | cut -d'/' -f1)
@@ -54,8 +54,8 @@ get_openclaw_pid() {
         fi
     fi
     
-    # 降级：通过进程名查找
-    pgrep openclaw | head -1 || echo ""
+    # 没有监听端口，返回空（不再使用 pgrep 避免误匹配）
+    echo ""
 }
 
 # 检查端口是否监听
@@ -77,9 +77,15 @@ status_docker() {
     local pid
     pid=$(get_openclaw_pid)
     
+    # 以端口检测为主要判断依据（避免僵尸进程导致误判）
+    local is_running=""
+    if check_port "$PORT"; then
+        is_running="1"
+    fi
+    
     # 静默模式
     if [ "$quiet" = "1" ]; then
-        if [ -n "$pid" ]; then
+        if [ "$is_running" = "1" ]; then
             echo "running"
         else
             echo "stopped"
@@ -92,12 +98,14 @@ status_docker() {
     echo
     log_info "服务状态:"
     
-    if [ -n "$pid" ]; then
+    if [ "$is_running" = "1" ]; then
         # 运行中：模拟 systemctl 的 active (running) 格式
         echo "● openclaw-gateway.service - OpenClaw Gateway"
         echo "     Loaded: loaded (Docker 模式)"
         echo "     Active: active (running)"
-        echo "   Main PID: $pid (openclaw-gateway)"
+        if [ -n "$pid" ]; then
+            echo "   Main PID: $pid (openclaw-gateway)"
+        fi
         echo ""
         log_info "Success"
     else
