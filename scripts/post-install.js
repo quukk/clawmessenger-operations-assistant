@@ -83,6 +83,19 @@ function installAndStartService() {
 
     svc.on('install', () => {
       console.log('[postinstall] 服务注册成功，正在启动...');
+
+      // 显式设置开机自启 + 崩溃自动恢复
+      const cmdFailure = `sc.exe failure "${SERVICE_NAME}" reset= 0 actions= restart/0/restart/0/restart/0`;
+      exec(cmdFailure, (err) => {
+        if (err) console.error(`[postinstall] 设置恢复策略失败: ${err.message}`);
+        else console.log('[postinstall] 恢复策略已设置：崩溃后自动重启');
+      });
+
+      exec(`sc.exe config "${SERVICE_NAME}" start= auto`, (err) => {
+        if (err) console.error(`[postinstall] 设置自动启动失败: ${err.message}`);
+        else console.log('[postinstall] 启动类型已设为：自动');
+      });
+
       svc.start();
     });
 

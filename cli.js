@@ -12,7 +12,7 @@
  *   node cli.js --status       # 查看服务状态
  */
 
-const { spawn, exec } = require('child_process');
+const { spawn, exec, execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -83,6 +83,19 @@ function installService() {
 
       svc.on('install', () => {
         console.log('[CLI] 服务安装成功');
+
+        // 显式设置开机自启 + 崩溃自动恢复
+        const cmdFailure = `sc.exe failure "${SERVICE_NAME}" reset= 0 actions= restart/0/restart/0/restart/0`;
+        exec(cmdFailure, (err) => {
+          if (err) console.error(`[CLI] 设置恢复策略失败: ${err.message}`);
+          else console.log('[CLI] 恢复策略已设置：崩溃后自动重启');
+        });
+
+        exec(`sc.exe config "${SERVICE_NAME}" start= auto`, (err) => {
+          if (err) console.error(`[CLI] 设置自动启动失败: ${err.message}`);
+          else console.log('[CLI] 启动类型已设为：自动');
+        });
+
         svc.start();
       });
 
