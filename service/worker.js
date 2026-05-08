@@ -21,7 +21,15 @@ const HOST = process.env.SILENT_SERVICE_HOST || '127.0.0.1';
 // 如果 logger 初始化后，也同步写到 logger
 const originalStderr = process.stderr.write.bind(process.stderr);
 process.stderr.write = (chunk, encoding, callback) => {
-  originalStderr(chunk, encoding, callback);
+  try {
+    originalStderr(chunk, encoding, callback);
+  } catch (err) {
+    // EPIPE 常见于子进程（如 openclaw）已退出但仍在写日志，忽略即可
+    if (err.code === 'EPIPE') {
+      return;
+    }
+    throw err;
+  }
 };
 
 /**
@@ -259,6 +267,9 @@ async function refreshRongCloudToken() {
 
 async function initRongCloud() {
   if (!rongcloudConfig) return;
+
+  log.info(`[WORKER] Worker 启动，目录: ${__dirname}`);
+  log.info(`[WORKER] 代码版本特征: isOffLineMessage-pass-through, messageDirection-log, addEventListener-exclusive`);
 
   // 启动 opencode 服务（与桌面客户端对齐）
   log.info('[WORKER] 启动 opencode 服务...');
@@ -561,6 +572,11 @@ process.on('uncaughtException', async (err) => {
   // EADDRINUSE 已由 server.on('error') 处理，这里避免重复触发优雅关闭
   if (err.code === 'EADDRINUSE' && err.message && err.message.includes(String(PORT))) {
     log.warn(`[WORKER] 捕获到 EADDRINUSE（端口 ${PORT}），交由 server 错误处理器重试`);
+    return;
+  }
+  // EPIPE 常见于子进程（如 openclaw）已退出但仍在写日志，不触发整个 worker 关闭
+  if (err.code === 'EPIPE') {
+    log.warn(`[WORKER] 捕获到 EPIPE（子进程管道断开），忽略`);
     return;
   }
   log.error(`[WORKER] 未捕获异常: ${err.message}\n${err.stack}`);

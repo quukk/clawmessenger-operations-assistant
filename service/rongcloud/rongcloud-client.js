@@ -42,14 +42,22 @@ class RongCloudClient {
     this.log?.info(`[RongCloudClient] has sendReadReceiptResponseV2: ${typeof RongIMLib.sendReadReceiptResponseV2 === 'function'}`);
     this.log?.info(`[RongCloudClient] has sendReadReceiptResponseV5: ${typeof RongIMLib.sendReadReceiptResponseV5 === 'function'}`);
 
+    // 优先使用新版 addEventListener；与旧版 setOnReceiveMessageListener 互斥
+    // 避免同时注册导致 SDK 内部回调冲突或覆盖
     if (RongIMLib.addEventListener) {
       this.log?.info('[RongCloudClient] 使用 addEventListener 模式');
 
       RongIMLib.addEventListener(RongIMLib.Events?.MESSAGES || 'MESSAGES', (event) => {
-        // this.log?.info(`[RongCloudClient] 收到消息事件: ${JSON.stringify(event).substring(0, 200)}`);
+        this.log?.info(`[RongCloudClient] MESSAGES 事件触发, messages长度=${event?.messages?.length || 0}`);
         event.messages?.forEach(msg => {
+          this.log?.info(`[RongCloudClient] MESSAGES 单条消息: messageType=${msg.messageType}, senderUserId=${msg.senderUserId}, conversationType=${msg.conversationType}, isOffLineMessage=${msg.isOffLineMessage}, messageDirection=${msg.messageDirection}`);
           this.handleReceivedMessage(msg);
         });
+      });
+
+      // 调试：监听消息被拦截事件
+      RongIMLib.addEventListener(RongIMLib.Events?.MESSAGE_BLOCKED || 'MESSAGE_BLOCKED', (data) => {
+        this.log?.warn(`[RongCloudClient] 消息被拦截: ${JSON.stringify(data).substring(0, 200)}`);
       });
 
       RongIMLib.addEventListener(RongIMLib.Events?.CONNECTED || 'CONNECTED', () => {
@@ -61,9 +69,8 @@ class RongCloudClient {
         this.log?.warn(`[RongCloudClient] 断开连接, code: ${code}`);
         this.isConnected = false;
       });
-    } else {
+    } else if (RongIMLib.setOnReceiveMessageListener) {
       this.log?.info('[RongCloudClient] 使用 setOnReceiveMessageListener 模式');
-
       RongIMLib.setConnectionStatusListener({
         onChanged: (status) => {
           this.log?.info(`[RongCloudClient] 连接状态变化: ${status}`);
@@ -73,7 +80,7 @@ class RongCloudClient {
 
       RongIMLib.setOnReceiveMessageListener({
         onReceived: (message) => {
-          this.log?.info(`[RongCloudClient] onReceived: messageType=${message.messageType}, senderUserId=${message.senderUserId}`);
+          this.log?.info(`[RongCloudClient] onReceived: messageType=${message.messageType}, senderUserId=${message.senderUserId}, conversationType=${message.conversationType}, isOffLineMessage=${message.isOffLineMessage}, messageDirection=${message.messageDirection}`);
           this.handleReceivedMessage(message);
         }
       });
@@ -100,6 +107,9 @@ class RongCloudClient {
   }
 
   handleReceivedMessage(message) {
+    // 最外层日志：确保任何消息到达都能留下痕迹（在过滤之前）
+    this.log?.info(`[RongCloudClient] handleReceivedMessage 入口: messageType=${message.messageType}, senderUserId=${message.senderUserId}, conversationType=${message.conversationType}, isOffLineMessage=${message.isOffLineMessage}, messageDirection=${message.messageDirection}, messageUId=${message.messageUId}`);
+
     // 1. 不再静默过滤离线消息：Docker 中每次启动都是新连接，
     //    群聊@消息常以离线消息形式推送，过滤会导致消息丢失
     if (message.isOffLineMessage) {
@@ -109,15 +119,18 @@ class RongCloudClient {
     // 2. 过滤自己发送的消息（融云 SDK 可能将发送消息回传）
     // messageDirection: 1=发送, 2=接收
     if (message.messageDirection === 1) {
+      this.log?.info('[RongCloudClient] 过滤自己发送的消息 (messageDirection=1)');
       return;
     }
     if (message.senderUserId === this.config.accountId) {
+      this.log?.info(`[RongCloudClient] 过滤自己发送的消息 (senderUserId=${message.senderUserId} === accountId=${this.config.accountId})`);
       return;
     }
 
     // 3. 消息去重：防止同一条消息被多次触发（融云重推或多端同步）
     const dedupKey = message.messageUId || `${message.senderUserId}-${message.sentTime}-${message.messageType}`;
     if (this.processedMessageUIds.has(dedupKey)) {
+      this.log?.info(`[RongCloudClient] 消息去重过滤: dedupKey=${dedupKey}`);
       return;
     }
     this.processedMessageUIds.add(dedupKey);

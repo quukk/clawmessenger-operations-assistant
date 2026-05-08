@@ -177,6 +177,8 @@ function startWorker(isAfterUpdate = false, backupDirForRollback = null) {
   if (stopping || isRollingBack) return;
 
   log.info(`[DAEMON] 启动 Worker，daemon PID: ${process.pid}，更新后重启: ${isAfterUpdate}`);
+  log.info(`[DAEMON] Daemon 目录: ${__dirname}`);
+  log.info(`[DAEMON] Worker 路径: ${WORKER_PATH}`);
 
   // 启动前释放旧端口，防止旧 worker 残留占用
   freePortIfNeeded(PORT);

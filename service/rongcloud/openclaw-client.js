@@ -111,8 +111,13 @@ function getGatewayToken() {
       if (fs.existsSync(filePath)) {
         const content = fs.readFileSync(filePath, 'utf-8');
         const config = JSON.parse(content);
-        // 可能的 token 字段名
-        const token = config.gatewayToken || config.token || config.apiKey || config.api_key || config.password;
+        // 可能的 token 字段名（支持嵌套路径 gateway.auth.token）
+        const token = config.gatewayToken
+          || (config.gateway?.auth?.token)
+          || config.token
+          || config.apiKey
+          || config.api_key
+          || config.password;
         if (token) {
           return String(token);
         }
@@ -302,7 +307,12 @@ class OpenClawClient {
         const text = chunk.toString();
         stderr += text;
         // 实时记录 stderr，方便调试卡死问题
-        this.log?.info(`[OpenClawClient] CLI stderr: ${text.trim().substring(0, 300)}`);
+        // 子进程退出时管道可能已断开，忽略 EPIPE 避免未捕获异常
+        try {
+          this.log?.info(`[OpenClawClient] CLI stderr: ${text.trim().substring(0, 300)}`);
+        } catch {
+          // 忽略日志写入失败
+        }
       });
 
       // 超时兜底（30 分钟）

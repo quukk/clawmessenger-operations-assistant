@@ -26,6 +26,8 @@ const command = args[0] || '--run';
 
 function runDaemon() {
   console.log('[CLI] 启动 Daemon...');
+  console.log(`[CLI] CLI 路径: ${__filename}`);
+  console.log(`[CLI] Daemon 路径: ${DAEMON_PATH}`);
 
   const daemon = spawn('node', [DAEMON_PATH], {
     stdio: 'inherit',
