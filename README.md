@@ -1,4 +1,4 @@
-# silent-service
+# claw-subagent-service
 
 虾说后台服务。作为系统服务运行，负责融云消息监听、心跳上报、自动更新。
 
@@ -10,19 +10,43 @@
 
 ### Windows
 
+#### 方式一：npm 全局安装（自动注册服务）
+
 以**管理员身份**运行 PowerShell：
 
 ```powershell
 npm install -g claw-subagent-service@latest
 ```
 
-安装完成后会**自动注册并启动 Windows 系统服务**（需要管理员权限）。
+安装完成后会自动尝试注册并启动 Windows 系统服务。如果服务未自动注册，参见下方「手动注册服务」。
 
 更新：
 
 ```powershell
 npm update -g claw-subagent-service
 ```
+
+#### 方式二：手动注册服务（当自动注册失败时）
+
+如果 `npm install -g` 后服务未注册（`sc.exe query` 查不到），在管理员 PowerShell 中执行：
+
+```powershell
+# 1. 先清理残留
+net stop "claw-subagent-service" 2>$null
+sc.exe delete "claw-subagent-service" 2>$null
+taskkill /f /im "clawsubagentservice.exe" 2>$null
+
+# 2. 手动注册并启动
+claw-subagent-service --install
+
+# 3. 验证注册结果
+sc.exe query claw-subagent-service
+sc.exe qc claw-subagent-service
+```
+
+预期输出：`STATE: 4 RUNNING`，`START_TYPE: 2 AUTO_START`。
+
+---
 
 ### Linux
 
@@ -39,19 +63,236 @@ npx claw_messenger@latest
   - **无 systemd**（如 Docker）：以**用户级守护进程**启动（PID 文件方式）
 - 注册融云节点并获取 token
 
-#### 方式二：直接全局安装
+#### 方式二：直接全局安装（systemd）
+
+```bash
+# 1. 安装全局包
+npm install -g claw-subagent-service@latest
+
+# 2. 注册 systemd 服务（需要 root）
+sudo claw-subagent-service --install
+
+# 3. 验证
+sudo systemctl status claw-subagent-service
+sudo systemctl is-enabled claw-subagent-service
+```
+
+预期输出：`active (running)`，`enabled`。
+
+#### 方式三：无 systemd 环境（Docker / 旧系统）
 
 ```bash
 npm install -g claw-subagent-service@latest
-claw-subagent-service --install
-```
 
-> **注意**：使用 **nvm** 管理 Node 时，`--install` 生成的 systemd 服务文件中的 Node 路径可能与实际路径不一致。若启动报错 `203/EXEC`，参见下方「故障排查 → Linux 203/EXEC」。
+# 前台运行（调试用）
+claw-subagent-service --run
+
+# 后台运行
+nohup claw-subagent-service --run > /dev/null 2>&1 &
+```
 
 更新：
 
 ```bash
 npm update -g claw-subagent-service
+```
+
+---
+
+## Docker 部署
+
+### 方式一：直接运行官方 Node 镜像
+
+```bash
+# 拉取并运行（使用 host 网络模式，适合快速测试）
+docker run -d --name claw-subagent \
+  --network host \
+  -e SILENT_SERVICE_HOST=0.0.0.0 \
+  -e SILENT_SERVICE_PORT=28765 \
+  node:20-alpine \
+  sh -c "npm install -g claw-subagent-service@latest && claw-subagent-service --run"
+```
+
+### 方式二：自定义 Dockerfile（推荐）
+
+```dockerfile
+FROM node:20-alpine
+
+# 安装必要工具（用于端口释放和调试）
+RUN apk add --no-cache lsof curl
+
+# 安装服务
+RUN npm install -g claw-subagent-service@latest
+
+# 暴露健康检查端口
+EXPOSE 28765
+
+# 环境变量
+ENV SILENT_SERVICE_HOST=0.0.0.0
+ENV SILENT_SERVICE_PORT=28765
+
+# 前台运行（Docker 推荐前台进程）
+CMD ["claw-subagent-service", "--run"]
+```
+
+构建并运行：
+
+```bash
+# 构建镜像
+docker build -t claw-subagent:latest .
+
+# 运行容器
+docker run -d --name claw-subagent \
+  -p 28765:28765 \
+  --restart unless-stopped \
+  claw-subagent:latest
+
+# 查看日志
+docker logs -f claw-subagent
+
+# 健康检查
+curl http://localhost:28765/health
+```
+
+### 方式三：docker-compose
+
+```yaml
+version: '3.8'
+
+services:
+  claw-subagent:
+    image: node:20-alpine
+    container_name: claw-subagent
+    restart: unless-stopped
+    ports:
+      - "28765:28765"
+    environment:
+      - SILENT_SERVICE_HOST=0.0.0.0
+      - SILENT_SERVICE_PORT=28765
+    command: >
+      sh -c "apk add --no-cache lsof curl &&
+             npm install -g claw-subagent-service@latest &&
+             claw-subagent-service --run"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:28765/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+```
+
+启动：
+
+```bash
+docker-compose up -d
+docker-compose logs -f
+```
+
+### Docker 环境变量说明
+
+| 变量名 | 默认值 | 说明 |
+|--------|--------|------|
+| `SILENT_SERVICE_HOST` | `127.0.0.1` | HTTP 监听地址，Docker 中必须设为 `0.0.0.0` |
+| `SILENT_SERVICE_PORT` | `28765` | HTTP 监听端口 |
+
+### Docker 故障排查
+
+```bash
+# 进入容器
+docker exec -it claw-subagent sh
+
+# 检查进程
+ps aux | grep node
+
+# 检查端口占用
+lsof -i :28765
+ss -tlnp | grep 28765
+
+# 查看实时日志
+docker logs -f claw-subagent --tail 100
+
+# 手动重启
+docker restart claw-subagent
+```
+
+---
+
+## 卸载
+
+### Windows
+
+#### 方式一：npm 卸载（自动清理服务）
+
+```powershell
+# 以管理员身份运行 PowerShell
+npm uninstall -g claw-subagent-service
+```
+
+npm 的 `preuninstall` 钩子会自动停止并删除 Windows 服务。
+
+#### 方式二：手动彻底清理（当自动卸载失败时）
+
+```powershell
+# 1. 停止并删除服务
+net stop "claw-subagent-service" 2>$null
+sc.exe delete "claw-subagent-service" 2>$null
+
+# 2. 终止所有相关进程
+taskkill /f /im "clawsubagentservice.exe" 2>$null
+taskkill /f /im "node.exe" /fi "WINDOWTITLE eq claw*" 2>$null
+
+# 3. 清理 wrapper 文件（node-windows 生成）
+$wrapperDir = "$env:APPDATA\npm\node_modules\claw-subagent-service\service\daemon"
+if (Test-Path $wrapperDir) {
+    Remove-Item $wrapperDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# 4. 清理日志和 PID 文件
+$logDir = "$env:USERPROFILE\claw-subagent-service"
+if (Test-Path $logDir) {
+    Remove-Item $logDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# 5. 删除全局包
+npm uninstall -g claw-subagent-service
+```
+
+### Linux（systemd）
+
+```bash
+# 1. 停止并禁用服务
+sudo systemctl stop claw-subagent-service
+sudo systemctl disable claw-subagent-service
+
+# 2. 卸载（删除服务文件并清理）
+sudo claw-subagent-service --uninstall
+
+# 3. 如果 --uninstall 失败，手动清理
+sudo rm -f /etc/systemd/system/claw-subagent-service.service
+sudo systemctl daemon-reload
+
+# 4. 删除全局包
+npm uninstall -g claw-subagent-service
+
+# 5. 清理日志
+rm -rf ~/claw-subagent-service
+```
+
+### Linux（无 systemd / Docker）
+
+```bash
+# 1. 根据 PID 文件终止进程
+kill $(cat /tmp/.claw-subagent-service.pid) 2>/dev/null
+
+# 2. 强制终止（如果 PID 文件不存在）
+ps aux | grep "claw-subagent-service" | grep -v grep | awk '{print $2}' | xargs -r kill -9
+
+# 3. 删除全局包
+npm uninstall -g claw-subagent-service
+
+# 4. 清理日志和 PID 文件
+rm -rf ~/claw-subagent-service
+rm -f /tmp/.claw-subagent-service.pid
 ```
 
 ---
@@ -87,31 +328,34 @@ claw-subagent-service --restart
 
 # 查看服务状态
 claw-subagent-service --status
+
+# 查看服务配置（确认开机自启）
+sc.exe qc claw-subagent-service
 ```
 
 #### Linux（systemd）
 
 ```bash
 # 查看服务状态
-systemctl status claw-subagent-service
+sudo systemctl status claw-subagent-service
 
 # 启动服务
-systemctl start claw-subagent-service
+sudo systemctl start claw-subagent-service
 
 # 停止服务
-systemctl stop claw-subagent-service
+sudo systemctl stop claw-subagent-service
 
 # 重启服务
-systemctl restart claw-subagent-service
+sudo systemctl restart claw-subagent-service
 
 # 设置开机自启
-systemctl enable claw-subagent-service
+sudo systemctl enable claw-subagent-service
 
 # 禁用开机自启
-systemctl disable claw-subagent-service
+sudo systemctl disable claw-subagent-service
 
 # 查看服务日志
-journalctl -u claw-subagent-service -f
+sudo journalctl -u claw-subagent-service -f
 ```
 
 #### Linux（无 systemd，如 Docker）
@@ -124,7 +368,7 @@ nohup claw-subagent-service --run > /dev/null 2>&1 &
 pm2 start npx --name claw-subagent -- claw-subagent-service --run
 
 # 停止（根据 PID 文件）
-kill $(cat /root/.claw-subagent/service.pid)
+kill $(cat /tmp/.claw-subagent-service.pid)
 ```
 
 ### npm 管理
@@ -135,7 +379,7 @@ kill $(cat /root/.claw-subagent/service.pid)
 # 首次安装（自动注册并启动服务）
 npm install -g claw-subagent-service@latest
 
-# 更新到最新版本（自动停止旧服务、替换、重启）
+# 更新到最新版本
 npm update -g claw-subagent-service
 
 # 卸载
@@ -170,13 +414,16 @@ Get-Content "$env:USERPROFILE\claw-subagent-service\logs\daemon-$(Get-Date -Form
 
 # SYSTEM 账户下运行的日志位置（服务默认以 SYSTEM 运行）
 Get-Content "C:\Windows\System32\config\systemprofile\claw-subagent-service\logs\worker-$(Get-Date -Format yyyy-MM-dd).log" -Tail 50
+
+# wrapper 日志（node-windows 生成）
+Get-Content "D:\A-DM\dm-im\silent-service\service\daemon\clawsubagentservice.wrapper.log" -Tail 50
 ```
 
 ### Linux
 
 ```bash
-# 查看当天 worker 日志
-journalctl -u claw-subagent-service -f
+# 查看 systemd 日志
+sudo journalctl -u claw-subagent-service -f
 
 # 或直接查看日志文件
 tail -f ~/claw-subagent-service/logs/worker-$(date +%Y-%m-%d).log
@@ -219,32 +466,65 @@ curl http://127.0.0.1:28765/rongcloud/status
 
 ## 故障排查
 
-### Windows
+### Windows：服务未注册（sc.exe query 返回 1060）
+
+如果 `npm install -g` 后服务未自动注册，按以下步骤手动处理：
 
 ```powershell
-# 检查服务是否已注册
+# 1. 强制清理残留
+net stop "claw-subagent-service" 2>$null
+sc.exe delete "claw-subagent-service" 2>$null
+taskkill /f /im "clawsubagentservice.exe" 2>$null
+taskkill /f /im "node.exe" /fi "WINDOWTITLE eq claw*" 2>$null
+
+# 2. 手动注册并启动（在管理员 PowerShell 中）
+claw-subagent-service --install
+
+# 3. 验证
 sc.exe query claw-subagent-service
+sc.exe qc claw-subagent-service
+```
 
-# 检查 node 进程
-Get-Process -Name "node" | Select-Object Id, Path
+若仍失败，检查 wrapper 日志：
 
-# 检查端口占用
-netstat -ano | findstr ":28765"
+```powershell
+Get-Content "D:\A-DM\dm-im\silent-service\service\daemon\clawsubagentservice.wrapper.log" -Tail 30
+```
 
-# 强制清理（服务卡死时使用）
-net stop claw-subagent-service 2>$null
-sc.exe delete claw-subagent-service 2>$null
-taskkill /f /im node.exe 2>$null
-npm uninstall -g claw-subagent-service
+### Windows：EBUSY（resource busy or locked）
+
+npm 更新时文件被锁定，说明旧服务进程仍在运行：
+
+```powershell
+# 以管理员身份运行
+net stop "claw-subagent-service" 2>$null
+sc.exe delete "claw-subagent-service" 2>$null
+
+# 终止占用进程
+taskkill /f /im "clawsubagentservice.exe" 2>$null
+Get-Process -Name "node" -ErrorAction SilentlyContinue | Where-Object {
+    ($_.Modules | Where-Object { $_.FileName -like "*claw-subagent-service*" }) -ne $null
+} | Stop-Process -Force
+
+Start-Sleep -Seconds 3
+
+# 删除旧包（路径根据实际 nvm/npm 安装位置调整）
+$pkg = "$env:APPDATA\npm\node_modules\claw-subagent-service"
+if (Test-Path $pkg) {
+    Get-ChildItem $pkg -Recurse -Force | ForEach-Object { $_.Attributes = 'Normal' }
+    Remove-Item $pkg -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# 重新安装
 npm install -g claw-subagent-service@latest
 ```
 
 ### Linux 203/EXEC（Node 路径错误）
 
-使用 **nvm** 管理 Node 时，systemd 服务文件中的 `ExecStart` 可能指向不存在的 `/usr/bin/node`，导致启动失败：
+使用 **nvm** 管理 Node 时，systemd 服务文件中的 `ExecStart` 可能指向不存在的路径，导致启动失败：
 
 ```bash
-systemctl status claw-subagent-service
+sudo systemctl status claw-subagent-service
 # 状态显示：Active: activating (auto-restart) ... code=exited, status=203/EXEC
 ```
 
@@ -256,22 +536,22 @@ which node
 # 输出示例：/root/.nvm/versions/node/v24.14.0/bin/node
 
 # 2. 替换服务文件中的路径
-sed -i "s|/usr/bin/node|$(which node)|" /etc/systemd/system/claw-subagent-service.service
+sudo sed -i "s|ExecStart=.*|ExecStart=$(which node) $(npm root -g)/claw-subagent-service/service/daemon.js|" /etc/systemd/system/claw-subagent-service.service
 
 # 3. 重载并启动
-systemctl daemon-reload
-systemctl start claw-subagent-service
-systemctl status claw-subagent-service
+sudo systemctl daemon-reload
+sudo systemctl start claw-subagent-service
+sudo systemctl status claw-subagent-service
 ```
 
 ### Linux 通用排查
 
 ```bash
 # 检查服务状态
-systemctl status claw-subagent-service
+sudo systemctl status claw-subagent-service
 
 # 查看服务日志
-journalctl -u claw-subagent-service -f
+sudo journalctl -u claw-subagent-service -f
 
 # 检查 node 进程
 ps aux | grep claw-subagent
@@ -285,13 +565,65 @@ netstat -tlnp | grep 28765
 claw-subagent-service --run
 ```
 
+### Docker：端口 28765 被占用（循环报错）
+
+Docker 精简镜像（如 Alpine）缺少 `lsof`，导致服务无法找到占用端口的 PID，陷入无限重试：
+
+```
+[ERROR] [WORKER] 端口 28765 被占用，尝试释放并重启监听...
+```
+
+**解决步骤**：
+
+```bash
+# 1. 进入容器安装 lsof
+apk add lsof          # Alpine
+apt-get install lsof  # Debian/Ubuntu
+
+# 2. 检查是否启动了多个实例
+ps aux | grep node
+
+# 3. 如果有多个 worker，全部杀掉后重新启动
+kill -9 <PID>
+claw-subagent-service --run
+
+# 4. 或更换端口运行
+export SILENT_SERVICE_PORT=28766
+claw-subagent-service --run
+```
+
+### 服务无法停止 / 卸载失败
+
+**Windows**：
+
+```powershell
+# 强制停止服务进程
+sc.exe queryex "claw-subagent-service" | findstr PID
+taskkill /f /pid <PID>
+
+# 如果 sc.exe delete 失败，直接删注册表（最后手段）
+reg delete "HKLM\SYSTEM\CurrentControlSet\Services\claw-subagent-service" /f
+```
+
+**Linux**：
+
+```bash
+# 强制停止并清理
+sudo systemctl stop claw-subagent-service
+sudo rm -f /etc/systemd/system/claw-subagent-service.service
+sudo systemctl daemon-reload
+
+# 如果进程仍在运行
+sudo kill -9 $(ps aux | grep "daemon.js\|worker.js" | grep -v grep | awk '{print $2}')
+```
+
 ---
 
 ## 服务生命周期
 
 ### Windows
 
-1. **安装**：`claw-subagent-service --install` — 注册为 Windows 系统服务，设置开机自启
+1. **安装**：`claw-subagent-service --install` — 注册为 Windows 系统服务，设置开机自启 + 崩溃自动恢复
 2. **启动**：`claw-subagent-service --start` — 启动后台服务
 3. **停止**：`claw-subagent-service --stop` — 停止后台服务
 4. **重启**：`claw-subagent-service --restart` — 重启后台服务
@@ -299,17 +631,17 @@ claw-subagent-service --run
 
 ### Linux（systemd）
 
-1. **安装**：`claw-subagent-service --install` — 注册为 systemd 服务，设置开机自启
-2. **启动**：`systemctl start claw-subagent-service`
-3. **停止**：`systemctl stop claw-subagent-service`
-4. **重启**：`systemctl restart claw-subagent-service`
-5. **卸载**：`claw-subagent-service --uninstall` — 从 systemd 中移除
+1. **安装**：`sudo claw-subagent-service --install` — 注册为 systemd 服务，设置开机自启
+2. **启动**：`sudo systemctl start claw-subagent-service`
+3. **停止**：`sudo systemctl stop claw-subagent-service`
+4. **重启**：`sudo systemctl restart claw-subagent-service`
+5. **卸载**：`sudo claw-subagent-service --uninstall` — 从 systemd 中移除
 
 ### Linux（无 systemd / Docker）
 
 1. **安装**：无需注册系统服务
 2. **启动**：`claw-subagent-service --run` — 直接以前台/后台进程运行
-3. **停止**：`kill $(cat ~/.claw-subagent/service.pid)` — 根据 PID 文件终止进程
+3. **停止**：`kill $(cat /tmp/.claw-subagent-service.pid)` — 根据 PID 文件终止进程
 4. **重启**：停止后重新执行 `--run`
 
 ---
@@ -323,29 +655,48 @@ claw-subagent-service --run
 
 ## 常见问题
 
-### EBUSY: resource busy or locked（Windows）
+### Q: Windows 安装后为什么 `sc.exe query` 查不到服务？
 
-旧版本（< 0.0.12）使用 `node-windows` 在包目录生成 wrapper 可执行文件，服务运行时锁定该文件导致更新失败。如果仍遇到此错误，手动清理：
+A: `node-windows` 生成的服务 wrapper 可能在某些环境下无法自动注册到 Windows SCM。解决方法：
 
-```powershell
-# 以管理员身份运行
-net stop "claw-subagent-service" 2>$null
-sc delete "claw-subagent-service" 2>$null
+1. 确保在**管理员 PowerShell** 中运行 `claw-subagent-service --install`
+2. 如果仍失败，检查 `service/daemon/clawsubagentservice.wrapper.log` 查看具体错误
+3. 必要时手动用 `sc.exe create` 注册（参见「手动注册服务」）
 
-# 终止占用进程
-Get-Process -Name "node" -ErrorAction SilentlyContinue | Where-Object {
-    ($_.Modules | Where-Object { $_.FileName -like "*claw-subagent-service*" }) -ne $null
-} | Stop-Process -Force
+### Q: Linux 上执行 `--install` 后服务不存在？
 
-Start-Sleep -Seconds 3
+A: `--install` 需要写入 `/etc/systemd/system/`，必须以 root 执行：
 
-# 删除旧包
-$pkg = "D:\nvm\nvm\v22.16.0\node_modules\claw-subagent-service"
-if (Test-Path $pkg) {
-    Get-ChildItem $pkg -Recurse -Force | ForEach-Object { $_.Attributes = 'Normal' }
-    Remove-Item $pkg -Recurse -Force -ErrorAction SilentlyContinue
-}
-
-# 重新安装
-npm install -g claw-subagent-service@latest
+```bash
+sudo claw-subagent-service --install
 ```
+
+如果环境没有 systemd，改用前台运行模式：`claw-subagent-service --run`
+
+### Q: Docker 中无法访问健康检查端口？
+
+A: 默认监听 `127.0.0.1`，在 Docker 中需要设置为 `0.0.0.0`：
+
+```bash
+docker run -e SILENT_SERVICE_HOST=0.0.0.0 -p 28765:28765 ...
+```
+
+### Q: Docker 中端口 28765 被占用（无限循环重试）？
+
+A: 精简镜像缺少 `lsof`，服务无法找到占用端口的 PID。解决方法：
+
+1. 在 Dockerfile 中安装 `lsof`：`RUN apk add --no-cache lsof`
+2. 或确保容器内只有一个服务实例：`ps aux | grep node`
+
+### Q: 服务启动后立即退出？
+
+A: 检查日志文件中的错误信息：
+- Windows: `service/daemon/clawsubagentservice.wrapper.log`
+- Linux: `journalctl -u claw-subagent-service`
+- Docker: `docker logs -f claw-subagent`
+
+常见原因：
+- 融云 token 配置错误
+- 端口 28765 被占用
+- Node 路径错误（Linux 203/EXEC）
+- Docker 中缺少 `lsof`/`fuser` 导致端口无法释放

@@ -15,17 +15,8 @@ const { startOpencodeService, stopOpencodeService } = require('./modules/opencod
 
 const log = createLogger('worker');
 const PORT = process.env.SILENT_SERVICE_PORT ? parseInt(process.env.SILENT_SERVICE_PORT, 10) : 28765;
+const HOST = process.env.SILENT_SERVICE_HOST || '127.0.0.1';
 
-
-// 捕获所有异常，强制打印到控制台（绕过 logger）
-process.on('uncaughtException', (err) => {
-  console.error('[WORKER_FATAL] 未捕获异常:', err);
-  process.exit(1);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('[WORKER_FATAL] 未捕获Promise:', reason);
-});
 
 // 如果 logger 初始化后，也同步写到 logger
 const originalStderr = process.stderr.write.bind(process.stderr);
@@ -54,9 +45,20 @@ function findPidOnPort(port) {
         }
       }
     } else {
-      const out = execSync(`lsof -i :${port} -t 2>/dev/null`, { encoding: 'utf8', timeout: 5000 });
-      const pid = parseInt(out.trim(), 10);
-      if (!isNaN(pid)) return pid;
+      // 优先尝试 lsof，再兜底 ss / fuser / netstat（适配精简 Docker 镜像）
+      const commands = [
+        `lsof -i :${port} -t 2>/dev/null`,
+        `fuser ${port}/tcp 2>/dev/null`,
+        `ss -tlnp 2>/dev/null | grep ":${port}" | sed -n 's/.*pid=\\([0-9]*\\).*/\\1/p'`,
+        `netstat -tlnp 2>/dev/null | grep ":${port}" | sed -n 's/.*\\/\\([0-9]*\\).*/\\1/p'`,
+      ];
+      for (const cmd of commands) {
+        try {
+          const out = execSync(cmd, { encoding: 'utf8', timeout: 5000 }).trim();
+          const candidate = parseInt(out.split('\n')[0], 10);
+          if (!isNaN(candidate) && candidate > 0 && candidate !== process.pid) return candidate;
+        } catch { continue; }
+      }
     }
   } catch { /* port is free */ }
   return null;
@@ -83,7 +85,18 @@ function forceKill(pid) {
 function ensurePortFree(port) {
   for (let i = 0; i < 3; i++) {
     const pid = findPidOnPort(port);
-    if (!pid) return true;
+    if (!pid) {
+      // 端口查询工具都不可用但端口仍可能被占用，按脚本名兜底清理一次
+      if (i === 0 && process.platform !== 'win32') {
+        try {
+          execSync('pkill -9 -f "daemon.js" 2>/dev/null || true', { timeout: 5000 });
+          execSync('pkill -9 -f "worker.js" 2>/dev/null || true', { timeout: 5000 });
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2000);
+        } catch { /* 忽略 */ }
+        continue;
+      }
+      return true;
+    }
     log.warn(`[WORKER] 端口 ${port} 被进程 ${pid} 占用，正在释放...`);
     forceKill(pid);
     // 同步等待端口释放（最多 1.5s）
@@ -467,23 +480,30 @@ server.on('error', (err) => {
     log.error(`[WORKER] 端口 ${PORT} 被占用，尝试释放并重启监听...`);
     // 尝试杀死占用进程后重试
     const pid = findPidOnPort(PORT);
-    if (pid) {
+    if (pid && pid !== process.pid) {
       log.warn(`[WORKER] 发现占用进程 ${pid}，强制终止...`);
       forceKill(pid);
+    } else if (!pid) {
+      // 所有端口查询工具都不可用（常见于精简 Docker 镜像），按脚本名兜底清理
+      log.warn('[WORKER] 无法查询端口占用进程，尝试按脚本名清理残留...');
+      try {
+        execSync('pkill -9 -f "daemon.js" 2>/dev/null || true', { timeout: 5000 });
+        execSync('pkill -9 -f "worker.js" 2>/dev/null || true', { timeout: 5000 });
+      } catch { /* 忽略 */ }
     }
-    // 延迟 2 秒后重试
+    // 延迟 3 秒后重试，给进程退出和端口释放留出足够时间
     setTimeout(() => {
       log.info(`[WORKER] 重新尝试监听端口 ${PORT}...`);
       server.close(() => {});
-      server.listen(PORT, '127.0.0.1');
-    }, 2000);
+      server.listen(PORT, HOST);
+    }, 3000);
     return;
   }
   log.error(`[WORKER] HTTP 服务错误: ${err.message}`);
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-  log.info(`[WORKER] HTTP 服务已启动: http://127.0.0.1:${PORT}/health`);
+server.listen(PORT, HOST, () => {
+  log.info(`[WORKER] HTTP 服务已启动: http://${HOST}:${PORT}/health`);
 });
 
 process.on('message', (msg) => {

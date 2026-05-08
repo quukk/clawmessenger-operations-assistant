@@ -128,11 +128,12 @@ class RongCloudClient {
     try {
       const msgType = message.messageType;
       let rawContent = message.content;
-      let mentionedInfo = null;
+      // 融云 SDK 中 mentionedInfo 通常在消息根级别
+      let mentionedInfo = message.mentionedInfo || null;
 
       // 自定义消息 content 可能是对象，提取文本内容并保留 mentionedInfo
       if (rawContent && typeof rawContent === 'object') {
-        mentionedInfo = rawContent.mentionedInfo || null;
+        mentionedInfo = mentionedInfo || rawContent.mentionedInfo || null;
         rawContent = rawContent.content || rawContent.text || JSON.stringify(rawContent);
       }
 

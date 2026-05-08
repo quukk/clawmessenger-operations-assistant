@@ -113,7 +113,8 @@ class ScriptExecutor {
         cmd = 'cmd';
         args = ['/c', command];
       } else {
-        cmd = 'bash';
+        // Alpine 等精简镜像可能缺少 bash，优先使用 sh
+        cmd = 'sh';
         args = ['-c', command];
       }
 
@@ -186,7 +187,8 @@ class ScriptExecutor {
         cmd = 'cmd';
         args = ['/c', scriptPath];
       } else {
-        cmd = 'bash';
+        // Alpine 等精简镜像可能缺少 bash，优先使用 sh
+        cmd = 'sh';
         args = [scriptPath];
       }
 

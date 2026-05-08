@@ -63,8 +63,8 @@ class MessageHandler {
       }
       this.log?.info(`[MessageHandler] 消息提及本节点(${this.nodeId})，处理`);
     } else if (msg.conversationType === 3) {
-      this.log?.info(`[MessageHandler] 群聊消息未 @ 本节点(${this.nodeId})，忽略`);
-      return false;
+      // 群聊消息未 @ 任何人 → 视为所有人参与，正常处理
+      this.log?.info(`[MessageHandler] 群聊消息未 @ 任何人，本节点(${this.nodeId})参与处理`);
     } else {
       this.log?.info(`[MessageHandler] 单聊消息未指定节点，本节点(${this.nodeId})处理`);
     }

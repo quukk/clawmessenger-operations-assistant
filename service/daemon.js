@@ -119,11 +119,38 @@ function freePortIfNeeded(port) {
         }
       }
     } else {
-      const out = execSync(`lsof -i :${port} -t 2>/dev/null`, { encoding: 'utf8', timeout: 5000 });
-      const pid = parseInt(out.trim(), 10);
-      if (pid && pid > 0) {
+      // Linux / macOS：优先 lsof，兜底 fuser / ss / netstat / pkill
+      let pid = 0;
+      const commands = [
+        `lsof -i :${port} -t 2>/dev/null`,
+        `fuser ${port}/tcp 2>/dev/null`,
+        `ss -tlnp 2>/dev/null | grep -oP 'pid=\\K[0-9]+'`,
+        `netstat -tlnp 2>/dev/null | grep ":${port} " | awk '{print $7}' | cut -d'/' -f1`,
+      ];
+      for (const cmd of commands) {
+        try {
+          const out = execSync(cmd, { encoding: 'utf8', timeout: 5000 }).trim();
+          const firstLine = out.split(/\r?\n/)[0];
+          const candidate = parseInt(firstLine, 10);
+          if (candidate && candidate > 0 && candidate !== currentWorkerPid && candidate !== process.pid) {
+            pid = candidate;
+            break;
+          }
+        } catch { /* 命令不可用，继续下一个兜底 */ }
+      }
+
+      if (pid) {
         log.warn(`[DAEMON] 端口 ${port} 被进程 ${pid} 占用，正在释放...`);
-        process.kill(pid, 'SIGKILL');
+        try { process.kill(pid, 'SIGKILL'); } catch (e) {
+          log.warn(`[DAEMON] 终止进程 ${pid} 失败: ${e.message}`);
+        }
+      } else {
+        // 所有命令都不可用，尝试按脚本名批量杀掉残留进程
+        try {
+          execSync('pkill -9 -f "daemon.js" 2>/dev/null || true', { timeout: 5000 });
+          execSync('pkill -9 -f "worker.js" 2>/dev/null || true', { timeout: 5000 });
+          log.warn(`[DAEMON] 已尝试按脚本名释放端口 ${port}`);
+        } catch { /* 忽略 */ }
       }
     }
   } catch { /* 端口已被释放或无法查询 */ }
@@ -184,9 +211,16 @@ function startWorker(isAfterUpdate = false, backupDirForRollback = null) {
       healthTimer = null;
     }
 
-    log.error(`[DAEMON] Worker 退出，code=${code}, signal=${signal}`);
     worker = null;
     currentWorkerPid = null;
+
+    // 正常退出（code=0, signal=null）视为优雅关闭，不增加崩溃计数
+    const isNormalExit = code === 0 && signal === null;
+    if (isNormalExit) {
+      log.info(`[DAEMON] Worker 正常退出，code=${code}, signal=${signal}`);
+    } else {
+      log.error(`[DAEMON] Worker 异常退出，code=${code}, signal=${signal}`);
+    }
 
     if (isAfterUpdate && code !== 0 && currentBackupDir && !isRollingBack) {
       isRollingBack = true;
@@ -207,9 +241,11 @@ function startWorker(isAfterUpdate = false, backupDirForRollback = null) {
     }
 
     if (!stopping && !isRollingBack) {
-      // 使用指数退避延迟后重启；端口释放交由 startWorker 中的 freePortIfNeeded 处理，
-      // 避免此处误杀刚刚由其他实例启动的 worker
-      const delay = getRestartDelay();
+      // 正常退出使用固定 1 秒延迟；异常退出使用指数退避
+      const delay = isNormalExit ? 1000 : getRestartDelay();
+      if (!isNormalExit) {
+        log.info(`[DAEMON] Worker 连续崩溃 ${crashCount} 次，等待 ${delay / 1000}s 后重启`);
+      }
       setTimeout(() => startWorker(false, null), delay);
     }
   });
@@ -243,10 +279,10 @@ function restartWorkerWithUpdate(backupDir) {
           execSync(`taskkill /pid ${worker.pid} /T /F 2>nul`, { windowsHide: true });
         } catch (e) {
           // 忽略错误，使用 kill 作为后备
-          worker.kill('SIGTERM');
+          try { worker.kill('SIGTERM'); } catch { /* 进程可能已退出 */ }
         }
       } else {
-        worker.kill('SIGTERM');
+        try { worker.kill('SIGTERM'); } catch { /* 进程可能已退出 */ }
       }
 
       const waitKill = setInterval(() => {
@@ -261,10 +297,10 @@ function restartWorkerWithUpdate(backupDir) {
               const { execSync } = require('child_process');
               execSync(`taskkill /pid ${worker.pid} /T /F 2>nul`, { windowsHide: true });
             } catch (e) {
-              worker.kill('SIGKILL');
+              try { worker.kill('SIGKILL'); } catch { /* 进程可能已退出 */ }
             }
           } else {
-            worker.kill('SIGKILL');
+            try { worker.kill('SIGKILL'); } catch { /* 进程可能已退出 */ }
           }
         }
       }, 500);
