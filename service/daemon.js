@@ -145,11 +145,11 @@ function freePortIfNeeded(port) {
           log.warn(`[DAEMON] 终止进程 ${pid} 失败: ${e.message}`);
         }
       } else {
-        // 所有命令都不可用，尝试按脚本名批量杀掉残留进程
+        // 所有端口查询命令都不可用（常见于精简 Docker 镜像）
+        // 兜底：杀掉残留 Worker 进程（Daemon 自身的命令行不含 worker.js，不会自杀）
         try {
-          execSync('pkill -9 -f "daemon.js" 2>/dev/null || true', { timeout: 5000 });
           execSync('pkill -9 -f "worker.js" 2>/dev/null || true', { timeout: 5000 });
-          log.warn(`[DAEMON] 已尝试按脚本名释放端口 ${port}`);
+          log.warn(`[DAEMON] 已尝试杀掉残留 Worker 进程`);
         } catch { /* 忽略 */ }
       }
     }

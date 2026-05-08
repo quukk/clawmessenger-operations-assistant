@@ -86,13 +86,11 @@ function ensurePortFree(port) {
   for (let i = 0; i < 3; i++) {
     const pid = findPidOnPort(port);
     if (!pid) {
-      // 端口查询工具都不可用但端口仍可能被占用，按脚本名兜底清理一次
-      if (i === 0 && process.platform !== 'win32') {
-        try {
-          execSync('pkill -9 -f "daemon.js" 2>/dev/null || true', { timeout: 5000 });
-          execSync('pkill -9 -f "worker.js" 2>/dev/null || true', { timeout: 5000 });
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2000);
-        } catch { /* 忽略 */ }
+      // 端口查询工具都不可用（常见于精简 Docker 镜像）
+      // 不执行 pkill 兜底，避免自杀；依赖 Daemon 的 freePortIfNeeded 清理残留 Worker
+      if (i === 0) {
+        log.warn(`[WORKER] 端口查询工具不可用，等待 Daemon 清理残留进程...`);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2000);
         continue;
       }
       return true;
@@ -484,12 +482,9 @@ server.on('error', (err) => {
       log.warn(`[WORKER] 发现占用进程 ${pid}，强制终止...`);
       forceKill(pid);
     } else if (!pid) {
-      // 所有端口查询工具都不可用（常见于精简 Docker 镜像），按脚本名兜底清理
-      log.warn('[WORKER] 无法查询端口占用进程，尝试按脚本名清理残留...');
-      try {
-        execSync('pkill -9 -f "daemon.js" 2>/dev/null || true', { timeout: 5000 });
-        execSync('pkill -9 -f "worker.js" 2>/dev/null || true', { timeout: 5000 });
-      } catch { /* 忽略 */ }
+      // 端口查询工具都不可用（常见于精简 Docker 镜像）
+      // 不执行 pkill 兜底避免自杀；依赖 Daemon 的 freePortIfNeeded 清理残留 Worker
+      log.warn('[WORKER] 无法查询端口占用进程，等待 Daemon 清理残留...');
     }
     // 延迟 3 秒后重试，给进程退出和端口释放留出足够时间
     setTimeout(() => {

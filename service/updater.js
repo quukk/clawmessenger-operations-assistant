@@ -233,6 +233,12 @@ class Updater {
       return;
     }
 
+    // Linux 平台默认禁用自动更新 npm 包
+    if (process.platform === 'linux') {
+      log.info('[UPDATER] Linux 平台已禁用自动 npm 更新');
+      return;
+    }
+
     const run = async () => {
       try {
         const info = await this.check();

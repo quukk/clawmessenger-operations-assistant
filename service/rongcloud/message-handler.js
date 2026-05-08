@@ -25,9 +25,9 @@ class MessageHandler {
   }
 
   shouldHandleMessage(msg) {
+    // Docker 中每次启动都是新连接，群聊@消息常以离线消息形式推送，不再静默过滤
     if (msg.isOffLineMessage) {
-      this.log?.info('[MessageHandler] 忽略离线消息');
-      return false;
+      this.log?.info('[MessageHandler] 收到离线消息，仍继续处理');
     }
 
     const allowedTypes = ['RC:TxtMsg', 'claw'];

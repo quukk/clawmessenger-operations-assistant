@@ -100,9 +100,10 @@ class RongCloudClient {
   }
 
   handleReceivedMessage(message) {
-    // 1. 过滤离线消息
+    // 1. 不再静默过滤离线消息：Docker 中每次启动都是新连接，
+    //    群聊@消息常以离线消息形式推送，过滤会导致消息丢失
     if (message.isOffLineMessage) {
-      return;
+      this.log?.info('[RongCloudClient] 收到离线消息，仍继续处理');
     }
 
     // 2. 过滤自己发送的消息（融云 SDK 可能将发送消息回传）
