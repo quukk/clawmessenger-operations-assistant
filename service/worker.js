@@ -130,6 +130,15 @@ const logTimestampValidation = (message) => {
 
 log.info(`[WORKER] 业务进程启动，PID: ${process.pid}`);
 
+// 修复：如果 worker 继承的 cwd 已失效（如 daemon 所在目录被删除），先切到临时目录
+try {
+  process.cwd();
+} catch (e) {
+  if (e.code === 'ENOENT') {
+    try { process.chdir(os.tmpdir()); } catch {}
+  }
+}
+
 const localConfigPath = path.join(__dirname, '..', 'rongcloud-config.json');
 let rongcloudConfig = null;
 

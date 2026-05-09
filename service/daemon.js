@@ -176,6 +176,15 @@ function getRestartDelay() {
 function startWorker(isAfterUpdate = false, backupDirForRollback = null) {
   if (stopping || isRollingBack) return;
 
+  // 修复：如果 daemon 的 cwd 已失效（如目录被删除/替换），先切到临时目录，避免 worker 继承无效路径
+  try {
+    process.cwd();
+  } catch (e) {
+    if (e.code === 'ENOENT') {
+      try { process.chdir(os.tmpdir()); } catch {}
+    }
+  }
+
   log.info(`[DAEMON] 启动 Worker，daemon PID: ${process.pid}，更新后重启: ${isAfterUpdate}`);
   log.info(`[DAEMON] Daemon 目录: ${__dirname}`);
   log.info(`[DAEMON] Worker 路径: ${WORKER_PATH}`);

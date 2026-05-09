@@ -196,6 +196,30 @@ function startOpenClawGateway(log) {
 }
 
 class OpenClawClient {
+  // 全局并发限制：同时最多运行 N 个 openclaw agent 进程
+  static maxConcurrency = 2;
+  static runningCount = 0;
+  static waitQueue = [];
+  // Session 级串行锁：确保同一 session 不会并发 spawn 多个进程
+  static sessionLocks = new Map();
+
+  static async acquireSlot() {
+    if (OpenClawClient.runningCount < OpenClawClient.maxConcurrency) {
+      OpenClawClient.runningCount++;
+      return;
+    }
+    return new Promise(resolve => OpenClawClient.waitQueue.push(resolve));
+  }
+
+  static releaseSlot() {
+    OpenClawClient.runningCount--;
+    if (OpenClawClient.waitQueue.length > 0) {
+      const next = OpenClawClient.waitQueue.shift();
+      OpenClawClient.runningCount++;
+      next();
+    }
+  }
+
   constructor(log) {
     this.log = log;
     this.gatewayStarting = false;
@@ -260,6 +284,35 @@ class OpenClawClient {
 
   async chatViaCLI(message, fromUser) {
     const sessionId = `clawmessenger-${fromUser}`;
+
+    // 1. Session 级串行锁：同一用户的消息排队执行，避免多个进程竞争同一 session 文件
+    const previousLock = OpenClawClient.sessionLocks.get(sessionId);
+    let resolveLock;
+    const currentLock = new Promise(r => { resolveLock = r; });
+    OpenClawClient.sessionLocks.set(sessionId, currentLock);
+    if (previousLock) {
+      this.log?.info(`[OpenClawClient] session ${sessionId} 正在处理中，排队等待...`);
+      await previousLock;
+    }
+
+    // 2. 全局并发槽位限制：所有实例共享，防止服务器资源耗尽
+    await OpenClawClient.acquireSlot();
+    this.log?.info(`[OpenClawClient] 获得执行槽位 (当前运行: ${OpenClawClient.runningCount}/${OpenClawClient.maxConcurrency})`);
+
+    try {
+      return await this._runAgentCLI(message, fromUser, sessionId);
+    } finally {
+      OpenClawClient.releaseSlot();
+      this.log?.info(`[OpenClawClient] 释放执行槽位 (当前运行: ${OpenClawClient.runningCount}/${OpenClawClient.maxConcurrency})`);
+      // 释放 session 锁
+      resolveLock();
+      if (OpenClawClient.sessionLocks.get(sessionId) === currentLock) {
+        OpenClawClient.sessionLocks.delete(sessionId);
+      }
+    }
+  }
+
+  _runAgentCLI(message, fromUser, sessionId) {
     const escapedMessage = message
       .replace(/\\/g, '\\\\')
       .replace(/"/g, '\\"')
@@ -278,9 +331,7 @@ class OpenClawClient {
 
     const quoteArg = (s) => `"${s}"`;
     const cmdParts = ['openclaw', 'agent', '-m', quoteArg(escapedMessage), '--session-id', quoteArg(sessionId)];
-    if (gatewayToken) {
-      cmdParts.push('--token', quoteArg(gatewayToken));
-    }
+    // 注意：openclaw agent CLI 不支持 --token 参数，token 通过环境变量传递
     const command = cmdParts.join(' ');
 
     this.log?.info(`[OpenClawClient] 执行: ${command}`);
@@ -292,10 +343,27 @@ class OpenClawClient {
 
       // 关键：不设置 OPENCLAW_GATEWAY_URL，避免触发 "gateway url override requires explicit credentials"
       // 让 openclaw agent 通过默认方式自动发现本地 gateway
+
+      // 修复：如果父进程 cwd 已失效（如目录被删除/替换），先修复自身 cwd，避免子进程继承无效路径
+      try {
+        process.cwd();
+      } catch (e) {
+        if (e.code === 'ENOENT') {
+          try { process.chdir(os.tmpdir()); } catch {}
+        }
+      }
+
+      const env = getOpenClawEnv();
+      // 将 gateway token 通过环境变量传递（openclaw agent 不支持 --token CLI 参数）
+      if (gatewayToken) {
+        env.OPENCLAW_API_KEY = gatewayToken;
+        env.OPENCLAW_TOKEN = gatewayToken;
+      }
       const child = spawn(command, {
         shell: true,
         windowsHide: true,
-        env: getOpenClawEnv(),
+        env,
+        cwd: os.tmpdir(),
       });
 
       this.log?.info(`[OpenClawClient] CLI 子进程 PID=${child.pid}`);

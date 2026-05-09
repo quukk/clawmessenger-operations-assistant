@@ -10,6 +10,7 @@
  * 参考: nodejs_client/src/main/rongyun-client.ts startOpencodeService()
  */
 const net = require('net');
+const os = require('os');
 const { spawn, exec } = require('child_process');
 
 /**
@@ -57,7 +58,7 @@ function installOpencode(log) {
     const installChild = spawn(
       'npm',
       ['install', '-g', 'opencode-ai@latest'],
-      { shell: true, windowsHide: true }
+      { shell: true, windowsHide: true, cwd: os.tmpdir() }
     );
     
     let installOutput = '';
@@ -101,7 +102,7 @@ function startOpencodeProcess(log) {
     const child = spawn(
       'opencode',
       ['serve', '--port', '4096', '--hostname', '127.0.0.1'],
-      { shell: true, windowsHide: true }
+      { shell: true, windowsHide: true, cwd: os.tmpdir() }
     );
     
     // 保存进程引用，以便后续关闭

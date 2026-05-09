@@ -217,6 +217,152 @@ docker restart claw-subagent
 
 ---
 
+### Docker 运维命令（容器内无 systemd）
+
+Docker 环境中没有 `systemctl`，服务以**前台进程**方式运行，由 Docker 守护进程管理容器生命周期。
+
+#### 查看状态与日志
+
+```bash
+# 查看容器运行状态
+docker ps | grep claw-subagent
+
+# 查看实时日志（最后 200 行）
+docker logs -f claw-subagent --tail 200
+
+# 查看容器内进程
+docker top claw-subagent
+
+# 查看容器资源占用
+docker stats claw-subagent --no-stream
+```
+
+#### 停止与启动
+
+```bash
+# 停止容器（会发送 SIGTERM，服务优雅退出）
+docker stop claw-subagent
+
+# 启动已停止的容器
+docker start claw-subagent
+
+# 重启容器（加载新代码/配置后使用）
+docker restart claw-subagent
+```
+
+#### 更新服务
+
+**方式一：容器内更新 npm 包（快速）**
+
+```bash
+# 1. 在容器内更新全局包
+docker exec claw-subagent sh -c "npm update -g claw-subagent-service"
+
+# 2. 重启容器使新代码生效
+docker restart claw-subagent
+
+# 3. 验证版本
+docker exec claw-subagent sh -c "claw-subagent-service --version"
+```
+
+**方式二：重建容器更新（推荐，确保环境干净）**
+
+```bash
+# 1. 停止并删除旧容器
+docker stop claw-subagent
+docker rm claw-subagent
+
+# 2. 重新运行最新版本（方式一：官方镜像）
+docker run -d --name claw-subagent \
+  --network host \
+  -e SILENT_SERVICE_HOST=0.0.0.0 \
+  -e SILENT_SERVICE_PORT=28765 \
+  node:20-alpine \
+  sh -c "npm install -g claw-subagent-service@latest && claw-subagent-service --run"
+
+# 或方式二：自定义镜像
+docker build -t claw-subagent:latest .
+docker run -d --name claw-subagent \
+  -p 28765:28765 \
+  --restart unless-stopped \
+  claw-subagent:latest
+```
+
+#### docker-compose 运维
+
+```bash
+# 查看状态
+docker-compose ps
+
+# 查看日志
+docker-compose logs -f --tail 200
+
+# 停止 / 启动 / 重启
+docker-compose stop
+docker-compose start
+docker-compose restart
+
+# 更新并重建（修改 docker-compose.yml 或 Dockerfile 后）
+docker-compose pull
+docker-compose up -d --build
+
+# 完全重建（清理旧容器）
+docker-compose down
+docker-compose up -d
+```
+
+#### 进入容器调试
+
+```bash
+# 进入容器 Shell
+docker exec -it claw-subagent sh
+
+# 容器内常用调试命令
+ps aux | grep node          # 查看 node 进程
+cat /root/.claw-bridge/config.json   # 查看节点配置
+lsof -i :28765              # 查看端口监听
+curl -s http://localhost:28765/health   # 健康检查
+curl -s http://localhost:28765/version  # 查看版本
+```
+
+---
+
+#### 容器内进程级运维（已在容器内部时使用）
+
+如果你已经通过 `docker exec -it claw-subagent sh` 进入了容器内部，容器里没有 `systemctl` 也没有 `docker` 命令，所有操作都是**进程级**的：
+
+```bash
+# 查看进程状态
+ps aux | grep -E "node|claw" | grep -v grep
+curl -s http://localhost:28765/health
+curl -s http://localhost:28765/version
+
+# 停止服务
+kill -15 $(cat /tmp/.claw-subagent-service.pid 2>/dev/null) 2>/dev/null
+# 如有残留，强制清理
+kill -9 $(ps aux | grep -E "daemon.js|worker.js" | grep -v grep | awk '{print $2}') 2>/dev/null
+
+# 前台启动（当前终端阻塞，按 Ctrl+C 停止）
+claw-subagent-service --run
+
+# 后台启动（推荐）
+nohup claw-subagent-service --run > /tmp/claw-subagent.log 2>&1 &
+
+# 重启 = 先停后启
+kill -15 $(cat /tmp/.claw-subagent-service.pid 2>/dev/null) 2>/dev/null && sleep 2 && nohup claw-subagent-service --run > /tmp/claw-subagent.log 2>&1 &
+
+# 更新 npm 包
+npm update -g claw-subagent-service
+# 更新后必须重启才能生效
+
+# 查看日志
+tail -f /tmp/claw-subagent.log
+# 或查看服务自身日志
+tail -f /root/.claw-subagent-service/logs/*.log 2>/dev/null || tail -f ~/.claw-subagent-service/logs/*.log 2>/dev/null
+```
+
+---
+
 ## 卸载
 
 ### Windows

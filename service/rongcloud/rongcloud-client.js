@@ -22,6 +22,9 @@ class RongCloudClient {
     this.processingQueue = Promise.resolve();
     this.processedMessageUIds = new Set();
     this.messageDedupMaxSize = 1000;
+    // 发送侧短期缓存：防止融云 SDK 回传自己发送的消息导致机器人自言自语
+    this.sentMessageUIds = new Set();
+    this.sentMessageDedupMaxSize = 100;
   }
 
   async connect(handler) {
@@ -110,10 +113,10 @@ class RongCloudClient {
     // 最外层日志：确保任何消息到达都能留下痕迹（在过滤之前）
     this.log?.info(`[RongCloudClient] handleReceivedMessage 入口: messageType=${message.messageType}, senderUserId=${message.senderUserId}, conversationType=${message.conversationType}, isOffLineMessage=${message.isOffLineMessage}, messageDirection=${message.messageDirection}, messageUId=${message.messageUId}`);
 
-    // 1. 不再静默过滤离线消息：Docker 中每次启动都是新连接，
-    //    群聊@消息常以离线消息形式推送，过滤会导致消息丢失
+    // 1. 过滤离线消息：离线消息是历史记录，不需要重复处理
     if (message.isOffLineMessage) {
-      this.log?.info('[RongCloudClient] 收到离线消息，仍继续处理');
+      this.log?.info('[RongCloudClient] 收到离线消息，忽略');
+      return;
     }
 
     // 2. 过滤自己发送的消息（融云 SDK 可能将发送消息回传）
@@ -124,6 +127,12 @@ class RongCloudClient {
     }
     if (message.senderUserId === this.config.accountId) {
       this.log?.info(`[RongCloudClient] 过滤自己发送的消息 (senderUserId=${message.senderUserId} === accountId=${this.config.accountId})`);
+      return;
+    }
+
+    // 2.5 通过发送缓存过滤：融云 SDK 回传自己消息时，messageDirection/senderUserId 可能不一致
+    if (message.messageUId && this.sentMessageUIds.has(message.messageUId)) {
+      this.log?.info(`[RongCloudClient] 过滤自己发送的消息 (messageUId=${message.messageUId} 在发送缓存中)`);
       return;
     }
 
@@ -227,7 +236,16 @@ class RongCloudClient {
       // this.log?.info(`[RongCloudClient] 发送结果: code=${result.code}`);
 
       if (result.code === 0 || result.code === 200) {
-        this.log?.info(`[RongCloudClient] 发送成功, messageUId: ${result.data?.messageUId}`);
+        const sentUId = result.data?.messageUId;
+        this.log?.info(`[RongCloudClient] 发送成功, messageUId: ${sentUId}`);
+        // 将发送成功的 messageUId 加入短期缓存，用于过滤 SDK 回传的自己消息
+        if (sentUId) {
+          this.sentMessageUIds.add(sentUId);
+          if (this.sentMessageUIds.size > this.sentMessageDedupMaxSize) {
+            const first = this.sentMessageUIds.values().next().value;
+            this.sentMessageUIds.delete(first);
+          }
+        }
         return true;
       } else {
         this.log?.error(`[RongCloudClient] 发送失败, code: ${result.code}`);
