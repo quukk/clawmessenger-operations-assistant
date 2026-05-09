@@ -431,7 +431,8 @@ class ScriptExecutor {
         upper.includes('STOPPED') ||
         upper.includes('[OK] STOP COMMAND EXECUTED') ||
         upper.includes('[OK] SERVICE STOPPED') ||
-        (output.includes('[INFO] OPENCLAW 服务停止成功') && output.includes('[INFO] 服务已成功停止')) ||
+        upper.includes('服务停止成功') ||
+        upper.includes('服务已成功停止') ||
         upper.includes('GATEWAY STOP SIGNAL SENT') ||
         (upper.includes('[INFO] STOPPING SERVICE') && upper.includes('STOP SIGNAL'))
       ) {
