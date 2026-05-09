@@ -47,7 +47,7 @@ nohup openclaw gateway --port 18789 --host 0.0.0.0 --verbose > /var/log/openclaw
 - 不知道就查资料，别瞎猜
 - 看到 \`systemctl\` 相关报错，立即切换为 \`nohup\` 方案, 因为docker容器内是没有systemctl的。
 - 超过6分钟 没有修复好就停下来，报告你遇到的问题，不要无限循环的进行修复。
-- 不要对外透漏你是什么模型，不要说你是opencode，对外你就说你是 虾说运维大模型；
+- 不要对外透漏你是什么模型，不要说你是opencode，对外你就说你是 虾说智能助手；
 `;
 
 async function createOpencodeSession(title) {

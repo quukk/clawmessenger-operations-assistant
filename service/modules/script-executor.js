@@ -90,6 +90,11 @@ class ScriptExecutor {
     try {
       const { stdout, stderr } = await this.runScript(scriptPath);
       const fullOutput = stdout + stderr;
+      
+      // 调试日志：记录脚本实际输出
+      console.log(`[ScriptExecutor-DEBUG] ${scriptName} 原始输出:\n${fullOutput}`);
+      console.log(`[ScriptExecutor-DEBUG] ${scriptName} 输出长度: ${fullOutput.length}`);
+      
       return this.parseStatus(command, fullOutput);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -177,6 +182,20 @@ class ScriptExecutor {
   }
 
   runScript(scriptPath) {
+    // Linux/Mac 系统：自动修复 shell 脚本的 CRLF 换行符
+    if (process.platform !== 'win32') {
+      try {
+        const fs = require('fs');
+        const content = fs.readFileSync(scriptPath, 'utf8');
+        if (content.includes('\r\n')) {
+          fs.writeFileSync(scriptPath, content.replace(/\r\n/g, '\n'));
+          console.log(`[ScriptExecutor] 已修复 ${path.basename(scriptPath)} 换行符（CRLF → LF）`);
+        }
+      } catch (e) {
+        // 忽略读取/写入错误，继续执行
+      }
+    }
+
     return new Promise((resolve, reject) => {
       const system = process.platform;
       let cmd;
@@ -188,6 +207,13 @@ class ScriptExecutor {
       } else {
         cmd = 'bash';
         args = [scriptPath];
+      }
+
+      // 调试日志：记录执行环境
+      if (process.platform !== 'win32') {
+        console.log(`[ScriptExecutor-DEBUG] 执行脚本: ${scriptPath}`);
+        console.log(`[ScriptExecutor-DEBUG] PATH: ${process.env.PATH}`);
+        console.log(`[ScriptExecutor-DEBUG] SHELL: ${process.env.SHELL}`);
       }
 
       const child = spawn(cmd, args, {
@@ -321,6 +347,12 @@ class ScriptExecutor {
 
   parseStatus(command, output) {
     const upper = output.toUpperCase();
+    
+    // 调试日志：记录解析过程
+    console.log(`[ScriptExecutor-DEBUG] parseStatus 命令: ${command}`);
+    console.log(`[ScriptExecutor-DEBUG] parseStatus 大写输出包含: ACTIVE: ACTIVE (RUNNING)? ${upper.includes('ACTIVE: ACTIVE (RUNNING)')}`);
+    console.log(`[ScriptExecutor-DEBUG] parseStatus 大写输出包含: SUCCESS? ${upper.includes('SUCCESS')}`);
+    console.log(`[ScriptExecutor-DEBUG] parseStatus 原始输出包含: :18789? ${output.includes(':18789')}`);
 
     if (
       upper.includes('OPENCLAW COMMAND NOT FOUND') ||
@@ -358,6 +390,7 @@ class ScriptExecutor {
           message: getServiceStatusMessage(OpenClawServiceStatus.NOT_RUNNING)
         };
       }
+      console.log(`[ScriptExecutor-DEBUG] STATUS 默认返回: NOT_RUNNING（未匹配到运行中标识）`);
       return {
         status: OpenClawServiceStatus.NOT_RUNNING,
         message: getServiceStatusMessage(OpenClawServiceStatus.NOT_RUNNING)
