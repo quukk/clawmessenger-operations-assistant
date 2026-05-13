@@ -199,7 +199,7 @@ function loadRongCloudConfig() {
       config.appKey = localConfig.appKey || config.appKey;
       if (localConfig.token) config.token = localConfig.token;
       if (localConfig.accountId) config.accountId = localConfig.accountId;
-      if (localConfig.appSecret) config.appSecret = localConfig.appSecret;
+      // appSecret 不再从本地配置加载，统一从服务端获取
       if (localConfig.apiBaseUrl) config.apiBaseUrl = localConfig.apiBaseUrl;
       log.info(`[WORKER] 从本地配置加载: appKey=${config.appKey?.substring(0, 8)}...`);
     }

@@ -1,4 +1,5 @@
 const { MessageHandler } = require('../../service/rongcloud/message-handler');
+const axios = require('axios');
 
 jest.mock('../../service/rongcloud/openclaw-client', () => {
   class MockOpenClawClient {
@@ -16,6 +17,8 @@ jest.mock('../../service/rongcloud/openclaw-client', () => {
   return { OpenClawClient: MockOpenClawClient };
 });
 
+jest.mock('axios');
+
 describe('MessageHandler', () => {
   let handler;
   let mockSendFn;
@@ -32,7 +35,8 @@ describe('MessageHandler', () => {
     };
     mockConfig = {
       accountId: 'test_account',
-      maxRounds: 10
+      maxRounds: 10,
+      apiBaseUrl: null // 禁用流式处理，简化测试
     };
     handler = new MessageHandler(mockConfig, mockSendFn, mockLog);
   });
@@ -43,7 +47,7 @@ describe('MessageHandler', () => {
       expect(handler.sendFn).toBe(mockSendFn);
       expect(handler.log).toBe(mockLog);
       expect(handler._groupRoundCounts).toBeInstanceOf(Map);
-      expect(handler._maxRounds).toBe(10);
+      expect(handler._defaultMaxRounds).toBe(10);
     });
   });
 
@@ -86,13 +90,14 @@ describe('MessageHandler', () => {
   });
 
   describe('handleMessage', () => {
-    test('should process normal private chat messages', async () => {
+    test('should process normal private chat messages with mention', async () => {
       const msg = {
         messageType: 'RC:TxtMsg',
         senderUserId: 'user1',
         targetId: 'user2',
         conversationType: 1,
-        content: 'Hello'
+        content: 'Hello @test_account',
+        mentionedInfo: { userIdList: ['test_account'] }
       };
       await handler.handleMessage(msg);
       // 私聊回复目标为发送者
@@ -100,6 +105,9 @@ describe('MessageHandler', () => {
     });
 
     test('should track group chat rounds and block when max reached', async () => {
+      axios.get.mockResolvedValue({
+        data: { code: 200, data: { maxRounds: 2 } }
+      });
       const msg = {
         messageType: 'RC:TxtMsg',
         senderUserId: 'user1',
@@ -107,8 +115,8 @@ describe('MessageHandler', () => {
         conversationType: 3,
         content: 'Hello'
       };
-      handler._maxRounds = 2;
       handler._groupRoundCounts.clear();
+      handler._groupConfigCache.clear();
 
       // 第1轮：正常处理
       await handler.handleMessage(msg);
@@ -132,6 +140,9 @@ describe('MessageHandler', () => {
     });
 
     test('should reset rounds with /newround command in group chat', async () => {
+      axios.get.mockResolvedValue({
+        data: { code: 200, data: { maxRounds: 10 } }
+      });
       const msg = {
         messageType: 'RC:TxtMsg',
         senderUserId: 'user1',
@@ -139,8 +150,8 @@ describe('MessageHandler', () => {
         conversationType: 3,
         content: '/newround'
       };
-      handler._maxRounds = 10;
       handler._groupRoundCounts.set('group1', 10);
+      handler._groupConfigCache.clear();
 
       await handler.handleMessage(msg);
       expect(handler._getGroupRoundCount('group1')).toBe(0);
@@ -152,6 +163,9 @@ describe('MessageHandler', () => {
     });
 
     test('should show round status with /roundstatus command', async () => {
+      axios.get.mockResolvedValue({
+        data: { code: 200, data: { maxRounds: 10 } }
+      });
       const msg = {
         messageType: 'RC:TxtMsg',
         senderUserId: 'user1',
@@ -159,8 +173,8 @@ describe('MessageHandler', () => {
         conversationType: 3,
         content: '/roundstatus'
       };
-      handler._maxRounds = 10;
       handler._groupRoundCounts.set('group1', 5);
+      handler._groupConfigCache.clear();
 
       await handler.handleMessage(msg);
       expect(mockSendFn).toHaveBeenCalledWith(
@@ -171,6 +185,9 @@ describe('MessageHandler', () => {
     });
 
     test('should show ended status with /roundstatus when max reached', async () => {
+      axios.get.mockResolvedValue({
+        data: { code: 200, data: { maxRounds: 10 } }
+      });
       const msg = {
         messageType: 'RC:TxtMsg',
         senderUserId: 'user1',
@@ -178,8 +195,8 @@ describe('MessageHandler', () => {
         conversationType: 3,
         content: '/roundstatus'
       };
-      handler._maxRounds = 10;
       handler._groupRoundCounts.set('group1', 10);
+      handler._groupConfigCache.clear();
 
       await handler.handleMessage(msg);
       expect(mockSendFn).toHaveBeenCalledWith(
@@ -197,7 +214,6 @@ describe('MessageHandler', () => {
         conversationType: 1,
         content: 'Hello'
       };
-      handler._maxRounds = 2;
       handler._groupRoundCounts.clear();
 
       // 发送多条消息，私聊不应受轮数限制
@@ -208,13 +224,14 @@ describe('MessageHandler', () => {
       expect(handler._getGroupRoundCount('user2')).toBe(0);
     });
 
-    test('should handle slash-prefixed messages as normal chat in private', async () => {
+    test('should handle slash-prefixed messages as normal chat in private with mention', async () => {
       const msg = {
         messageType: 'RC:TxtMsg',
         senderUserId: 'user1',
         targetId: 'user2',
         conversationType: 1,
-        content: '/customcmd'
+        content: '/customcmd @test_account',
+        mentionedInfo: { userIdList: ['test_account'] }
       };
       await handler.handleMessage(msg);
       // 私聊中 / 开头的消息当前作为普通消息处理，由 AI 回复
@@ -227,7 +244,8 @@ describe('MessageHandler', () => {
         senderUserId: 'user1',
         targetId: 'user2',
         conversationType: 1,
-        content: 'Hello'
+        content: 'Hello @test_account',
+        mentionedInfo: { userIdList: ['test_account'] }
       };
       // Force an error by making sendFn throw
       mockSendFn.mockRejectedValueOnce(new Error('Send failed'));
@@ -242,9 +260,9 @@ describe('MessageHandler', () => {
     });
 
     test('_incrementGroupRoundCount should increase count', () => {
-      handler._incrementGroupRoundCount('group1');
+      handler._incrementGroupRoundCount('group1', 10);
       expect(handler._getGroupRoundCount('group1')).toBe(1);
-      handler._incrementGroupRoundCount('group1');
+      handler._incrementGroupRoundCount('group1', 10);
       expect(handler._getGroupRoundCount('group1')).toBe(2);
     });
 
@@ -252,6 +270,30 @@ describe('MessageHandler', () => {
       handler._groupRoundCounts.set('group1', 5);
       handler._resetGroupRoundCount('group1');
       expect(handler._getGroupRoundCount('group1')).toBe(0);
+    });
+
+    test('_getGroupMaxRounds should fetch from API and cache', async () => {
+      handler.config.apiBaseUrl = 'http://test-server';
+      axios.get.mockResolvedValue({
+        data: { code: 200, data: { maxRounds: 20 } }
+      });
+      const rounds = await handler._getGroupMaxRounds('group1');
+      expect(rounds).toBe(20);
+      expect(axios.get).toHaveBeenCalledWith(
+        'http://test-server/im/api/group/info',
+        { params: { groupId: 'group1' }, timeout: 5000 }
+      );
+      // 第二次调用应走缓存
+      axios.get.mockClear();
+      const rounds2 = await handler._getGroupMaxRounds('group1');
+      expect(rounds2).toBe(20);
+      expect(axios.get).not.toHaveBeenCalled();
+    });
+
+    test('_getGroupMaxRounds should fallback to default on API error', async () => {
+      axios.get.mockRejectedValue(new Error('Network error'));
+      const rounds = await handler._getGroupMaxRounds('group1');
+      expect(rounds).toBe(10); // default
     });
   });
 

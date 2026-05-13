@@ -1,6 +1,8 @@
 const { MessageType } = require('./types');
 const { OpenClawClient } = require('./openclaw-client');
 const { handleNormalMessage } = require('../modules/normal-message-handler');
+const { RongCloudServerAPI } = require('./rongcloud-server-api');
+const { SystemConfigManager } = require('../modules/system-config');
 const axios = require('axios');
 const MENTION_REGEX = /@(claw_[a-zA-Z0-9]+)/g;
 
@@ -11,6 +13,11 @@ class MessageHandler {
     this.log = log;
     this.sendReadReceiptFn = sendReadReceiptFn;
     this.openclawClient = new OpenClawClient(log);
+    // 初始化系统配置管理器（从 Python 服务端动态获取配置）
+    this.configManager = new SystemConfigManager(config, log);
+    // 初始化融云服务端 API 客户端（直接调用融云 API，无需通过服务端代理）
+    this.serverAPI = new RongCloudServerAPI(this.configManager, log);
+    this.log?.info('[MessageHandler] 融云服务端 API 客户端已初始化（配置从服务端动态获取）');
     this.nodeId = config.accountId || '';
     this.handleNormalMessage = handleNormalMessage;
     this._streamQueue = Promise.resolve();
@@ -18,14 +25,18 @@ class MessageHandler {
     this._streamMessageUIDs = new Map();
     // 群聊对话轮数统计：groupId -> currentRound
     this._groupRoundCounts = new Map();
-    this._maxRounds = config.maxRounds || 10;
+    // 群组配置缓存：groupId -> { maxRounds, expiresAt }
+    this._groupConfigCache = new Map();
+    this._defaultMaxRounds = 10;
+    this._groupConfigCacheTTL = config.groupConfigCacheTTL || 60000; // 默认缓存 60 秒
   }
 
   /**
    * 判断是否支持流式处理
+   * 现在配置从服务端动态获取，总是启用
    */
   get isStreamingEnabled() {
-    return !!this.config.apiBaseUrl;
+    return !!this.serverAPI;
   }
 
   extractMentions(content) {
@@ -97,10 +108,10 @@ class MessageHandler {
   /**
    * 增加群聊轮数
    */
-  _incrementGroupRoundCount(groupId) {
+  _incrementGroupRoundCount(groupId, maxRounds) {
     const current = this._getGroupRoundCount(groupId);
     this._groupRoundCounts.set(groupId, current + 1);
-    this.log?.info(`[MessageHandler] 群聊 ${groupId} 轮数 +1，当前: ${current + 1}/${this._maxRounds}`);
+    this.log?.info(`[MessageHandler] 群聊 ${groupId} 轮数 +1，当前: ${current + 1}/${maxRounds}`);
   }
 
   /**
@@ -109,6 +120,47 @@ class MessageHandler {
   _resetGroupRoundCount(groupId) {
     this._groupRoundCounts.set(groupId, 0);
     this.log?.info(`[MessageHandler] 群聊 ${groupId} 轮数已重置`);
+  }
+
+  /**
+   * 从后端 API 获取群组配置
+   */
+  async _fetchGroupConfig(groupId) {
+    try {
+      const apiUrl = `${this.config.apiBaseUrl}/im/api/group/info`;
+      this.log?.info(`[MessageHandler] 查询群组配置: groupId=${groupId}, url=${apiUrl}`);
+      const resp = await axios.get(apiUrl, {
+        params: { groupId: groupId },
+        timeout: 5000
+      });
+      if (resp.data?.code === 200 && resp.data.data) {
+        const maxRounds = resp.data.data.maxRounds;
+        if (typeof maxRounds === 'number') {
+          this.log?.info(`[MessageHandler] 群组 ${groupId} 配置: maxRounds=${maxRounds}`);
+          return maxRounds;
+        }
+      }
+    } catch (err) {
+      this.log?.warn(`[MessageHandler] 获取群组配置失败: ${err.message}`);
+    }
+    return this._defaultMaxRounds;
+  }
+
+  /**
+   * 获取群组最大轮数（带缓存）
+   */
+  async _getGroupMaxRounds(groupId) {
+    const cached = this._groupConfigCache.get(groupId);
+    const now = Date.now();
+    if (cached && cached.expiresAt > now) {
+      return cached.maxRounds;
+    }
+    const maxRounds = await this._fetchGroupConfig(groupId);
+    this._groupConfigCache.set(groupId, {
+      maxRounds,
+      expiresAt: now + this._groupConfigCacheTTL
+    });
+    return maxRounds;
   }
 
   async handleMessage(msg) {
@@ -122,8 +174,10 @@ class MessageHandler {
       this.log?.info(`[MessageHandler] 收到消息 from=${msg.senderUserId}, type=${type}, content=${logContent.substring(0, 50)}`);
 
       // 群聊轮数控制（仅对群聊生效）
+      let maxRounds = this._defaultMaxRounds;
       if (msg.conversationType === 3) {
         const groupId = msg.targetId;
+        maxRounds = await this._getGroupMaxRounds(groupId);
         const currentRounds = this._getGroupRoundCount(groupId);
 
         // 处理内置轮数相关命令
@@ -131,23 +185,23 @@ class MessageHandler {
           const payload = this.parseCommand(msg.content, msg.senderUserId);
           if (payload.command === 'newround') {
             this._resetGroupRoundCount(groupId);
-            await this.sendFn(groupId, `✅ 新一轮对话已开始，最大对话轮数为 ${this._maxRounds} 轮。`, msg.conversationType);
+            await this.sendFn(groupId, `✅ 新一轮对话已开始，最大对话轮数为 ${maxRounds} 轮。`, msg.conversationType);
             return;
           }
           if (payload.command === 'roundstatus') {
-            const remaining = Math.max(0, this._maxRounds - currentRounds);
-            const statusMsg = currentRounds >= this._maxRounds
-              ? `⛔ 本轮对话已结束（已达 ${this._maxRounds} 轮）。发送 /newround 开启新一轮。`
-              : `📊 当前对话进度：第 ${currentRounds + 1}/${this._maxRounds} 轮，剩余 ${remaining} 轮。`;
+            const remaining = Math.max(0, maxRounds - currentRounds);
+            const statusMsg = currentRounds >= maxRounds
+              ? `⛔ 本轮对话已结束（已达 ${maxRounds} 轮）。发送 /newround 开启新一轮。`
+              : `📊 当前对话进度：第 ${currentRounds + 1}/${maxRounds} 轮，剩余 ${remaining} 轮。`;
             await this.sendFn(groupId, statusMsg, msg.conversationType);
             return;
           }
         }
 
         // 检查是否已达最大轮数
-        if (currentRounds >= this._maxRounds) {
-          this.log?.info(`[MessageHandler] 群聊 ${groupId} 已达到最大轮数 ${this._maxRounds}，拒绝处理`);
-          await this.sendFn(groupId, `⛔ 本轮对话已达到最大轮数（${this._maxRounds} 轮），对话已结束。\n\n发送 /newround 可开启新一轮对话。`, msg.conversationType);
+        if (currentRounds >= maxRounds) {
+          this.log?.info(`[MessageHandler] 群聊 ${groupId} 已达到最大轮数 ${maxRounds}，拒绝处理`);
+          await this.sendFn(groupId, `⛔ 本轮对话已达到最大轮数（${maxRounds} 轮），对话已结束。\n\n发送 /newround 可开启新一轮对话。`, msg.conversationType);
           return;
         }
       }
@@ -165,7 +219,7 @@ class MessageHandler {
           await this.handleNormalMessageStream(msg);
           // 流式处理成功，群聊轮数 +1
           if (msg.conversationType === 3) {
-            this._incrementGroupRoundCount(msg.targetId);
+            this._incrementGroupRoundCount(msg.targetId, maxRounds);
           }
         } catch (err) {
           this.log?.error(`[MessageHandler] 流式处理失败，回退到非流式: ${err.message}`);
@@ -175,7 +229,7 @@ class MessageHandler {
             await this.sendFn(targetId, reply, msg.conversationType);
             // 非流式回退成功，群聊轮数 +1
             if (msg.conversationType === 3) {
-              this._incrementGroupRoundCount(msg.targetId);
+              this._incrementGroupRoundCount(msg.targetId, maxRounds);
             }
           }
         }
@@ -187,7 +241,7 @@ class MessageHandler {
           await this.sendFn(targetId, reply, msg.conversationType);
           // 非流式处理成功，群聊轮数 +1
           if (msg.conversationType === 3) {
-            this._incrementGroupRoundCount(msg.targetId);
+            this._incrementGroupRoundCount(msg.targetId, maxRounds);
           }
         }
       }
@@ -322,8 +376,13 @@ class MessageHandler {
           if (buffer.trim()) {
             try {
               this.log?.info(`[MessageHandler] 发送历史记录文本消息: length=${buffer.length}`);
-              // 使用特殊前缀标记，前端识别后跳过渲染（避免与流式消息重复显示）
-              const historyContent = `__STREAM_HISTORY__:${buffer}`;
+              // 使用 JSON 格式包含 streamId，前端可据此关联并更新流式消息内容
+              const historyContent = JSON.stringify({
+                __stream_history__: true,
+                streamId: streamId,
+                text: buffer,
+                sentTime: Date.now()
+              });
               await this.sendFn(targetId, historyContent, conversationType);
             } catch (err) {
               this.log?.error(`[MessageHandler] 发送历史记录失败: ${err.message}`);
@@ -349,36 +408,30 @@ class MessageHandler {
   }
 
   /**
-   * 发送 typing 状态（通过 Python 后端代理）
+   * 发送 typing 状态（直接调用融云 API）
    */
   async _sendTypingStatus(fromUserId, targetId, conversationType) {
-    if (!this.isStreamingEnabled) return;
+    if (!this.isStreamingEnabled || !this.serverAPI) return;
     try {
-      await axios.post(
-        `${this.config.apiBaseUrl}/im/api/proxy/stream/typing`,
-        {
-          fromUserId,
-          targetId,
-          conversationType
-        },
-        { timeout: 5000 }
-      );
+      await this.serverAPI.sendTypingStatus({
+        fromUserId,
+        toUserId: targetId,
+        conversationType
+      });
       this.log?.info(`[MessageHandler] typing 状态已发送: ${fromUserId} -> ${targetId}`);
     } catch (err) {
-      const url = `${this.config.apiBaseUrl}/im/api/proxy/stream/typing`;
-      const status = err.response?.status;
-      this.log?.warn(`[MessageHandler] 发送 typing 状态失败: ${err.message}, url=${url}, status=${status || 'N/A'}`);
+      this.log?.warn(`[MessageHandler] 发送 typing 状态失败: ${err.message}`);
     }
   }
 
   /**
-   * 发送流式消息片段（通过 Python 后端代理）
+   * 发送流式消息片段（直接调用融云 API）
    */
   async _sendStreamChunk(fromUserId, targetId, conversationType, content, streamId, isFirstChunk, isLastChunk, seq = 1) {
     const contentPreview = typeof content === 'string' ? content.substring(0, 100) : JSON.stringify(content).substring(0, 100);
     this.log?.info(`[MessageHandler] _sendStreamChunk ENTRY: target=${targetId}, streamId=${streamId}, seq=${seq}, first=${isFirstChunk}, last=${isLastChunk}, content_len=${content?.length || 0}, content_preview=${contentPreview}`);
-    if (!this.isStreamingEnabled) {
-      this.log?.warn('[MessageHandler] _sendStreamChunk  skipped: isStreamingEnabled=false');
+    if (!this.isStreamingEnabled || !this.serverAPI) {
+      this.log?.warn('[MessageHandler] _sendStreamChunk  skipped: 未配置 appKey/appSecret');
       return;
     }
     
@@ -388,36 +441,42 @@ class MessageHandler {
         // 获取已存储的 RongCloud messageUID（首流响应返回的）
         const messageUID = this._streamMessageUIDs.get(streamId);
         
-        const payload = {
-          fromUserId,
-          targetId,
-          content,
-          streamId,
-          isFirstChunk,
-          isLastChunk,
-          conversationType,
-          seq,
-          messageUID
-        };
-        this.log?.info(`[MessageHandler] _sendStreamChunk 请求体: ${JSON.stringify(payload).substring(0, 300)}`);
-        const resp = await axios.post(
-          `${this.config.apiBaseUrl}/im/api/proxy/stream/publish`,
-          payload,
-          { timeout: 10000 }
-        );
-        
-        // 首流时存储 RongCloud 返回的 messageUID
-        if (isFirstChunk && resp.data?.messageUID) {
-          this._streamMessageUIDs.set(streamId, resp.data.messageUID);
-          this.log?.info(`[MessageHandler] 首流 messageUID 已存储: ${resp.data.messageUID}, streamId=${streamId}`);
+        let result;
+        if (conversationType === 3) {
+          // 群聊流式消息
+          result = await this.serverAPI.sendStreamGroup({
+            fromUserId,
+            toGroupId: targetId,
+            content,
+            streamId,
+            isFirstChunk,
+            isLastChunk,
+            seq,
+            messageUID
+          });
+        } else {
+          // 单聊流式消息
+          result = await this.serverAPI.sendStreamPrivate({
+            fromUserId,
+            toUserId: targetId,
+            content,
+            streamId,
+            isFirstChunk,
+            isLastChunk,
+            seq,
+            messageUID
+          });
         }
         
-        this.log?.info(`[MessageHandler] _sendStreamChunk 成功: status=${resp.status}, seq=${seq}, response=${JSON.stringify(resp.data).substring(0, 200)}`);
+        // 首流时存储 RongCloud 返回的 messageUID
+        if (isFirstChunk && result?.messageUID) {
+          this._streamMessageUIDs.set(streamId, result.messageUID);
+          this.log?.info(`[MessageHandler] 首流 messageUID 已存储: ${result.messageUID}, streamId=${streamId}`);
+        }
+        
+        this.log?.info(`[MessageHandler] _sendStreamChunk 成功: seq=${seq}`);
       } catch (err) {
-        const url = `${this.config.apiBaseUrl}/im/api/proxy/stream/publish`;
-        const status = err.response?.status;
-        const responseData = err.response?.data ? JSON.stringify(err.response.data).substring(0, 200) : 'N/A';
-        this.log?.warn(`[MessageHandler] 发送流式消息失败: ${err.message}, url=${url}, status=${status || 'N/A'}, response=${responseData}, seq=${seq}`);
+        this.log?.warn(`[MessageHandler] 发送流式消息失败: ${err.message}, seq=${seq}`);
       }
     });
     
