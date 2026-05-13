@@ -16,6 +16,9 @@ class MessageHandler {
     this._streamQueue = Promise.resolve();
     // 存储流式消息的 RongCloud messageUID：streamId -> messageUID
     this._streamMessageUIDs = new Map();
+    // 群聊对话轮数统计：groupId -> currentRound
+    this._groupRoundCounts = new Map();
+    this._maxRounds = config.maxRounds || 10;
   }
 
   /**
@@ -84,6 +87,30 @@ class MessageHandler {
     return true;
   }
 
+  /**
+   * 获取群聊当前轮数
+   */
+  _getGroupRoundCount(groupId) {
+    return this._groupRoundCounts.get(groupId) || 0;
+  }
+
+  /**
+   * 增加群聊轮数
+   */
+  _incrementGroupRoundCount(groupId) {
+    const current = this._getGroupRoundCount(groupId);
+    this._groupRoundCounts.set(groupId, current + 1);
+    this.log?.info(`[MessageHandler] 群聊 ${groupId} 轮数 +1，当前: ${current + 1}/${this._maxRounds}`);
+  }
+
+  /**
+   * 重置群聊轮数
+   */
+  _resetGroupRoundCount(groupId) {
+    this._groupRoundCounts.set(groupId, 0);
+    this.log?.info(`[MessageHandler] 群聊 ${groupId} 轮数已重置`);
+  }
+
   async handleMessage(msg) {
     if (!this.shouldHandleMessage(msg)) {
       return;
@@ -94,16 +121,62 @@ class MessageHandler {
       const logContent = typeof msg.content === 'string' ? msg.content : (msg.content?.content || '');
       this.log?.info(`[MessageHandler] 收到消息 from=${msg.senderUserId}, type=${type}, content=${logContent.substring(0, 50)}`);
 
+      // 群聊轮数控制（仅对群聊生效）
+      if (msg.conversationType === 3) {
+        const groupId = msg.targetId;
+        const currentRounds = this._getGroupRoundCount(groupId);
+
+        // 处理内置轮数相关命令
+        if (type === MessageType.COMMAND) {
+          const payload = this.parseCommand(msg.content, msg.senderUserId);
+          if (payload.command === 'newround') {
+            this._resetGroupRoundCount(groupId);
+            await this.sendFn(groupId, `✅ 新一轮对话已开始，最大对话轮数为 ${this._maxRounds} 轮。`, msg.conversationType);
+            return;
+          }
+          if (payload.command === 'roundstatus') {
+            const remaining = Math.max(0, this._maxRounds - currentRounds);
+            const statusMsg = currentRounds >= this._maxRounds
+              ? `⛔ 本轮对话已结束（已达 ${this._maxRounds} 轮）。发送 /newround 开启新一轮。`
+              : `📊 当前对话进度：第 ${currentRounds + 1}/${this._maxRounds} 轮，剩余 ${remaining} 轮。`;
+            await this.sendFn(groupId, statusMsg, msg.conversationType);
+            return;
+          }
+        }
+
+        // 检查是否已达最大轮数
+        if (currentRounds >= this._maxRounds) {
+          this.log?.info(`[MessageHandler] 群聊 ${groupId} 已达到最大轮数 ${this._maxRounds}，拒绝处理`);
+          await this.sendFn(groupId, `⛔ 本轮对话已达到最大轮数（${this._maxRounds} 轮），对话已结束。\n\n发送 /newround 可开启新一轮对话。`, msg.conversationType);
+          return;
+        }
+      }
+
+      // 发送已读回执（fire-and-forget，不阻塞消息处理）
+      if (this.sendReadReceiptFn && msg.messageUId) {
+        this.sendReadReceiptFn(msg).catch((err) => {
+          this.log?.warn(`[MessageHandler] 发送已读回执失败: ${err.message}`);
+        });
+      }
+
       // 如果配置了代理地址，使用流式处理
       if (this.isStreamingEnabled) {
         try {
           await this.handleNormalMessageStream(msg);
+          // 流式处理成功，群聊轮数 +1
+          if (msg.conversationType === 3) {
+            this._incrementGroupRoundCount(msg.targetId);
+          }
         } catch (err) {
           this.log?.error(`[MessageHandler] 流式处理失败，回退到非流式: ${err.message}`);
           const reply = await this.handleNormalMessage(msg);
           if (reply) {
             const targetId = this.getReplyTarget(msg);
             await this.sendFn(targetId, reply, msg.conversationType);
+            // 非流式回退成功，群聊轮数 +1
+            if (msg.conversationType === 3) {
+              this._incrementGroupRoundCount(msg.targetId);
+            }
           }
         }
       } else {
@@ -112,6 +185,10 @@ class MessageHandler {
         if (reply) {
           const targetId = this.getReplyTarget(msg);
           await this.sendFn(targetId, reply, msg.conversationType);
+          // 非流式处理成功，群聊轮数 +1
+          if (msg.conversationType === 3) {
+            this._incrementGroupRoundCount(msg.targetId);
+          }
         }
       }
     } catch (err) {
@@ -174,6 +251,23 @@ class MessageHandler {
 
     // 2. 调用 OpenClaw SSE
     let hasSentChunk = false;
+    // typing 刷新定时器：每次 delta 时刷新 typing，超时后自动停止
+    let typingTimer = null;
+    const refreshTyping = async () => {
+      // 清除旧的超时
+      if (typingTimer) {
+        clearTimeout(typingTimer);
+        typingTimer = null;
+      }
+      // 发送 typing
+      await this._sendTypingStatus(fromUserId, targetId, conversationType);
+      // 设置 3 秒超时，如果 3 秒内没有新的 delta，typing 自动消失
+      typingTimer = setTimeout(() => {
+        this.log?.info(`[MessageHandler] typing 超时自动清除: streamId=${streamId}`);
+        typingTimer = null;
+      }, 3000);
+    };
+
     try {
       // 确保传入的内容是字符串（claw 类型消息 content 可能是对象）
       const chatContent = typeof msg.content === 'string' ? msg.content : (msg.content?.content || JSON.stringify(msg.content));
@@ -188,9 +282,18 @@ class MessageHandler {
           // 发送增量（delta），让前端做增量拼接，避免内容重复
           await this._sendStreamChunk(fromUserId, targetId, conversationType, delta, streamId, seq === 1, false, seq);
           hasSentChunk = true;
+          // 每次有输出时刷新 typing 状态
+          await refreshTyping();
         },
         async (fullText) => {
           this.log?.info(`[MessageHandler] onDone 触发, fullText.length=${fullText.length}, buffer.length=${buffer.length}, hasSentChunk=${hasSentChunk}`);
+          
+          // 清除 typing 定时器
+          if (typingTimer) {
+            clearTimeout(typingTimer);
+            typingTimer = null;
+          }
+          
           if (buffer.trim()) {
             // 发送尾流：空字符串表示流结束，前端保留已拼接的完整内容
             seq += 1;
@@ -214,10 +317,29 @@ class MessageHandler {
           
           // 清理已存储的 messageUID，防止内存泄漏
           this._streamMessageUIDs.delete(streamId);
+          
+          // 发送持久化的普通文本消息作为历史记录（融云会保存 RC:TxtMsg）
+          if (buffer.trim()) {
+            try {
+              this.log?.info(`[MessageHandler] 发送历史记录文本消息: length=${buffer.length}`);
+              // 使用特殊前缀标记，前端识别后跳过渲染（避免与流式消息重复显示）
+              const historyContent = `__STREAM_HISTORY__:${buffer}`;
+              await this.sendFn(targetId, historyContent, conversationType);
+            } catch (err) {
+              this.log?.error(`[MessageHandler] 发送历史记录失败: ${err.message}`);
+            }
+          }
         }
       );
     } catch (err) {
       this.log?.error(`[MessageHandler] 流式处理错误: ${err.message}`);
+      
+      // 清除 typing 定时器
+      if (typingTimer) {
+        clearTimeout(typingTimer);
+        typingTimer = null;
+      }
+      
       await this._sendStreamChunk(fromUserId, targetId, conversationType, '抱歉，AI 响应出现错误，请稍后重试。', streamId, true, true, 1);
       
       // 错误时也要清理

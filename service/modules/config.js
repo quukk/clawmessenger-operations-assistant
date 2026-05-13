@@ -85,6 +85,7 @@ function loadConfig() {
     scriptTimeout: localConfig.scriptTimeout || 180,
     successKeyword: localConfig.successKeyword || 'Success',
     chatTimeout: localConfig.chatTimeout || 600,
+    maxRounds: localConfig.maxRounds || 10,
     apiBaseUrl
   };
 }
