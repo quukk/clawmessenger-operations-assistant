@@ -369,17 +369,17 @@ class MessageHandler {
 
           this.log?.info(`[MessageHandler] 流式消息完成，streamId=${streamId}, 总长度: ${fullText.length}`);
           
-          // 清理已存储的 messageUID，防止内存泄漏
-          this._streamMessageUIDs.delete(streamId);
-          
           // 发送持久化的普通文本消息作为历史记录（融云会保存 RC:TxtMsg）
           if (buffer.trim()) {
             try {
-              this.log?.info(`[MessageHandler] 发送历史记录文本消息: length=${buffer.length}`);
+              // 使用融云首流返回的 messageUID 作为 streamId，确保与前端匹配
+              const rongCloudMsgUID = this._streamMessageUIDs.get(streamId);
+              const historyStreamId = rongCloudMsgUID || streamId;
+              this.log?.info(`[MessageHandler] 发送历史记录文本消息: length=${buffer.length}, streamId=${historyStreamId}`);
               // 使用 JSON 格式包含 streamId，前端可据此关联并更新流式消息内容
               const historyContent = JSON.stringify({
                 __stream_history__: true,
-                streamId: streamId,
+                streamId: historyStreamId,
                 text: buffer,
                 sentTime: Date.now()
               });
@@ -388,6 +388,9 @@ class MessageHandler {
               this.log?.error(`[MessageHandler] 发送历史记录失败: ${err.message}`);
             }
           }
+          
+          // 清理已存储的 messageUID，防止内存泄漏
+          this._streamMessageUIDs.delete(streamId);
         }
       );
     } catch (err) {
