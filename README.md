@@ -549,33 +549,149 @@ npm uninstall -g claw-subagent-service
 
 ## 日志查看
 
-### Windows
+### 日志文件说明
 
-```powershell
-# 查看当天 worker 日志（服务运行日志）
-Get-Content "$env:USERPROFILE\claw-subagent-service\logs\worker-$(Get-Date -Format yyyy-MM-dd).log" -Tail 50
+服务运行过程中会产生以下日志文件，均位于安装目录的 `logs/` 子文件夹中：
 
-# 查看当天 daemon 日志（守护进程日志）
-Get-Content "$env:USERPROFILE\claw-subagent-service\logs\daemon-$(Get-Date -Format yyyy-MM-dd).log" -Tail 50
+| 日志文件 | 说明 | 关键内容 |
+|----------|------|----------|
+| `worker-YYYY-MM-DD.log` | Worker 进程日志 | 融云消息收发、OpenClaw SSE 流式调用、消息处理流程 |
+| `daemon-YYYY-MM-DD.log` | Daemon 进程日志 | 服务启动/停止、进程监控、自动更新、端口管理 |
+| `updater-YYYY-MM-DD.log` | 自动更新日志 | 版本检查、下载更新、安装结果 |
 
-# SYSTEM 账户下运行的日志位置（服务默认以 SYSTEM 运行）
-Get-Content "C:\Windows\System32\config\systemprofile\claw-subagent-service\logs\worker-$(Get-Date -Format yyyy-MM-dd).log" -Tail 50
+### 日志目录位置
 
-# wrapper 日志（node-windows 生成）
-Get-Content "D:\A-DM\dm-im\silent-service\service\daemon\clawsubagentservice.wrapper.log" -Tail 50
-```
+| 安装方式 | 日志目录路径 |
+|----------|-------------|
+| npm 全局安装（Linux/macOS） | `$(npm root -g)/claw-subagent-service/logs/` |
+| npm 全局安装（Windows） | `%APPDATA%\npm\node_modules\claw-subagent-service\logs\` |
+| 本地源码运行 | `./logs/`（项目根目录） |
+| Docker 容器内 | `/usr/lib/node_modules/claw-subagent-service/logs/` 或 `/data/node_cli/logs/` |
 
-### Linux
+### Linux / macOS 查看命令
 
 ```bash
-# 查看 systemd 日志
+# 1. 确定安装目录
+INSTALL_DIR=$(npm root -g)/claw-subagent-service
+# 如果是本地源码运行，替换为实际路径，如：
+# INSTALL_DIR=/data/node_cli
+
+# 2. 查看当天 worker 日志（实时跟踪，调试用）
+tail -f $INSTALL_DIR/logs/worker-$(date +%Y-%m-%d).log
+
+# 3. 查看 worker 日志最后 200 行
+tail -n 200 $INSTALL_DIR/logs/worker-$(date +%Y-%m-%d).log
+
+# 4. 查看 daemon 日志
+tail -n 100 $INSTALL_DIR/logs/daemon-$(date +%Y-%m-%d).log
+
+# 5. 查看 updater 日志
+tail -n 50 $INSTALL_DIR/logs/updater-$(date +%Y-%m-%d).log
+
+# 6. 列出所有日志文件及大小
+ls -lah $INSTALL_DIR/logs/
+
+# 7. 搜索包含特定关键词的日志（如错误、SSE、融云）
+grep -i "error\|sse\|融云\|rongcloud\|claw" $INSTALL_DIR/logs/worker-$(date +%Y-%m-%d).log
+
+# 8. 搜索今天的所有 ERROR 级别日志
+grep "$(date +%Y-%m-%d)" $INSTALL_DIR/logs/worker-$(date +%Y-%m-%d).log | grep "\[ERROR\]"
+
+# 9. 合并 worker + daemon 日志并按时间排序（完整时间线）
+cat $INSTALL_DIR/logs/worker-$(date +%Y-%m-%d).log $INSTALL_DIR/logs/daemon-$(date +%Y-%m-%d).log | sort
+
+# 10. 实时查看所有组件日志（使用 multitail，需安装）
+# multitail $INSTALL_DIR/logs/worker-$(date +%Y-%m-%d).log $INSTALL_DIR/logs/daemon-$(date +%Y-%m-%d).log
+```
+
+### Windows 查看命令
+
+```powershell
+# 1. 确定安装目录
+$installDir = (npm root -g) + "\claw-subagent-service"
+
+# 2. 查看当天 worker 日志
+Get-Content "$installDir\logs\worker-$(Get-Date -Format yyyy-MM-dd).log" -Tail 100
+
+# 3. 查看 daemon 日志
+Get-Content "$installDir\logs\daemon-$(Get-Date -Format yyyy-MM-dd).log" -Tail 100
+
+# 4. 搜索错误关键词
+Select-String -Path "$installDir\logs\*.log" -Pattern "ERROR|error|失败|异常"
+
+# 5. 查看 wrapper 日志（node-windows 服务生成）
+Get-Content "$env:APPDATA\npm\node_modules\claw-subagent-service\service\daemon\clawsubagentservice.wrapper.log" -Tail 50
+
+# 6. SYSTEM 账户下运行的日志（如果服务以 SYSTEM 运行）
+Get-Content "C:\Windows\System32\config\systemprofile\claw-subagent-service\logs\worker-$(Get-Date -Format yyyy-MM-dd).log" -Tail 50
+```
+
+### Docker 查看命令
+
+```bash
+# 1. 查看容器内日志（实时）
+docker exec -it <容器名> sh -c "tail -f \$(npm root -g)/claw-subagent-service/logs/worker-\$(date +%Y-%m-%d).log"
+
+# 2. 直接在宿主机查看容器日志文件
+docker exec <容器名> cat /usr/lib/node_modules/claw-subagent-service/logs/worker-$(date +%Y-%m-%d).log
+
+# 3. 查看容器标准输出（非日志文件，是控制台输出）
+docker logs -f <容器名> --tail 200
+
+# 4. 将容器日志复制到宿主机
+docker cp <容器名>:/usr/lib/node_modules/claw-subagent-service/logs/ ./claw-logs/
+```
+
+### 按运行模式查看日志
+
+#### systemd 模式（Linux 服务器）
+
+```bash
+# 查看 systemd 管理的实时日志
 sudo journalctl -u claw-subagent-service -f
 
-# 或直接查看日志文件
-tail -f ~/claw-subagent-service/logs/worker-$(date +%Y-%m-%d).log
+# 查看最近 100 条日志
+sudo journalctl -u claw-subagent-service -n 100
 
-# 查看 daemon 日志
-tail -f ~/claw-subagent-service/logs/daemon-$(date +%Y-%m-%d).log
+# 查看今天所有日志
+sudo journalctl -u claw-subagent-service --since today
+
+# 查看指定时间段的日志
+sudo journalctl -u claw-subagent-service --since "2026-05-11 06:00:00" --until "2026-05-11 07:00:00"
+
+# 查看包含特定关键词的日志
+sudo journalctl -u claw-subagent-service -g "SSE|error|融云"
+```
+
+#### 用户级守护进程模式（无 systemd / Docker）
+
+```bash
+# 查找日志目录（全局搜索）
+find / -name "worker-*.log" -path "*/claw-subagent-service/logs/*" 2>/dev/null
+
+# 常见路径：
+# /usr/lib/node_modules/claw-subagent-service/logs/
+# /usr/local/lib/node_modules/claw-subagent-service/logs/
+# /root/.clawmessenger/logs/
+# /data/node_cli/logs/
+
+# 设置日志目录变量并实时查看
+LOG_DIR=/usr/lib/node_modules/claw-subagent-service/logs
+tail -f $LOG_DIR/worker-$(date +%Y-%m-%d).log
+```
+
+#### 前台运行模式（调试开发）
+
+```bash
+# 直接运行，日志输出到终端控制台
+claw-subagent-service --run
+
+# 后台运行并重定向到文件
+nohup claw-subagent-service --run > /tmp/claw-subagent.log 2>&1 &
+tail -f /tmp/claw-subagent.log
+
+# 使用 tee 同时输出到终端和文件
+claw-subagent-service --run 2>&1 | tee /tmp/claw-subagent-$(date +%Y%m%d).log
 ```
 
 ---

@@ -154,10 +154,59 @@ function checkPort(port) {
 }
 
 /**
+ * 确保 openclaw.json 中启用了 chatCompletions 端点
+ * 在启动 gateway 前调用，避免 SSE 流式调用返回 404
+ */
+function ensureChatCompletionsConfig(log) {
+  const realHome = getRealHomeDir();
+  const openclawDir = path.join(realHome, '.openclaw');
+  const configPath = path.join(openclawDir, 'openclaw.json');
+
+  let settings = {};
+  let existed = false;
+
+  try {
+    if (fs.existsSync(configPath)) {
+      const content = fs.readFileSync(configPath, 'utf-8');
+      settings = JSON.parse(content);
+      existed = true;
+    }
+  } catch (err) {
+    log?.warn(`[OpenClawClient] 读取 openclaw.json 失败: ${err.message}`);
+    settings = {};
+  }
+
+  const current = settings.gateway?.http?.endpoints?.chatCompletions?.enabled;
+  if (current === true) {
+    log?.info('[OpenClawClient] openclaw.json 中 chatCompletions 已启用');
+    return;
+  }
+
+  if (!settings.gateway) settings.gateway = {};
+  if (!settings.gateway.http) settings.gateway.http = {};
+  if (!settings.gateway.http.endpoints) settings.gateway.http.endpoints = {};
+  if (!settings.gateway.http.endpoints.chatCompletions) settings.gateway.http.endpoints.chatCompletions = {};
+  settings.gateway.http.endpoints.chatCompletions.enabled = true;
+
+  try {
+    if (!fs.existsSync(openclawDir)) {
+      fs.mkdirSync(openclawDir, { recursive: true });
+    }
+    fs.writeFileSync(configPath, JSON.stringify(settings, null, 2), 'utf-8');
+    log?.info(`[OpenClawClient] 已自动在 openclaw.json 中启用 chatCompletions (${existed ? '更新' : '新建'})`);
+  } catch (err) {
+    log?.error(`[OpenClawClient] 写入 openclaw.json 失败: ${err.message}`);
+  }
+}
+
+/**
  * 启动 OpenClaw gateway
  */
 function startOpenClawGateway(log) {
   return new Promise((resolve) => {
+    // 启动前自动修复配置
+    ensureChatCompletionsConfig(log);
+
     log?.info('[OpenClawClient] 正在启动 OpenClaw gateway...');
 
     const child = spawn('openclaw', ['gateway'], {
@@ -230,8 +279,7 @@ class OpenClawClient {
    * 确保 OpenClaw gateway 在运行
    */
   async ensureGatewayRunning() {
-    if (this.gatewayStarted) return true;
-
+    // 每次调用都实际检查端口，避免 gateway 崩溃后缓存状态失效
     const gatewayRunning = await checkPort(18789);
 
     if (gatewayRunning) {
@@ -239,6 +287,8 @@ class OpenClawClient {
       this.gatewayStarted = true;
       return true;
     }
+
+    this.gatewayStarted = false;
 
     // 避免并发启动
     if (this.gatewayStarting) {
@@ -280,6 +330,203 @@ class OpenClawClient {
 
     // 直接走 CLI 调用（OpenClaw Gateway 未暴露兼容的 HTTP REST API）
     return this.chatViaCLI(message, fromUser);
+  }
+
+  /**
+   * 流式调用 OpenClaw（SSE）
+   * 调用 OpenClaw Gateway 的 /v1/chat/completions SSE 端点
+   *
+   * @param {string} message - 用户消息
+   * @param {string} fromUser - 用户ID（用于session隔离）
+   * @param {Function} onDelta - 每次收到内容块时的回调 (chunk: string) => void
+   * @param {Function} onDone - 流结束时的回调 (fullText: string) => void
+   * @param {Function} onError - 出错时的回调 (error: Error) => void
+   * @returns {Promise<void>}
+   */
+  async chatStream(message, fromUser, onDelta, onDone, onError) {
+    if (!message || !message.trim()) {
+      onError?.(new Error('消息内容为空'));
+      return;
+    }
+
+    const gatewayReady = await this.ensureGatewayRunning();
+    if (!gatewayReady) {
+      const err = new Error('OpenClaw gateway 启动失败');
+      this.log?.error('[OpenClawClient] ' + err.message);
+      onError?.(err);
+      return;
+    }
+
+    this.log?.info(`[OpenClawClient] 准备 SSE 流式调用 OpenClaw，from=${fromUser}`);
+
+    const gatewayToken = getGatewayToken();
+    const sessionId = `clawmessenger-${fromUser}`;
+
+    // 尝试多个可能的 SSE 端点，兼容不同版本 OpenClaw Gateway
+    const endpoints = [
+      'http://127.0.0.1:18789/v1/chat/completions',
+      'http://127.0.0.1:18789/v1/responses'
+    ];
+
+    for (let i = 0; i < endpoints.length; i++) {
+      const apiUrl = endpoints[i];
+      try {
+        await this._doChatStream(apiUrl, gatewayToken, sessionId, message, onDelta, onDone);
+        return; // 成功则直接返回
+      } catch (err) {
+        const is404 = err.response?.status === 404;
+        const isLast = i === endpoints.length - 1;
+
+        if (is404 && !isLast) {
+          this.log?.warn(`[OpenClawClient] SSE 端点 ${apiUrl} 返回 404，尝试备用端点`);
+          continue;
+        }
+
+        if (is404 && isLast) {
+          this.log?.error(`[OpenClawClient] 所有 SSE 端点均返回 404。OpenClaw chatCompletions 端点未启用。`);
+          this.log?.error(`[OpenClawClient] 请检查 ~/.openclaw/openclaw.json 中是否包含:`);
+          this.log?.error(`[OpenClawClient]   gateway.http.endpoints.chatCompletions.enabled = true`);
+          this.log?.error(`[OpenClawClient] 修改后请重启 OpenClaw gateway: openclaw gateway`);
+        } else {
+          this.log?.error(`[OpenClawClient] SSE 请求失败: ${err.message}`);
+        }
+        // 不再内部调用 onError，让错误通过 Promise reject 向上传播，便于调用方回退
+        throw err;
+      }
+    }
+  }
+
+  async _doChatStream(apiUrl, gatewayToken, sessionId, message, onDelta, onDone) {
+    const headers = {
+      'Content-Type': 'application/json',
+      'Accept': 'text/event-stream'
+    };
+    if (gatewayToken) {
+      headers['Authorization'] = `Bearer ${gatewayToken}`;
+    }
+
+    const payload = {
+      model: 'openclaw',
+      messages: [
+        { role: 'user', content: message }
+      ],
+      stream: true,
+      max_tokens: 2048
+    };
+
+    this.log?.info(`[OpenClawClient] SSE 请求 payload: ${JSON.stringify(payload)}`);
+
+    let fullText = '';
+    let buffer = '';
+    let lastChunkData = null;
+    let hasError = false;
+    let errorMsg = '';
+
+    const response = await axios.post(apiUrl, payload, {
+      headers,
+      responseType: 'stream',
+      timeout: 600000 // 10 分钟
+    });
+
+    return new Promise((resolve, reject) => {
+      response.data.on('data', async (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // 保留未完整的最后一行
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith('data: ')) continue;
+
+          const dataStr = trimmed.slice(6).trim();
+          if (dataStr === '[DONE]') continue;
+
+          try {
+            const data = JSON.parse(dataStr);
+            lastChunkData = data;
+
+            // 检测流式错误块
+            if (data.error) {
+              hasError = true;
+              errorMsg = typeof data.error === 'string' ? data.error : (data.error.message || JSON.stringify(data.error));
+              this.log?.error(`[OpenClawClient] SSE chunk error: ${errorMsg}`);
+              continue;
+            }
+
+            // 尝试多个可能的内容字段，兼容不同版本 OpenClaw / 不同模型提供商
+            let delta = null;
+            const choice = data.choices?.[0];
+            if (choice) {
+              delta = choice.delta?.content
+                ?? choice.message?.content
+                ?? choice.text
+                ?? choice.delta?.text
+                ?? choice.delta?.reasoning_content
+                ?? null;
+            }
+            if (delta === null || delta === undefined) {
+              delta = data.content ?? data.delta ?? data.text ?? null;
+            }
+
+            if (typeof delta === 'string') {
+              if (delta.length > 0) {
+                fullText += delta;
+                try {
+                  await onDelta?.(delta);
+                } catch (err) {
+                  reject(err);
+                  return;
+                }
+              }
+              // 空字符串 delta 是合法的（无新内容块），静默跳过
+            } else if (delta !== null && delta !== undefined) {
+              this.log?.info(`[OpenClawClient] SSE 原始数据(delta非字符串): ${JSON.stringify(data).substring(0, 200)}`);
+            } else {
+              // 无可识别的 content 字段，仅当不包含 finish_reason 时才打印调试日志
+              if (!data.choices?.[0]?.finish_reason) {
+                this.log?.info(`[OpenClawClient] SSE 原始数据(无content): ${JSON.stringify(data).substring(0, 200)}`);
+              }
+            }
+          } catch {
+            // 忽略无法解析的 JSON 行
+          }
+        }
+      });
+
+      response.data.on('end', async () => {
+        this.log?.info(`[OpenClawClient] SSE 流结束，总长度: ${fullText.length}`);
+
+        if (hasError) {
+          reject(new Error(`OpenClaw SSE 错误: ${errorMsg}`));
+          return;
+        }
+
+        if (fullText.length === 0) {
+          // 兜底：某些网关会在最后一个 chunk 的 message.content 中返回完整内容
+          const lastContent = lastChunkData?.choices?.[0]?.message?.content;
+          if (typeof lastContent === 'string' && lastContent.length > 0) {
+            fullText = lastContent;
+            this.log?.info(`[OpenClawClient] 从 last chunk message.content 提取内容，长度: ${fullText.length}`);
+          }
+        }
+
+        if (fullText.length === 0) {
+          reject(new Error('OpenClaw SSE 返回空内容，可能 LLM 网络异常或模型未配置'));
+          return;
+        }
+        try {
+          await onDone?.(fullText);
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      });
+
+      response.data.on('error', (err) => {
+        this.log?.error(`[OpenClawClient] SSE 流错误: ${err.message}`);
+        reject(err);
+      });
+    });
   }
 
   async chatViaCLI(message, fromUser) {

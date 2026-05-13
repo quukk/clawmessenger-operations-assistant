@@ -22,7 +22,7 @@ class RongyunMessageSender {
   buildMessage(msgType, content, requestId) {
     const mac = getMacAddress();
     const secret = generateSecret(mac, this.config.secretKey || 'secret_key');
-    
+
     return {
       msg_type: msgType,
       source_im_id: this.config.accountId || '',
@@ -46,8 +46,8 @@ class RongyunMessageSender {
 
     try {
       const messagePayload = this.buildMessage(msgType, content, requestId);
-      
-      this.log?.info(`[RongyunMessageSender] 发送协议消息 -> ${this.serverImId}, type=${msgType}`);
+
+      // this.log?.info(`[RongyunMessageSender] 发送协议消息 -> ${this.serverImId}, type=${msgType}`);
 
       const result = await this.rongcloudClient.sendMessage(
         this.serverImId,
@@ -56,7 +56,7 @@ class RongyunMessageSender {
       );
 
       if (result) {
-        this.log?.info(`[RongyunMessageSender] ${msgType} 发送成功`);
+        // this.log?.info(`[RongyunMessageSender] ${msgType} 发送成功`);
       } else {
         this.log?.warn(`[RongyunMessageSender] ${msgType} 发送失败`);
       }

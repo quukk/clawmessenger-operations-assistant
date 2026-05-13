@@ -60,6 +60,18 @@ function loadConfig() {
     }
   }
 
+  // 计算 apiBaseUrl：环境变量 > 配置文件 > 推导值 > 默认值
+  let apiBaseUrl = process.env.API_BASE_URL || localConfig.apiBaseUrl || clawBridgeConfig.apiBaseUrl;
+  if (!apiBaseUrl) {
+    const serverUrl = process.env.DM_SERVER_URL || 'https://newsradar.dreamdt.cn/im';
+    try {
+      const url = new URL(serverUrl);
+      apiBaseUrl = `${url.protocol}//${url.host}`;
+    } catch {
+      apiBaseUrl = 'http://127.0.0.1:5000';
+    }
+  }
+
   return {
     appKey: process.env.DM_APP_KEY || localConfig.appKey || 'bmdehs6pbyyks',
     token: localConfig.token || clawBridgeConfig.token,
@@ -72,7 +84,8 @@ function loadConfig() {
     openclawPort: localConfig.openclawPort || 18789,
     scriptTimeout: localConfig.scriptTimeout || 180,
     successKeyword: localConfig.successKeyword || 'Success',
-    chatTimeout: localConfig.chatTimeout || 600
+    chatTimeout: localConfig.chatTimeout || 600,
+    apiBaseUrl
   };
 }
 

@@ -49,8 +49,13 @@ function checkSingleton() {
             log.error(`[DAEMON] 另一个 Daemon 实例已在运行 (PID: ${pid}, 权限不足)，当前实例退出`);
             return false;
           }
-          // 进程不存在，继续启动
+          // 进程不存在（ESRCH），清理 stale PID 文件
+          log.info(`[DAEMON] 发现 stale PID 文件 (PID: ${pid} 已不存在)，清理中...`);
+          try { fs.unlinkSync(PID_FILE); } catch { /* 忽略 */ }
         }
+      } else {
+        // PID 文件内容无效，清理
+        try { fs.unlinkSync(PID_FILE); } catch { /* 忽略 */ }
       }
     }
   } catch {
@@ -129,7 +134,8 @@ function freePortIfNeeded(port) {
       ];
       for (const cmd of commands) {
         try {
-          const out = execSync(cmd, { encoding: 'utf8', timeout: 5000 }).trim();
+          // 精简 Docker 镜像中部分命令可能极慢或不存在，缩短超时避免阻塞
+          const out = execSync(cmd, { encoding: 'utf8', timeout: 2000 }).trim();
           const firstLine = out.split(/\r?\n/)[0];
           const candidate = parseInt(firstLine, 10);
           if (candidate && candidate > 0 && candidate !== currentWorkerPid && candidate !== process.pid) {
@@ -148,7 +154,7 @@ function freePortIfNeeded(port) {
         // 所有端口查询命令都不可用（常见于精简 Docker 镜像）
         // 兜底：杀掉残留 Worker 进程（Daemon 自身的命令行不含 worker.js，不会自杀）
         try {
-          execSync('pkill -9 -f "worker.js" 2>/dev/null || true', { timeout: 5000 });
+          execSync('pkill -9 -f "worker.js" 2>/dev/null || true', { timeout: 2000 });
           log.warn(`[DAEMON] 已尝试杀掉残留 Worker 进程`);
         } catch { /* 忽略 */ }
       }
@@ -340,8 +346,10 @@ function gracefulShutdown() {
     worker = null;
   }
 
-  // 释放端口，确保下次启动时端口可用
-  freePortIfNeeded(PORT);
+  // Worker 已被 SIGKILL，端口会立即释放，无需再执行可能阻塞的 freePortIfNeeded
+  // 旧代码在此处调用 freePortIfNeeded，其内部的 execSync 命令链在精简 Docker 中
+  // 可能阻塞 20+ 秒，导致 kill -15 后旧进程迟迟不退出，新实例 checkSingleton 失败。
+  cleanupPidFile();
   process.exit(0);
 }
 

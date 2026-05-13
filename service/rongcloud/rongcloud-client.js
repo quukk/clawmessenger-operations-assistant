@@ -226,7 +226,7 @@ class RongCloudClient {
         ? (RongIMLib.ConversationType?.GROUP || ConversationType.GROUP)
         : (RongIMLib.ConversationType?.PRIVATE || ConversationType.PRIVATE);
 
-      this.log?.info(`[RongCloudClient] 发送消息 -> ${targetId} (Type: ${convType}): ${content.substring(0, 50)}`);
+      // this.log?.info(`[RongCloudClient] 发送消息 -> ${targetId} (Type: ${convType}): ${content.substring(0, 50)}`);
 
       const result = await RongIMLib.sendTextMessage(
         { conversationType: convType, targetId },
@@ -237,7 +237,7 @@ class RongCloudClient {
 
       if (result.code === 0 || result.code === 200) {
         const sentUId = result.data?.messageUId;
-        this.log?.info(`[RongCloudClient] 发送成功, messageUId: ${sentUId}`);
+        // this.log?.info(`[RongCloudClient] 发送成功, messageUId: ${sentUId}`);
         // 将发送成功的 messageUId 加入短期缓存，用于过滤 SDK 回传的自己消息
         if (sentUId) {
           this.sentMessageUIds.add(sentUId);

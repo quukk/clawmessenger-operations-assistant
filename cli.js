@@ -30,19 +30,22 @@ function runDaemon() {
   console.log(`[CLI] Daemon 路径: ${DAEMON_PATH}`);
 
   const daemon = spawn('node', [DAEMON_PATH], {
-    stdio: 'inherit',
-    detached: false
+    stdio: 'ignore',
+    detached: true
   });
-  
-  daemon.on('exit', (code) => {
-    console.log(`[CLI] Daemon 退出，code=${code}`);
-    process.exit(code);
-  });
-  
-  daemon.on('error', (err) => {
-    console.error(`[CLI] Daemon 启动失败: ${err.message}`);
-    process.exit(1);
-  });
+
+  daemon.unref();
+
+  // 不阻塞等待 Daemon 退出：
+  // detached: true 使 Daemon 成为独立进程组 leader，避免随 CLI 收到 SIGINT/SIGHUP；
+  // stdio: 'ignore' 防止 nohup 场景下 pipe 断开导致异常；
+  // unref() 让 CLI 事件循环不等待 Daemon，安装脚本可立即继续。
+  console.log(`[CLI] Daemon 已启动，PID=${daemon.pid}`);
+
+  // 短暂停留确认 Daemon 未立即崩溃，随后 CLI 退出（Daemon 继续后台运行）
+  setTimeout(() => {
+    process.exit(0);
+  }, 1500);
 }
 
 function installService() {

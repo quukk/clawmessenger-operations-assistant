@@ -184,6 +184,7 @@ function loadRongCloudConfig() {
       config.token = clawConfig.token;
       config.accountId = clawConfig.nodeId;
       config.nodeName = clawConfig.nodeName;
+      if (clawConfig.apiBaseUrl) config.apiBaseUrl = clawConfig.apiBaseUrl;
       log.info(`[WORKER] 从 claw-bridge 加载配置: nodeId=${clawConfig.nodeId}, nodeName=${clawConfig.nodeName}`);
     } else {
       log.warn(`[WORKER] 未找到 ${clawBridgeConfigPath}`);
@@ -198,10 +199,27 @@ function loadRongCloudConfig() {
       config.appKey = localConfig.appKey || config.appKey;
       if (localConfig.token) config.token = localConfig.token;
       if (localConfig.accountId) config.accountId = localConfig.accountId;
+      if (localConfig.appSecret) config.appSecret = localConfig.appSecret;
+      if (localConfig.apiBaseUrl) config.apiBaseUrl = localConfig.apiBaseUrl;
       log.info(`[WORKER] 从本地配置加载: appKey=${config.appKey?.substring(0, 8)}...`);
     }
   } catch (err) {
     log.error(`[WORKER] 加载本地配置失败: ${err.message}`);
+  }
+
+  // 加载 apiBaseUrl（Python 后端地址，用于代理发送流式消息）
+  // 优先级：环境变量 > 配置文件 > 推导值(DM_SERVER_URL) > 默认值
+  config.apiBaseUrl = process.env.API_BASE_URL || config.apiBaseUrl;
+
+  if (!config.apiBaseUrl) {
+    const serverUrl = process.env.DM_SERVER_URL || 'https://newsradar.dreamdt.cn/im';
+    try {
+      const url = new URL(serverUrl);
+      config.apiBaseUrl = `${url.protocol}//${url.host}`;
+      log.info(`[WORKER] 从 serverUrl 推导 apiBaseUrl: ${config.apiBaseUrl}`);
+    } catch {
+      config.apiBaseUrl = 'http://127.0.0.1:5000';
+    }
   }
 
   if (!config.appKey) {
@@ -213,6 +231,8 @@ function loadRongCloudConfig() {
   if (!config.heartbeatInterval) {
     config.heartbeatInterval = 20;
   }
+
+  log.info(`[WORKER] 最终 apiBaseUrl: ${config.apiBaseUrl}`);
 
   if (config.token && config.accountId) {
     return config;
