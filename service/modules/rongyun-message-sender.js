@@ -174,11 +174,22 @@ class RongyunMessageSender {
         timestamp: Math.floor(Date.now() / 1000),
       };
 
-      const result = await this.rongcloudClient.sendMessage(
-        targetId,
-        JSON.stringify(messagePayload),
-        1 // PRIVATE
-      );
+      // 优先使用自定义消息类型发送 P2P 消息
+      let result;
+      if (this.rongcloudClient.SystemServiceMessage) {
+        result = await this.rongcloudClient.sendCustomMessage(
+          targetId,
+          messagePayload,
+          1 // PRIVATE
+        );
+      } else {
+        // 回退到文本消息（兼容旧版本）
+        result = await this.rongcloudClient.sendMessage(
+          targetId,
+          JSON.stringify(messagePayload),
+          1 // PRIVATE
+        );
+      }
 
       return result;
     } catch (err) {
