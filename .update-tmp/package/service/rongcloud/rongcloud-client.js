@@ -39,6 +39,18 @@ class RongCloudClient {
     this.log?.info('[RongCloudClient] 初始化 SDK...');
     RongIMLib.init({ appkey: this.config.appKey });
 
+    // 注册 system_service 自定义消息类型（与前端对齐）
+    try {
+      if (typeof RongIMLib.registerMessageType === 'function') {
+        this.SystemServiceMessage = RongIMLib.registerMessageType('system_service', true, false);
+        this.log?.info('[RongCloudClient] system_service 自定义消息类型已注册');
+      } else {
+        this.log?.warn('[RongCloudClient] SDK 不支持 registerMessageType');
+      }
+    } catch (err) {
+      this.log?.warn(`[RongCloudClient] 注册 system_service 消息类型失败: ${err.message}`);
+    }
+
     this.log?.info(`[RongCloudClient] SDK Events: ${JSON.stringify(Object.keys(RongIMLib.Events || {}))}`);
     this.log?.info(`[RongCloudClient] has addEventListener: ${typeof RongIMLib.addEventListener === 'function'}`);
     this.log?.info(`[RongCloudClient] has sendReadReceiptMessage: ${typeof RongIMLib.sendReadReceiptMessage === 'function'}`);
@@ -253,6 +265,50 @@ class RongCloudClient {
       }
     } catch (err) {
       this.log?.error(`[RongCloudClient] 发送异常: ${err.message}`);
+      return false;
+    }
+  }
+
+  async sendCustomMessage(targetId, content, conversationType, customType = 'system_service') {
+    if (!this.isConnected) {
+      this.log?.error('[RongCloudClient] 未连接，无法发送自定义消息');
+      return false;
+    }
+
+    if (!this.SystemServiceMessage) {
+      this.log?.error('[RongCloudClient] system_service 消息类型未注册');
+      return false;
+    }
+
+    try {
+      const convType = conversationType === ConversationType.GROUP
+        ? (RongIMLib.ConversationType?.GROUP || ConversationType.GROUP)
+        : (RongIMLib.ConversationType?.PRIVATE || ConversationType.PRIVATE);
+
+      const messageContent = typeof content === 'string' ? JSON.parse(content) : content;
+      const customMsg = new this.SystemServiceMessage(messageContent);
+
+      const result = await RongIMLib.sendMessage(
+        { conversationType: convType, targetId },
+        customMsg
+      );
+
+      if (result.code === 0 || result.code === 200) {
+        const sentUId = result.data?.messageUId;
+        if (sentUId) {
+          this.sentMessageUIds.add(sentUId);
+          if (this.sentMessageUIds.size > this.sentMessageDedupMaxSize) {
+            const first = this.sentMessageUIds.values().next().value;
+            this.sentMessageUIds.delete(first);
+          }
+        }
+        return true;
+      } else {
+        this.log?.error(`[RongCloudClient] 自定义消息发送失败, code: ${result.code}`);
+        return false;
+      }
+    } catch (err) {
+      this.log?.error(`[RongCloudClient] 发送自定义消息异常: ${err.message}`);
       return false;
     }
   }

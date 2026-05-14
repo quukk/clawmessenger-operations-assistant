@@ -169,7 +169,12 @@ class RongCloudClient {
       // 自定义消息 content 可能是对象，提取文本内容并保留 mentionedInfo
       if (rawContent && typeof rawContent === 'object') {
         mentionedInfo = mentionedInfo || rawContent.mentionedInfo || null;
-        rawContent = rawContent.content || rawContent.text || JSON.stringify(rawContent);
+        // system_service 等结构化消息保留完整 JSON（上层需要 msg_type 等字段）
+        if (message.messageType === 'system_service' || rawContent.msg_type) {
+          rawContent = JSON.stringify(rawContent);
+        } else {
+          rawContent = rawContent.content || rawContent.text || JSON.stringify(rawContent);
+        }
       }
 
       const content = rawContent || '';

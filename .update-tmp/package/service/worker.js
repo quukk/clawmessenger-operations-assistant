@@ -334,66 +334,75 @@ async function initRongCloud() {
   const originalHandleMessage = messageHandler.handleMessage.bind(messageHandler);
 
   messageHandler.handleMessage = async (msg) => {
-    // 检查是否是结构化消息
-    if (msg.content && typeof msg.content === 'string') {
-      try {
-        const parsed = JSON.parse(msg.content);
+    // 检查是否是结构化消息（支持字符串和对象两种格式）
+    // 融云 SDK 对自定义消息可能直接返回对象而非 JSON 字符串
+    if (msg.content) {
+      let parsed = null;
+      
+      if (typeof msg.content === 'string') {
+        // 字符串类型：尝试 JSON 解析
+        try {
+          parsed = JSON.parse(msg.content);
+        } catch {
+          // 不是 JSON，是普通消息
+        }
+      } else if (typeof msg.content === 'object' && msg.content !== null) {
+        // 对象类型：直接使用（融云 SDK 已自动解析）
+        parsed = msg.content;
+      }
 
-        if (parsed.msg_type) {
-          // 这是结构化消息，使用 RongyunMessageHandler 处理
-          log.info(`[WORKER] 收到结构化消息: type=${parsed.msg_type}, from=${parsed.source_im_id || msg.senderUserId}`);
+      if (parsed && parsed.msg_type) {
+        // 这是结构化消息，使用 RongyunMessageHandler 处理
+        log.info(`[WORKER] 收到结构化消息: type=${parsed.msg_type}, from=${parsed.source_im_id || msg.senderUserId}`);
 
-          // 忽略自己发送的消息
-          if (parsed.source_im_id === rongcloudConfig.accountId) {
-            return;
-          }
-
-          // Timestamp 校验（5分钟有效期）
-          const msgTimestamp = parsed.timestamp;
-          if (msgTimestamp) {
-            const currentTime = Math.floor(Date.now() / 1000);
-            const timeDiff = Math.abs(currentTime - msgTimestamp);
-            if (timeDiff > 300) { // 5分钟 = 300秒
-              logTimestampValidation(
-                `消息时间戳过期: msg_time=${msgTimestamp}, current_time=${currentTime}, ` +
-                `diff=${timeDiff}s, type=${parsed.msg_type}, source=${parsed.source_im_id}`
-              );
-              return;
-            }
-          }
-
-          // 解析 content 字段（它本身可能是 JSON 字符串）
-          let innerContent = parsed.content;
-          if (typeof innerContent === 'string') {
-            try {
-              innerContent = JSON.parse(innerContent);
-            } catch {
-              // 保持字符串
-            }
-          }
-
-          // 构建消息数据
-          // 注意：后端发送的 command 消息中，command/command_id/request_id 在 content 字段内
-          // 保留原始 content（用户消息内容），同时展开其他字段
-          const messageData = {
-            ...parsed,
-            ...innerContent,  // 展开 content 中的字段（如 command, command_id 等）
-            content: typeof innerContent === 'object' ? innerContent.content : innerContent,
-            senderUserId: parsed.source_im_id || msg.senderUserId,
-            targetId: msg.targetId,
-            conversationType: msg.conversationType,
-          };
-
-          // 使用 RongyunMessageHandler 处理
-          try {
-            await rongyunMessageHandler.handle(messageData);
-          } catch (err) {
-            log.error(`[WORKER] RongyunMessageHandler 处理异常: ${err.message}`);
-          }
+        // 忽略自己发送的消息
+        if (parsed.source_im_id === rongcloudConfig.accountId) {
           return;
         }
-      } catch {
-        // 不是 JSON，是普通消息，继续传给原始 handler
+
+        // Timestamp 校验（5分钟有效期）
+        const msgTimestamp = parsed.timestamp;
+        if (msgTimestamp) {
+          const currentTime = Math.floor(Date.now() / 1000);
+          const timeDiff = Math.abs(currentTime - msgTimestamp);
+          if (timeDiff > 300) { // 5分钟 = 300秒
+            logTimestampValidation(
+              `消息时间戳过期: msg_time=${msgTimestamp}, current_time=${currentTime}, ` +
+              `diff=${timeDiff}s, type=${parsed.msg_type}, source=${parsed.source_im_id}`
+            );
+            return;
+          }
+        }
+
+        // 解析 content 字段（它本身可能是 JSON 字符串）
+        let innerContent = parsed.content;
+        if (typeof innerContent === 'string') {
+          try {
+            innerContent = JSON.parse(innerContent);
+          } catch {
+            // 保持字符串
+          }
+        }
+
+        // 构建消息数据
+        // 注意：后端发送的 command 消息中，command/command_id/request_id 在 content 字段内
+        // 保留原始 content（用户消息内容），同时展开其他字段
+        const messageData = {
+          ...parsed,
+          ...innerContent,  // 展开 content 中的字段（如 command, command_id 等）
+          content: typeof innerContent === 'object' ? innerContent.content : innerContent,
+          senderUserId: parsed.source_im_id || msg.senderUserId,
+          targetId: msg.targetId,
+          conversationType: msg.conversationType,
+        };
+
+        // 使用 RongyunMessageHandler 处理
+        try {
+          await rongyunMessageHandler.handle(messageData);
+        } catch (err) {
+          log.error(`[WORKER] RongyunMessageHandler 处理异常: ${err.message}`);
+        }
+        return;
       }
     }
 

@@ -63,11 +63,22 @@ class RongCloudServerAPI {
     };
   }
 
+  _getFormHeaders(appKey, appSecret) {
+    const sign = this._generateSignature(appSecret);
+    return {
+      'App-Key': appKey,
+      'Nonce': sign.nonce,
+      'Timestamp': String(sign.timestamp),
+      'Signature': sign.signature,
+      'Content-Type': 'application/x-www-form-urlencoded'
+    };
+  }
+
   async request(path, data, appKey, appSecret, retry = true) {
     const url = `https://${this.currentHost}${path}`;
     const headers = this._getHeaders(appKey, appSecret);
 
-    this.log?.info(`[RongCloudServerAPI] 请求: POST ${url}`);
+    this.log?.info(`[RongCloudServerAPI] 请求: POST ${url} (JSON)`);
 
     try {
       const response = await axios.post(url, data, {
@@ -92,6 +103,50 @@ class RongCloudServerAPI {
       if (retry && this._switchHost()) {
         this.log?.warn(`[RongCloudServerAPI] 请求失败，使用备用域名重试: ${err.message}`);
         return this.request(path, data, appKey, appSecret, false);
+      }
+
+      this.log?.error(`[RongCloudServerAPI] 请求失败: ${err.message}`);
+      throw err;
+    }
+  }
+
+  async requestForm(path, data, appKey, appSecret, retry = true) {
+    const url = `https://${this.currentHost}${path}`;
+    const headers = this._getFormHeaders(appKey, appSecret);
+
+    // 将对象转换为 URLSearchParams (form-urlencoded)
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(data)) {
+      if (value !== undefined && value !== null) {
+        params.append(key, typeof value === 'object' ? JSON.stringify(value) : String(value));
+      }
+    }
+
+    this.log?.info(`[RongCloudServerAPI] 请求: POST ${url} (Form)`);
+
+    try {
+      const response = await axios.post(url, params.toString(), {
+        headers,
+        timeout: this.timeout,
+        responseType: 'json'
+      });
+
+      const result = response.data;
+
+      if (result.code && result.code !== 200) {
+        throw new Error(`[${result.code}] ${result.errorMessage || 'Unknown error'}`);
+      }
+
+      return result;
+    } catch (err) {
+      if (err.response?.status === 401) {
+        this.log?.error('[RongCloudServerAPI] 签名验证失败，请检查 App Key 和 App Secret');
+        throw err;
+      }
+
+      if (retry && this._switchHost()) {
+        this.log?.warn(`[RongCloudServerAPI] 请求失败，使用备用域名重试: ${err.message}`);
+        return this.requestForm(path, data, appKey, appSecret, false);
       }
 
       this.log?.error(`[RongCloudServerAPI] 请求失败: ${err.message}`);
@@ -227,9 +282,9 @@ class RongCloudServerAPI {
     this.log?.info(`[RongCloudServerAPI] 发送 typing 状态: ${fromUserId} -> ${toUserId}`);
     
     if (conversationType === 3) {
-      return this.request('/message/group/publish.json', data, appKey, appSecret);
+      return this.requestForm('/message/group/publish.json', data, appKey, appSecret);
     }
-    return this.request('/message/private/publish.json', data, appKey, appSecret);
+    return this.requestForm('/message/private/publish.json', data, appKey, appSecret);
   }
 }
 

@@ -150,6 +150,86 @@ class RongyunMessageSender {
       ...data,
     });
   }
+
+  /**
+   * 发送消息到指定目标（P2P）
+   */
+  async sendToTarget(targetId, msgType, content, requestId) {
+    if (!this.rongcloudClient?.isConnected) {
+      this.log?.error('[RongyunMessageSender] 未连接，无法发送消息');
+      return false;
+    }
+
+    try {
+      const mac = getMacAddress();
+      const secret = generateSecret(mac, this.config.secretKey || 'secret_key');
+      const messagePayload = {
+        msg_type: msgType,
+        source_im_id: this.config.accountId || '',
+        destination_im_id: targetId,
+        mac: mac,
+        secret: secret,
+        content: typeof content === 'string' ? content : JSON.stringify(content),
+        request_id: requestId || '',
+        timestamp: Math.floor(Date.now() / 1000),
+      };
+
+      // 优先使用自定义消息类型发送 P2P 消息
+      let result;
+      if (this.rongcloudClient.SystemServiceMessage) {
+        result = await this.rongcloudClient.sendCustomMessage(
+          targetId,
+          messagePayload,
+          1 // PRIVATE
+        );
+      } else {
+        // 回退到文本消息（兼容旧版本）
+        result = await this.rongcloudClient.sendMessage(
+          targetId,
+          JSON.stringify(messagePayload),
+          1 // PRIVATE
+        );
+      }
+
+      return result;
+    } catch (err) {
+      this.log?.error(`[RongyunMessageSender] P2P发送异常: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * 发送设备控制结果（P2P）
+   */
+  async sendDeviceControlResult(targetId, requestId, command, status, message, data) {
+    return await this.sendToTarget(
+      targetId,
+      RongyunMessageTypeEnum.DEVICE_CONTROL_RESULT,
+      {
+        command,
+        status,
+        message,
+        data
+      },
+      requestId
+    );
+  }
+
+  /**
+   * 发送设备状态报告（P2P）
+   */
+  async sendDeviceStatusReport(targetId, requestId, data, error) {
+    return await this.sendToTarget(
+      targetId,
+      RongyunMessageTypeEnum.DEVICE_STATUS_REPORT,
+      {
+        status: error ? 'error' : 'success',
+        message: error || '状态报告',
+        data
+      },
+      requestId
+    );
+  }
 }
 
 module.exports = {
