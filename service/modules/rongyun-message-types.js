@@ -22,7 +22,11 @@ const RongyunMessageTypeEnum = {
   CHAT_MESSAGE: "chat_message",
   CREATE_OPENCODE_SESSION: "create_opencode_session",
   OPENCODE_SESSION_CREATED: "opencode_session_created",
-  DELETE_OPENCODE_SESSION: "delete_opencode_session"
+  DELETE_OPENCODE_SESSION: "delete_opencode_session",
+  DEVICE_CONTROL: "device_control",
+  DEVICE_CONTROL_RESULT: "device_control_result",
+  DEVICE_STATUS_REQUEST: "device_status_request",
+  DEVICE_STATUS_REPORT: "device_status_report"
 };
 
 module.exports = { RongyunMessageTypeEnum };

@@ -11,6 +11,11 @@ const { RongyunMessageTypeEnum } = require('./rongyun-message-types');
 const { OpenClawCommandEnum } = require('./openclaw-enum');
 const { executeCommand } = require('./openclaw-control');
 const { createOpencodeSession, deleteOpencodeSession, forwardChatMessage } = require('./opencode-service');
+const { ServiceManager } = require('./service-manager');
+const { collectDashboardData } = require('./dashboard-collector');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
 class RongyunMessageHandler {
   constructor(rongcloudClient, config, log) {
@@ -72,6 +77,12 @@ class RongyunMessageHandler {
         case RongyunMessageTypeEnum.DELETE_OPENCODE_SESSION:
           await this.handleDeleteSession(parsed);
           break;
+        case RongyunMessageTypeEnum.DEVICE_CONTROL:
+          await this.handleDeviceControl(parsed);
+          break;
+        case RongyunMessageTypeEnum.DEVICE_STATUS_REQUEST:
+          await this.handleDeviceStatusRequest(parsed);
+          break;
         default:
           this.logWarn(`未处理的消息类型: ${msgType}`);
       }
@@ -85,8 +96,9 @@ class RongyunMessageHandler {
     const command = data.command;
     const commandId = data.command_id;
     const requestId = data.request_id;
+    const sourceId = data.source_im_id;
 
-    this.logInfo(`[RongyunMessageHandler] 收到命令: command=${command}, command_id=${commandId}`);
+    this.logInfo(`[RongyunMessageHandler] 收到命令: command=${command}, command_id=${commandId}, from=${sourceId || 'guardserver'}`);
 
     // 验证命令是否有效
     const validCommands = Object.values(OpenClawCommandEnum);
@@ -96,7 +108,7 @@ class RongyunMessageHandler {
         command_id: commandId,
         status: 'error',
         message: `未知命令: ${command}`
-      }, requestId);
+      }, requestId, sourceId);
       return;
     }
 
@@ -107,7 +119,7 @@ class RongyunMessageHandler {
         command_id: commandId,
         status: 'busy',
         message: '正在执行上一个指令，请稍后再试'
-      }, requestId);
+      }, requestId, sourceId);
       return;
     }
 
@@ -119,7 +131,7 @@ class RongyunMessageHandler {
         await this.sendResponse(RongyunMessageTypeEnum.COMMAND_RESULT, {
           ...response,
           command_id: commandId
-        }, requestId);
+        }, requestId, sourceId);
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -129,7 +141,7 @@ class RongyunMessageHandler {
         command_id: commandId,
         status: 'error',
         message: msg
-      }, requestId);
+      }, requestId, sourceId);
     } finally {
       this.commandLock = false;
     }
@@ -229,15 +241,125 @@ class RongyunMessageHandler {
     }
   }
 
-  async sendResponse(msgType, content, requestId) {
+  async handleDeviceControl(data) {
+    const command = data.command;
+    const requestId = data.request_id;
+    const targetId = data.source_im_id;
+
+    this.logInfo(`[RongyunMessageHandler] 收到设备控制命令: command=${command}, from=${targetId}`);
+
+    const validCommands = ['disable', 'enable', 'delete', 'status'];
+    if (!validCommands.includes(command)) {
+      await this.sendDeviceControlResult(targetId, requestId, command, 'error', `未知命令: ${command}`);
+      return;
+    }
+
+    try {
+      let result;
+      switch (command) {
+        case 'disable': {
+          const svcMgr = new ServiceManager('claw-subagent-service', 'OpenClaw Guard CLI Client', process.argv[1], this.log);
+          await svcMgr.stop();
+          await svcMgr.uninstall();
+          result = { status: 'success', message: '设备服务已禁用' };
+          break;
+        }
+        case 'enable': {
+          const svcMgr = new ServiceManager('claw-subagent-service', 'OpenClaw Guard CLI Client', process.argv[1], this.log);
+          await svcMgr.install();
+          result = { status: 'success', message: '设备服务已启用' };
+          break;
+        }
+        case 'delete': {
+          const svcMgr = new ServiceManager('claw-subagent-service', 'OpenClaw Guard CLI Client', process.argv[1], this.log);
+          try { await svcMgr.stop(); } catch (e) {}
+          try { await svcMgr.uninstall(); } catch (e) {}
+          const homeDir = os.homedir();
+          const configPaths = [
+            path.join(homeDir, '.claw-bridge', 'config.json'),
+            path.join(__dirname, '..', '..', 'rongcloud-config.json')
+          ];
+          for (const p of configPaths) {
+            if (fs.existsSync(p)) {
+              fs.unlinkSync(p);
+            }
+          }
+          result = { status: 'success', message: '设备已删除，本地配置已清除' };
+          break;
+        }
+        case 'status': {
+          const dashboard = await collectDashboardData();
+          result = { status: 'success', message: '状态查询成功', data: dashboard };
+          break;
+        }
+      }
+
+      await this.sendDeviceControlResult(targetId, requestId, command, result.status, result.message, result.data);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.logError(`设备控制命令执行异常: ${msg}`);
+      await this.sendDeviceControlResult(targetId, requestId, command, 'error', msg);
+    }
+  }
+
+  async handleDeviceStatusRequest(data) {
+    const requestId = data.request_id;
+    const targetId = data.source_im_id;
+
+    this.logInfo(`[RongyunMessageHandler] 收到设备状态请求, from=${targetId}`);
+
+    try {
+      const dashboard = await collectDashboardData();
+      await this.sendDeviceStatusReport(targetId, requestId, dashboard);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.logError(`设备状态查询异常: ${msg}`);
+      await this.sendDeviceStatusReport(targetId, requestId, null, msg);
+    }
+  }
+
+  async sendDeviceControlResult(targetId, requestId, command, status, message, data) {
+    if (!this.messageSender) {
+      this.logError('MessageSender 未设置，无法发送响应');
+      return;
+    }
+    try {
+      await this.messageSender.sendDeviceControlResult(targetId, requestId, command, status, message, data);
+      this.logInfo(`设备控制结果已发送: ${command} -> ${targetId}`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.logError(`发送设备控制结果失败: ${msg}`);
+    }
+  }
+
+  async sendDeviceStatusReport(targetId, requestId, data, error) {
+    if (!this.messageSender) {
+      this.logError('MessageSender 未设置，无法发送响应');
+      return;
+    }
+    try {
+      await this.messageSender.sendDeviceStatusReport(targetId, requestId, data, error);
+      this.logInfo(`设备状态报告已发送 -> ${targetId}`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.logError(`发送设备状态报告失败: ${msg}`);
+    }
+  }
+
+  async sendResponse(msgType, content, requestId, targetId) {
     if (!this.messageSender) {
       this.logError('MessageSender 未设置，无法发送响应');
       return;
     }
 
     try {
-      await this.messageSender.sendProtocolMessage(msgType, content, requestId);
-      this.logInfo(`响应已发送: ${msgType}`);
+      if (targetId) {
+        await this.messageSender.sendToTarget(targetId, msgType, content, requestId);
+        this.logInfo(`响应已发送: ${msgType} -> ${targetId}`);
+      } else {
+        await this.messageSender.sendProtocolMessage(msgType, content, requestId);
+        this.logInfo(`响应已发送: ${msgType}`);
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.logError(`发送响应失败: ${msg}`);
