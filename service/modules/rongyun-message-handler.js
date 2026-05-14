@@ -13,6 +13,8 @@ const { executeCommand } = require('./openclaw-control');
 const { createOpencodeSession, deleteOpencodeSession, forwardChatMessage } = require('./opencode-service');
 const { ServiceManager } = require('./service-manager');
 const { collectDashboardData } = require('./dashboard-collector');
+const { getOpenClawStatus } = require('./port-checker');
+const { getMacAddress } = require('./mac-address');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -306,11 +308,22 @@ class RongyunMessageHandler {
     const requestId = data.request_id;
     const targetId = data.source_im_id;
 
-    this.logInfo(`[RongyunMessageHandler] 收到设备状态请求, from=${targetId}`);
+    this.logInfo(`[RongyunMessageHandler] 收到设备状态请求, from=${targetId}, requestId=${requestId}`);
 
     try {
-      const dashboard = await collectDashboardData();
-      await this.sendDeviceStatusReport(targetId, requestId, dashboard);
+      // 获取 OpenClaw 运行状态（检查端口 18789）
+      const openClawStatus = await getOpenClawStatus();
+      
+      // 构建精简状态数据（避免超过融云 128KB 限制）
+      const statusData = {
+        open_claw_status: openClawStatus,  // 1=运行中, 0=未运行
+        mac_address: getMacAddress(),
+        version: '0.0.20',
+        timestamp: Date.now(),
+      };
+      
+      this.logInfo(`[RongyunMessageHandler] 设备状态: openClawStatus=${openClawStatus}`);
+      await this.sendDeviceStatusReport(targetId, requestId, statusData);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.logError(`设备状态查询异常: ${msg}`);
