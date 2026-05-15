@@ -39,16 +39,16 @@ class RongCloudClient {
     this.log?.info('[RongCloudClient] 初始化 SDK...');
     RongIMLib.init({ appkey: this.config.appKey });
 
-    // 注册 system_service 自定义消息类型（与前端对齐）
+    // 注册 command 自定义消息类型（与前端对齐）
     try {
       if (typeof RongIMLib.registerMessageType === 'function') {
-        this.SystemServiceMessage = RongIMLib.registerMessageType('system_service', true, false);
-        this.log?.info('[RongCloudClient] system_service 自定义消息类型已注册');
+        this.SystemServiceMessage = RongIMLib.registerMessageType('command', true, false);
+        this.log?.info('[RongCloudClient] command 自定义消息类型已注册');
       } else {
         this.log?.warn('[RongCloudClient] SDK 不支持 registerMessageType');
       }
     } catch (err) {
-      this.log?.warn(`[RongCloudClient] 注册 system_service 消息类型失败: ${err.message}`);
+      this.log?.warn(`[RongCloudClient] 注册 command 消息类型失败: ${err.message}`);
     }
 
     this.log?.info(`[RongCloudClient] SDK Events: ${JSON.stringify(Object.keys(RongIMLib.Events || {}))}`);
@@ -169,8 +169,8 @@ class RongCloudClient {
       // 自定义消息 content 可能是对象，提取文本内容并保留 mentionedInfo
       if (rawContent && typeof rawContent === 'object') {
         mentionedInfo = mentionedInfo || rawContent.mentionedInfo || null;
-        // system_service 等结构化消息保留完整 JSON（上层需要 msg_type 等字段）
-        if (message.messageType === 'system_service' || rawContent.msg_type) {
+        // command 等结构化消息保留完整 JSON（上层需要 msg_type 等字段）
+        if (message.messageType === 'command' || rawContent.msg_type) {
           rawContent = JSON.stringify(rawContent);
         } else {
           rawContent = rawContent.content || rawContent.text || JSON.stringify(rawContent);
@@ -274,14 +274,14 @@ class RongCloudClient {
     }
   }
 
-  async sendCustomMessage(targetId, content, conversationType, customType = 'system_service') {
+  async sendCustomMessage(targetId, content, conversationType, customType = 'command') {
     if (!this.isConnected) {
       this.log?.error('[RongCloudClient] 未连接，无法发送自定义消息');
       return false;
     }
 
     if (!this.SystemServiceMessage) {
-      this.log?.error('[RongCloudClient] system_service 消息类型未注册');
+      this.log?.error('[RongCloudClient] command 消息类型未注册');
       return false;
     }
 

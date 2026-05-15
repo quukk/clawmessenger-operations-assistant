@@ -92,8 +92,8 @@ class ScriptExecutor {
       const fullOutput = stdout + stderr;
       
       // 调试日志：记录脚本实际输出
-      console.log(`[ScriptExecutor-DEBUG] ${scriptName} 原始输出:\n${fullOutput}`);
-      console.log(`[ScriptExecutor-DEBUG] ${scriptName} 输出长度: ${fullOutput.length}`);
+      console.log(`[ScriptExecutor] 执行脚本: ${scriptPath}`);
+      console.log(`[ScriptExecutor] ${scriptName} 输出:\n${fullOutput}`);
       
       return this.parseStatus(command, fullOutput);
     } catch (e) {
