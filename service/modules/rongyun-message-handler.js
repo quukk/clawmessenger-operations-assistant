@@ -25,6 +25,7 @@ class RongyunMessageHandler {
     this.config = config;
     this.log = log;
     this.commandLock = false;
+    this.commandLockTimer = null;
     this.messageSender = null;
   }
 
@@ -126,6 +127,13 @@ class RongyunMessageHandler {
     }
 
     this.commandLock = true;
+    // 设置 60 秒超时保护，防止命令永久卡住导致锁无法释放
+    this.commandLockTimer = setTimeout(() => {
+      this.logWarn('[RongyunMessageHandler] 命令锁超时（60秒），自动释放');
+      this.commandLock = false;
+      this.commandLockTimer = null;
+    }, 60000);
+
     try {
       await executeCommand(command, null, async (response) => {
         // 增加短暂延迟，避免融云 SDK 在收到消息后立刻回复时消息丢失
@@ -146,6 +154,10 @@ class RongyunMessageHandler {
       }, requestId, sourceId);
     } finally {
       this.commandLock = false;
+      if (this.commandLockTimer) {
+        clearTimeout(this.commandLockTimer);
+        this.commandLockTimer = null;
+      }
     }
   }
 

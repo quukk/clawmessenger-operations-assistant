@@ -285,15 +285,6 @@ class ScriptExecutor {
         }
       });
       
-      // 错误处理
-      child.on('error', (err) => {
-        console.error(`[ScriptExecutor] 子进程错误: ${err.message}`);
-        if (!killed) {
-          killed = true;
-          clearTimeout(timer);
-          reject(err);
-        }
-      });
     });
   }
 
