@@ -96,7 +96,7 @@ class RongyunMessageHandler {
   }
 
   async handleCommand(data) {
-    const command = data.command;
+    const command = Number(data.command);  // 确保是数字类型
     const commandId = data.command_id;
     const requestId = data.request_id;
     const sourceId = data.source_im_id;
@@ -106,6 +106,7 @@ class RongyunMessageHandler {
     // 验证命令是否有效
     const validCommands = Object.values(OpenClawCommandEnum);
     if (!validCommands.includes(command)) {
+      this.logError(`[RongyunMessageHandler] 未知命令: ${command}, 有效命令: ${validCommands.join(', ')}`);
       await this.sendResponse(RongyunMessageTypeEnum.COMMAND_RESULT, {
         command,
         command_id: commandId,
@@ -272,11 +273,17 @@ class RongyunMessageHandler {
       let result;
       switch (command) {
         case 'disable': {
-          const svcMgr = new ServiceManager('claw-subagent-service', 'OpenClaw Guard CLI Client', process.argv[1], this.log);
-          await svcMgr.stop();
-          await svcMgr.uninstall();
+          // 先发送响应，再停止服务
           result = { status: 'success', message: '设备服务已禁用' };
-          break;
+          await this.sendDeviceControlResult(targetId, requestId, command, result.status, result.message, result.data);
+          
+          setTimeout(async () => {
+            const svcMgr = new ServiceManager('claw-subagent-service', 'OpenClaw Guard CLI Client', process.argv[1], this.log);
+            try { await svcMgr.stop(); } catch (e) {}
+            try { await svcMgr.uninstall(); } catch (e) {}
+          }, 2000);
+          
+          return;
         }
         case 'enable': {
           const svcMgr = new ServiceManager('claw-subagent-service', 'OpenClaw Guard CLI Client', process.argv[1], this.log);
@@ -285,21 +292,28 @@ class RongyunMessageHandler {
           break;
         }
         case 'delete': {
-          const svcMgr = new ServiceManager('claw-subagent-service', 'OpenClaw Guard CLI Client', process.argv[1], this.log);
-          try { await svcMgr.stop(); } catch (e) {}
-          try { await svcMgr.uninstall(); } catch (e) {}
-          const homeDir = os.homedir();
-          const configPaths = [
-            path.join(homeDir, '.claw-bridge', 'config.json'),
-            path.join(__dirname, '..', '..', 'rongcloud-config.json')
-          ];
-          for (const p of configPaths) {
-            if (fs.existsSync(p)) {
-              fs.unlinkSync(p);
-            }
-          }
+          // 先发送响应，再停止服务（否则服务停止后无法发送响应）
           result = { status: 'success', message: '设备已删除，本地配置已清除' };
-          break;
+          await this.sendDeviceControlResult(targetId, requestId, command, result.status, result.message, result.data);
+          
+          // 延迟执行实际的删除操作
+          setTimeout(async () => {
+            const svcMgr = new ServiceManager('claw-subagent-service', 'OpenClaw Guard CLI Client', process.argv[1], this.log);
+            try { await svcMgr.stop(); } catch (e) {}
+            try { await svcMgr.uninstall(); } catch (e) {}
+            const homeDir = os.homedir();
+            const configPaths = [
+              path.join(homeDir, '.claw-bridge', 'config.json'),
+              path.join(__dirname, '..', '..', 'rongcloud-config.json')
+            ];
+            for (const p of configPaths) {
+              if (fs.existsSync(p)) {
+                fs.unlinkSync(p);
+              }
+            }
+          }, 2000);
+          
+          return; // 已经发送了响应，直接返回
         }
         case 'status': {
           const dashboard = await collectDashboardData();

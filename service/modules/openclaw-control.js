@@ -38,9 +38,11 @@ function getScriptName(command) {
     [OpenClawCommandEnum.START]: 'start',
     [OpenClawCommandEnum.STOP]: 'stop',
     [OpenClawCommandEnum.RESTART]: 'restart',
-    [OpenClawCommandEnum.STATUS]: 'status'
+    [OpenClawCommandEnum.STATUS]: 'status',
+    [OpenClawCommandEnum.CONFIG_FIX]: null  // 配置修复不需要脚本
   };
-  return (names[command] || 'unknown') + ext;
+  const name = names[command];
+  return name ? name + ext : null;
 }
 
 function getCommandName(command) {
@@ -48,7 +50,8 @@ function getCommandName(command) {
     [OpenClawCommandEnum.START]: '启动',
     [OpenClawCommandEnum.STOP]: '停止',
     [OpenClawCommandEnum.RESTART]: '重启',
-    [OpenClawCommandEnum.STATUS]: '状态检查'
+    [OpenClawCommandEnum.STATUS]: '状态检查',
+    [OpenClawCommandEnum.CONFIG_FIX]: '配置修复'
   };
   return names[command] || '未知命令';
 }
@@ -73,6 +76,9 @@ async function manageWithServiceManager(command) {
       case OpenClawCommandEnum.STATUS:
         const status = await serviceMgr.status();
         return { status: OpenClawServiceStatus.RUNNING, message: status };
+      case OpenClawCommandEnum.CONFIG_FIX:
+        // 配置修复不通过 ServiceManager，回退到脚本方式
+        return null;
       default:
         return { status: OpenClawServiceStatus.ERROR, message: '未知命令' };
     }
@@ -123,6 +129,11 @@ async function verifyCommandResult(command, result, scriptOutput = '') {
   }
   
   const outputUpper = (scriptOutput || '').toUpperCase();
+  
+  // 配置修复命令不需要端口验证
+  if (command === OpenClawCommandEnum.CONFIG_FIX) {
+    return result;
+  }
   
   if (command === OpenClawCommandEnum.STOP) {
     // 等待 3 秒后验证端口
@@ -219,7 +230,8 @@ async function executeCommand(command, window, sendResponse) {
   // 输出日志
   if (result.status === OpenClawServiceStatus.START_SUCCESS ||
       result.status === OpenClawServiceStatus.STOP_SUCCESS ||
-      result.status === OpenClawServiceStatus.RESTART_SUCCESS) {
+      result.status === OpenClawServiceStatus.RESTART_SUCCESS ||
+      result.status === OpenClawServiceStatus.CONFIG_FIX_SUCCESS) {
     console.log(`[OpenClawControl] ${cmdName} 成功: ${result.message}`);
   } else if (result.status === OpenClawServiceStatus.ERROR) {
     console.log(`[OpenClawControl] ${cmdName} 失败: ${result.message}`);
