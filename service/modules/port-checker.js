@@ -129,10 +129,13 @@ function checkProcessExists() {
 }
 
 async function getOpenClawStatus(port = 18789) {
+  // 核心判断：只有端口在监听才算是真正运行
+  // openclaw gateway 的核心功能就是监听端口提供服务
+
   // 方法1: 通过 net.Socket 检查端口
   const isListening = await checkPortOnAllInterfaces(port);
   if (isListening) {
-    console.log(`[PortChecker] 端口 ${port} 检测为运行中（net.Socket）`);
+    console.log(`[PortChecker] 端口 ${port} 检测为运行中`);
     return 1;
   }
   
@@ -143,12 +146,10 @@ async function getOpenClawStatus(port = 18789) {
     return 1;
   }
   
-  // 方法3: 检查进程是否存在（备选）
+  // 方法3: 检查进程是否存在（仅用于日志，不改变判断结果）
   const processExists = checkProcessExists();
   if (processExists) {
-    console.warn(`[PortChecker] 警告: openclaw 进程存在，但端口 ${port} 未监听。可能绑定到其他端口或地址。`);
-    // 进程存在但端口未监听，返回特殊状态 2
-    return 2;
+    console.warn(`[PortChecker] 警告: openclaw 进程存在，但端口 ${port} 未监听。服务可能未正确启动或已崩溃。`);
   }
   
   console.log(`[PortChecker] 端口 ${port} 检测为未运行`);
