@@ -84,7 +84,7 @@ get_openclaw_pid() {
         fi
     fi
     
-    # 方法5: 通过 /proc/net/tcp 查找（不需要外部工具，最可靠）
+    # 方法5: 通过 /proc/net/tcp 查找（不需要外部工具）
     # 端口 18789 的十六进制 = 0x4965
     local hex_port="4965"
     for proc_dir in /proc/[0-9]*; do
@@ -96,6 +96,30 @@ get_openclaw_pid() {
             fi
         fi
     done
+    
+    # 方法6: 通过进程名查找（当服务未监听预期端口时）
+    if command -v pgrep &>/dev/null; then
+        pid=$(pgrep -f "openclaw" | head -1)
+        if [ -n "$pid" ]; then
+            echo "$pid"
+            return
+        fi
+    fi
+    
+    if command -v pidof &>/dev/null; then
+        pid=$(pidof openclaw | awk '{print $1}')
+        if [ -n "$pid" ]; then
+            echo "$pid"
+            return
+        fi
+    fi
+    
+    # 最后尝试 ps
+    pid=$(ps aux | grep -v grep | grep "openclaw" | head -1 | awk '{print $2}')
+    if [ -n "$pid" ]; then
+        echo "$pid"
+        return
+    fi
     
     echo ""
 }
