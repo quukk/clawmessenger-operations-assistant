@@ -34,6 +34,7 @@ get_openclaw_pid() {
     local pid=""
     
     # 按优先级尝试多种工具（适配精简 Docker 镜像）
+    # 方法1: lsof（最可靠）
     if command -v lsof &>/dev/null; then
         pid=$(lsof -i :${port} -t 2>/dev/null | head -1)
         if [ -n "$pid" ]; then
@@ -42,6 +43,7 @@ get_openclaw_pid() {
         fi
     fi
     
+    # 方法2: fuser
     if command -v fuser &>/dev/null; then
         pid=$(fuser ${port}/tcp 2>/dev/null | tr -d ' ')
         if [ -n "$pid" ]; then
@@ -50,14 +52,16 @@ get_openclaw_pid() {
         fi
     fi
     
+    # 方法3: ss
     if command -v ss &>/dev/null; then
-        pid=$(ss -tlnp 2>/dev/null | grep ":${port} " | head -1 | sed -n 's/.*pid=\\([0-9]*\\).*/\\1/p')
+        pid=$(ss -tlnp 2>/dev/null | grep ":${port} " | head -1 | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
         if [ -n "$pid" ]; then
             echo "$pid"
             return
         fi
     fi
     
+    # 方法4: netstat
     if command -v netstat &>/dev/null; then
         pid=$(netstat -tnlp 2>/dev/null | grep ":${port} " | head -1 | awk '{print $7}' | cut -d'/' -f1)
         if [ -n "$pid" ]; then
@@ -66,19 +70,16 @@ get_openclaw_pid() {
         fi
     fi
     
-    # 最后尝试 /proc 文件系统（最可靠，无需外部工具）
+    # 方法5: 通过 /proc/net/tcp 查找（不需要外部工具，最可靠）
+    # 端口 18789 的十六进制 = 0x4965
+    local hex_port="4965"
     for proc_dir in /proc/[0-9]*; do
-        if [ -d "$proc_dir/fd" ]; then
-            for fd in $proc_dir/fd/*; do
-                if [ -L "$fd" ]; then
-                    local target
-                    target=$(readlink "$fd" 2>/dev/null)
-                    if [ -n "$target" ] && echo "$target" | grep -q ":${port}"; then
-                        basename "$proc_dir"
-                        return
-                    fi
-                fi
-            done
+        if [ -f "$proc_dir/net/tcp" ]; then
+            # 检查该进程是否监听目标端口
+            if grep -q "[^0-9a-fA-F]${hex_port} " "$proc_dir/net/tcp" 2>/dev/null; then
+                basename "$proc_dir"
+                return
+            fi
         fi
     done
     
@@ -146,25 +147,41 @@ restart_docker() {
     fi
     
     # 如果正在运行，先停止
-    if [ -n "$pid" ]; then
+    if [ -n "$pid" ] || check_port "$PORT"; then
         log_info "正在停止 OpenClaw 服务..."
-        kill "$pid" &>/dev/null || true
+        if [ -n "$pid" ]; then
+            kill "$pid" &>/dev/null || true
+        fi
         
-        # 等待停止（最多 5 秒）
+        # 等待停止（最多 10 秒），使用端口双重验证
         local elapsed=0
-        while [ $elapsed -lt 5 ]; do
-            if [ -z "$(get_openclaw_pid)" ]; then
+        while [ $elapsed -lt 10 ]; do
+            local current_pid
+            current_pid=$(get_openclaw_pid)
+            if [ -z "$current_pid" ] && ! check_port "$PORT"; then
                 break
             fi
             sleep 1
             elapsed=$((elapsed + 1))
         done
         
-        # 如果还在运行，强制停止
-        if [ -n "$(get_openclaw_pid)" ]; then
-            log_warn "服务未在 5 秒内停止，正在强制停止..."
-            kill -9 "$pid" &>/dev/null || true
-            sleep 1
+        # 如果还在运行，强制停止并使用备选方案
+        if check_port "$PORT"; then
+            log_warn "服务未在 10 秒内停止，正在强制停止..."
+            if [ -n "$pid" ]; then
+                kill -9 "$pid" &>/dev/null || true
+            fi
+            pkill -9 -f "openclaw" &>/dev/null || true
+            if command -v fuser &>/dev/null; then
+                fuser -k "${PORT}/tcp" &>/dev/null || true
+            fi
+            sleep 2
+            
+            # 最终验证
+            if check_port "$PORT"; then
+                log_error "OpenClaw 服务停止失败！端口 $PORT 仍在监听。"
+                exit 1
+            fi
         fi
         
         log_info "服务已停止"

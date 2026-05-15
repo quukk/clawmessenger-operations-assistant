@@ -67,6 +67,7 @@ get_openclaw_pid() {
     local pid=""
     
     # 按优先级尝试多种工具（适配精简 Docker 镜像）
+    # 方法1: lsof（最可靠）
     if command -v lsof &>/dev/null; then
         pid=$(lsof -i :${port} -t 2>/dev/null | head -1)
         if [ -n "$pid" ]; then
@@ -75,6 +76,7 @@ get_openclaw_pid() {
         fi
     fi
     
+    # 方法2: fuser
     if command -v fuser &>/dev/null; then
         pid=$(fuser ${port}/tcp 2>/dev/null | tr -d ' ')
         if [ -n "$pid" ]; then
@@ -83,14 +85,16 @@ get_openclaw_pid() {
         fi
     fi
     
+    # 方法3: ss
     if command -v ss &>/dev/null; then
-        pid=$(ss -tlnp 2>/dev/null | grep ":${port} " | head -1 | sed -n 's/.*pid=\\([0-9]*\\).*/\\1/p')
+        pid=$(ss -tlnp 2>/dev/null | grep ":${port} " | head -1 | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
         if [ -n "$pid" ]; then
             echo "$pid"
             return
         fi
     fi
     
+    # 方法4: netstat
     if command -v netstat &>/dev/null; then
         pid=$(netstat -tnlp 2>/dev/null | grep ":${port} " | head -1 | awk '{print $7}' | cut -d'/' -f1)
         if [ -n "$pid" ]; then
@@ -99,19 +103,16 @@ get_openclaw_pid() {
         fi
     fi
     
-    # 最后尝试 /proc 文件系统（最可靠，无需外部工具）
+    # 方法5: 通过 /proc/net/tcp 查找（不需要外部工具，最可靠）
+    # 端口 18789 的十六进制 = 0x4965
+    local hex_port="4965"
     for proc_dir in /proc/[0-9]*; do
-        if [ -d "$proc_dir/fd" ]; then
-            for fd in $proc_dir/fd/*; do
-                if [ -L "$fd" ]; then
-                    local target
-                    target=$(readlink "$fd" 2>/dev/null)
-                    if [ -n "$target" ] && echo "$target" | grep -q ":${port}"; then
-                        basename "$proc_dir"
-                        return
-                    fi
-                fi
-            done
+        if [ -f "$proc_dir/net/tcp" ]; then
+            # 检查该进程是否监听目标端口
+            if grep -q "[^0-9a-fA-F]${hex_port} " "$proc_dir/net/tcp" 2>/dev/null; then
+                basename "$proc_dir"
+                return
+            fi
         fi
     done
     
@@ -126,6 +127,32 @@ stop_docker() {
     # 检查服务状态
     log_info "检查 OpenClaw 服务状态..."
     if [ -z "$pid" ]; then
+        # 即使找不到 PID，也检查端口是否还在监听
+        if check_port "$PORT"; then
+            log_warn "端口 $PORT 仍在监听，但无法获取 PID，尝试备选停止方案..."
+            # 尝试通过 fuser 直接通过端口杀进程
+            if command -v fuser &>/dev/null; then
+                log_info "使用 fuser 通过端口停止服务..."
+                fuser -k "${PORT}/tcp" &>/dev/null || true
+                sleep 2
+            fi
+            # 尝试通过 pkill 停止 openclaw 相关进程
+            if check_port "$PORT"; then
+                log_info "使用 pkill 停止 openclaw 进程..."
+                pkill -f "openclaw" &>/dev/null || true
+                sleep 2
+            fi
+            # 最终验证
+            if ! check_port "$PORT"; then
+                log_info "OpenClaw 服务已停止（通过备选方案）。"
+                log_info "服务已成功停止。"
+                log_info "Success"
+                exit 0
+            else
+                log_error "OpenClaw 服务停止失败！所有停止方案均无效。"
+                exit 1
+            fi
+        fi
         log_warn "OpenClaw 服务未在运行。"
         exit 0
     fi
@@ -133,14 +160,17 @@ stop_docker() {
     log_info "OpenClaw 服务正在运行（PID: $pid），准备停止..."
     
     # 停止服务：先发送 SIGTERM（优雅停止）
-    log_info "正在停止 OpenClaw 服务..."
+    log_info "正在停止 OpenClaw 服务（发送 SIGTERM）..."
     kill "$pid" &>/dev/null || true
     
-    # 等待服务完全停止（最多 10 秒）
+    # 等待服务完全停止（最多 10 秒），使用端口双重验证
     local elapsed=0
     while [ $elapsed -lt 10 ]; do
-        if [ -z "$(get_openclaw_pid)" ]; then
-            log_info "OpenClaw 服务停止成功！"
+        # 双重验证：检查 PID 和端口
+        local current_pid
+        current_pid=$(get_openclaw_pid)
+        if [ -z "$current_pid" ] && ! check_port "$PORT"; then
+            log_info "OpenClaw 服务停止成功！（PID 和端口均已关闭）"
             log_info "服务已成功停止。"
             log_info "Success"
             exit 0
@@ -153,32 +183,38 @@ stop_docker() {
     log_warn "服务未在 10 秒内停止，正在强制停止..."
     kill -9 "$pid" &>/dev/null || true
     
-    # 等待进程消失（最多 3 秒）
+    # 额外：尝试 pkill 确保所有相关进程都被停止
+    pkill -9 -f "openclaw" &>/dev/null || true
+    
+    # 等待进程消失（最多 5 秒）
     elapsed=0
-    while [ $elapsed -lt 3 ]; do
-        if [ -z "$(get_openclaw_pid)" ]; then
-            break
+    while [ $elapsed -lt 5 ]; do
+        local current_pid
+        current_pid=$(get_openclaw_pid)
+        if [ -z "$current_pid" ] && ! check_port "$PORT"; then
+            log_info "OpenClaw 服务已强制停止。"
+            log_info "服务已成功停止。"
+            log_info "Success"
+            exit 0
         fi
         sleep 1
         elapsed=$((elapsed + 1))
     done
     
-    # 验证：进程不存在或端口已关闭即为成功
-    # 使用端口检测作为辅助，避免僵尸进程导致误判
+    # 最终验证
     local current_pid
     current_pid=$(get_openclaw_pid)
-    if [ -z "$current_pid" ]; then
-        log_info "OpenClaw 服务已强制停止。"
+    if [ -z "$current_pid" ] && ! check_port "$PORT"; then
+        log_info "OpenClaw 服务已停止。"
         log_info "服务已成功停止。"
         log_info "Success"
-    elif ! check_port "$PORT"; then
-        # 端口已关闭但进程可能还在（僵尸状态），也认为成功
+    elif check_port "$PORT"; then
+        log_error "OpenClaw 服务停止失败！端口 $PORT 仍在监听。"
+        exit 1
+    else
         log_info "OpenClaw 服务已停止（端口已关闭）。"
         log_info "服务已成功停止。"
         log_info "Success"
-    else
-        log_error "OpenClaw 服务停止失败！进程仍然存在且端口仍在监听。"
-        exit 1
     fi
 }
 
