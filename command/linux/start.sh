@@ -4,7 +4,8 @@
 # 用法: ./start.sh [选项]
 # 支持 systemd 和 Docker（无 systemd）双模式
 
-set -e
+# 注意：不使用 set -e，因为我们已经实现了完善的错误处理和验证逻辑
+# set -e 可能导致 pgrep/pidof 找不到进程时脚本意外退出
 
 # 颜色定义
 RED='\033[0;31m'

@@ -4,7 +4,8 @@
 # 用法: ./stop.sh [选项]
 # 支持 systemd 和 Docker（无 systemd）双模式
 
-set -e
+# 注意：不使用 set -e，因为我们已经实现了完善的错误处理和验证逻辑
+# set -e 可能导致 pgrep/pidof 找不到进程时脚本意外退出
 
 # 颜色定义
 RED='\033[0;31m'
@@ -146,13 +147,24 @@ get_openclaw_pid() {
 
 # Docker 模式：停止服务
 stop_docker() {
+    log_info "检查 OpenClaw 服务状态..."
+    
+    # 获取所有 openclaw 进程 PID
+    local all_pids=""
+    if command -v pgrep &>/dev/null; then
+        all_pids=$(pgrep -f "openclaw" | tr '\n' ' ')
+    elif command -v pidof &>/dev/null; then
+        all_pids=$(pidof openclaw)
+    else
+        all_pids=$(ps aux | grep -v grep | grep "openclaw" | awk '{print $2}' | tr '\n' ' ')
+    fi
+    
     local pid
     pid=$(get_openclaw_pid)
     
     # 检查服务状态
-    log_info "检查 OpenClaw 服务状态..."
-    if [ -z "$pid" ]; then
-        # 即使找不到 PID，也检查端口是否还在监听
+    if [ -z "$pid" ] && [ -z "$all_pids" ]; then
+        # 没有进程，检查端口
         if check_port "$PORT"; then
             log_warn "端口 $PORT 仍在监听，但无法获取 PID，尝试备选停止方案..."
             # 尝试通过 fuser 直接通过端口杀进程
@@ -164,38 +176,43 @@ stop_docker() {
             # 尝试通过 pkill 停止 openclaw 相关进程
             if check_port "$PORT"; then
                 log_info "使用 pkill 停止 openclaw 进程..."
-                pkill -f "openclaw" &>/dev/null || true
+                pkill -9 -f "openclaw" &>/dev/null || true
                 sleep 2
             fi
-            # 最终验证
-            if ! check_port "$PORT"; then
-                log_info "OpenClaw 服务已停止（通过备选方案）。"
-                log_info "服务已成功停止。"
-                log_info "Success"
-                exit 0
-            else
-                log_error "OpenClaw 服务停止失败！所有停止方案均无效。"
-                exit 1
-            fi
         fi
-        log_warn "OpenClaw 服务未在运行。"
-        exit 0
+        
+        if ! check_port "$PORT" && [ -z "$(ps aux | grep -v grep | grep 'openclaw' | awk '{print $2}')" ]; then
+            log_warn "OpenClaw 服务未在运行。"
+            exit 0
+        else
+            log_error "OpenClaw 服务停止失败！"
+            exit 1
+        fi
     fi
     
-    log_info "OpenClaw 服务正在运行（PID: $pid），准备停止..."
+    log_info "发现 OpenClaw 进程: $all_pids"
     
-    # 停止服务：先发送 SIGTERM（优雅停止）
+    # 停止所有 openclaw 进程：先发送 SIGTERM（优雅停止）
     log_info "正在停止 OpenClaw 服务（发送 SIGTERM）..."
-    kill "$pid" &>/dev/null || true
+    for p in $all_pids; do
+        kill "$p" &>/dev/null || true
+    done
     
-    # 等待服务完全停止（最多 10 秒），使用端口双重验证
+    # 等待服务完全停止（最多 10 秒）
     local elapsed=0
     while [ $elapsed -lt 10 ]; do
-        # 双重验证：检查 PID 和端口
-        local current_pid
-        current_pid=$(get_openclaw_pid)
-        if [ -z "$current_pid" ] && ! check_port "$PORT"; then
-            log_info "OpenClaw 服务停止成功！（PID 和端口均已关闭）"
+        # 检查是否还有 openclaw 进程
+        local remaining_pids=""
+        if command -v pgrep &>/dev/null; then
+            remaining_pids=$(pgrep -f "openclaw" | tr '\n' ' ')
+        elif command -v pidof &>/dev/null; then
+            remaining_pids=$(pidof openclaw)
+        else
+            remaining_pids=$(ps aux | grep -v grep | grep "openclaw" | awk '{print $2}' | tr '\n' ' ')
+        fi
+        
+        if [ -z "$remaining_pids" ] && ! check_port "$PORT"; then
+            log_info "OpenClaw 服务停止成功！（所有进程已退出，端口已关闭）"
             log_info "服务已成功停止。"
             log_info "Success"
             exit 0
@@ -206,17 +223,24 @@ stop_docker() {
     
     # 如果还在运行，强制停止（SIGKILL）
     log_warn "服务未在 10 秒内停止，正在强制停止..."
-    kill -9 "$pid" &>/dev/null || true
-    
-    # 额外：尝试 pkill 确保所有相关进程都被停止
+    for p in $all_pids; do
+        kill -9 "$p" &>/dev/null || true
+    done
     pkill -9 -f "openclaw" &>/dev/null || true
     
     # 等待进程消失（最多 5 秒）
     elapsed=0
     while [ $elapsed -lt 5 ]; do
-        local current_pid
-        current_pid=$(get_openclaw_pid)
-        if [ -z "$current_pid" ] && ! check_port "$PORT"; then
+        local remaining_pids=""
+        if command -v pgrep &>/dev/null; then
+            remaining_pids=$(pgrep -f "openclaw" | tr '\n' ' ')
+        elif command -v pidof &>/dev/null; then
+            remaining_pids=$(pidof openclaw)
+        else
+            remaining_pids=$(ps aux | grep -v grep | grep "openclaw" | awk '{print $2}' | tr '\n' ' ')
+        fi
+        
+        if [ -z "$remaining_pids" ] && ! check_port "$PORT"; then
             log_info "OpenClaw 服务已强制停止。"
             log_info "服务已成功停止。"
             log_info "Success"
@@ -227,21 +251,26 @@ stop_docker() {
     done
     
     # 最终验证
-    local current_pid
-    current_pid=$(get_openclaw_pid)
-    if [ -z "$current_pid" ] && ! check_port "$PORT"; then
+    local remaining_pids=""
+    if command -v pgrep &>/dev/null; then
+        remaining_pids=$(pgrep -f "openclaw" | tr '\n' ' ')
+    elif command -v pidof &>/dev/null; then
+        remaining_pids=$(pidof openclaw)
+    else
+        remaining_pids=$(ps aux | grep -v grep | grep "openclaw" | awk '{print $2}' | tr '\n' ' ')
+    fi
+    
+    if [ -z "$remaining_pids" ] && ! check_port "$PORT"; then
         log_info "OpenClaw 服务已停止。"
         log_info "服务已成功停止。"
         log_info "Success"
         exit 0
-    elif check_port "$PORT"; then
-        log_error "OpenClaw 服务停止失败！端口 $PORT 仍在监听。"
+    elif [ -n "$remaining_pids" ]; then
+        log_error "OpenClaw 服务停止失败！进程仍然存在: $remaining_pids"
         exit 1
     else
-        log_info "OpenClaw 服务已停止（端口已关闭）。"
-        log_info "服务已成功停止。"
-        log_info "Success"
-        exit 0
+        log_error "OpenClaw 服务停止失败！端口 $PORT 仍在监听。"
+        exit 1
     fi
 }
 
