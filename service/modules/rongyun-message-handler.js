@@ -326,9 +326,20 @@ class RongyunMessageHandler {
       // 获取 OpenClaw 运行状态（检查端口 18789）
       const openClawStatus = await getOpenClawStatus();
       
-      // 构建精简状态数据（避免超过融云 128KB 限制）
+      // 构建状态数据
+      // openClawStatus: 1=端口监听正常, 2=进程存在但端口未监听, 0=未运行
+      let statusMessage;
+      if (openClawStatus === 1) {
+        statusMessage = '运行中';
+      } else if (openClawStatus === 2) {
+        statusMessage = '运行中(端口异常)';
+      } else {
+        statusMessage = '未运行';
+      }
+      
       const statusData = {
-        open_claw_status: openClawStatus,  // 1=运行中, 0=未运行
+        open_claw_status: openClawStatus,  // 1=运行中, 2=进程存在但端口未监听, 0=未运行
+        status_message: statusMessage,
         mac_address: getMacAddress(),
         version: '0.0.20',
         timestamp: Date.now(),

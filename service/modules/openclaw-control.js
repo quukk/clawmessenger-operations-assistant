@@ -128,7 +128,7 @@ async function verifyCommandResult(command, result, scriptOutput = '') {
     // 等待 3 秒后验证端口
     await new Promise(resolve => setTimeout(resolve, 3000));
     const portStatus = await getOpenClawStatus(18789);
-    console.log(`[OpenClawControl] 停止后端口状态: ${portStatus === 1 ? '运行中' : '未运行'}`);
+    console.log(`[OpenClawControl] 停止后端口状态: ${portStatus}`);
     
     if (portStatus === 1) {
       // 端口仍在监听，但检查脚本是否报告已停止
@@ -144,6 +144,13 @@ async function verifyCommandResult(command, result, scriptOutput = '') {
         status: OpenClawServiceStatus.ERROR,
         message: '停止失败: 服务仍在运行'
       };
+    } else if (portStatus === 2) {
+      // 进程存在但端口未监听，可能服务正在停止中
+      console.warn(`[OpenClawControl] 警告: openclaw 进程仍存在但端口已关闭。`);
+      return {
+        status: result.status,
+        message: result.message + ' (警告: 进程仍存在)'
+      };
     }
   } else if (command === OpenClawCommandEnum.START || command === OpenClawCommandEnum.RESTART) {
     // 等待服务启动
@@ -154,14 +161,14 @@ async function verifyCommandResult(command, result, scriptOutput = '') {
     while (attempts < maxWait) {
       await new Promise(resolve => setTimeout(resolve, 2000));
       portStatus = await getOpenClawStatus(18789);
-      if (portStatus === 1) break;
+      if (portStatus === 1 || portStatus === 2) break; // 端口监听或进程存在都算成功
       attempts++;
     }
     
-    console.log(`[OpenClawControl] ${getCommandName(command)}后端口状态: ${portStatus === 1 ? '运行中' : '未运行'}`);
+    console.log(`[OpenClawControl] ${getCommandName(command)}后端口状态: ${portStatus}`);
     
     if (portStatus === 0) {
-      // 端口未监听，但检查脚本是否报告成功（可能是服务绑定到其他接口）
+      // 端口未监听且进程不存在，但检查脚本是否报告成功
       if (outputUpper.includes('SUCCESS') || outputUpper.includes('ALREADY RUNNING')) {
         console.warn(`[OpenClawControl] 警告: 端口检查失败，但脚本报告成功。服务可能绑定到其他网络接口。`);
         // 信任脚本结果，但添加警告
@@ -173,6 +180,13 @@ async function verifyCommandResult(command, result, scriptOutput = '') {
       return {
         status: OpenClawServiceStatus.ERROR,
         message: `${getCommandName(command)}失败: 服务未运行`
+      };
+    } else if (portStatus === 2) {
+      // 进程存在但端口未监听，服务可能在启动中或绑定到其他地址
+      console.warn(`[OpenClawControl] 警告: openclaw 进程存在但端口 ${portStatus} 未监听。`);
+      return {
+        status: result.status === OpenClawServiceStatus.START_SUCCESS ? result.status : OpenClawServiceStatus.START_SUCCESS,
+        message: result.message + ' (进程已启动，端口检查可能不准确)'
       };
     }
   }
