@@ -314,9 +314,12 @@ class ScriptExecutor {
       if (upper.includes(kw.toUpperCase())) return true;
     }
 
-    // 对于 START 命令，不提前返回，让脚本完整执行
-    // 因为 start.bat 有等待循环，需要完整输出才能判断状态
-    if (command === OpenClawCommandEnum.START) {
+    // 对于 START/STOP/RESTART 命令，不提前返回
+    // 让脚本完整执行到 exit，由 exit code 判断成功失败
+    // 提前返回可能导致 kill 命令未执行完成
+    if (command === OpenClawCommandEnum.START ||
+        command === OpenClawCommandEnum.STOP ||
+        command === OpenClawCommandEnum.RESTART) {
       return false;
     }
 

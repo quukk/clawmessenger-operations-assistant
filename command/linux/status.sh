@@ -36,10 +36,24 @@ SERVICE_NAME="openclaw-gateway.service"
 PORT="18789"
 
 # 检测是否在 Docker 环境（无 systemd）
+# 注意：某些 Docker 镜像安装了 systemctl 命令但无法使用
+# 所以同时检查 systemd 是否实际运行
 is_docker() {
+    # 方法1: 检查 systemctl 是否可用
     if ! command -v systemctl &>/dev/null; then
         return 0  # 无 systemctl，认为是 Docker
     fi
+    
+    # 方法2: 即使安装了 systemctl，检查 systemd 是否实际运行
+    if [ ! -d "/run/systemd/system" ] && [ ! -d "/sys/fs/cgroup/systemd" ]; then
+        return 0  # systemd 未运行，认为是 Docker
+    fi
+    
+    # 方法3: 尝试执行 systemctl status，如果失败则认为是 Docker
+    if ! systemctl status &>/dev/null; then
+        return 0  # systemctl 无法使用，认为是 Docker
+    fi
+    
     return 1
 }
 
@@ -126,6 +140,7 @@ get_openclaw_pid() {
 }
 
 # 检查端口是否监听
+# 注意：只检查端口，不检查进程。进程存在不等于端口在监听。
 check_port() {
     local port=$1
     if command -v ss &>/dev/null; then
@@ -140,11 +155,9 @@ check_port() {
     elif command -v fuser &>/dev/null; then
         fuser $port/tcp 2>/dev/null | grep -q '[0-9]'
         return $?
-    else
-        # 降级：直接检查进程
-        [ -n "$(get_openclaw_pid)" ]
-        return $?
     fi
+    # 如果所有工具都不可用，无法准确检查端口，保守返回 1（端口未监听）
+    return 1
 }
 
 # Docker 模式：查看状态
