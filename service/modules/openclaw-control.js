@@ -136,33 +136,29 @@ async function verifyCommandResult(command, result, scriptOutput = '') {
   }
   
   if (command === OpenClawCommandEnum.STOP) {
-    // 等待 3 秒后验证端口
-    await new Promise(resolve => setTimeout(resolve, 3000));
-    const portStatus = await getOpenClawStatus(18789);
-    console.log(`[OpenClawControl] 停止后端口状态: ${portStatus}`);
+    // 停止命令验证：多次检查端口，处理看门狗自动重启的情况
+    console.log(`[OpenClawControl] 开始验证停止结果...`);
+    
+    let portStatus = 1;
+    let checkCount = 0;
+    const maxChecks = 5; // 最多检查 5 次
+    
+    while (checkCount < maxChecks && portStatus === 1) {
+      await new Promise(resolve => setTimeout(resolve, 3000)); // 每次等待 3 秒
+      portStatus = await getOpenClawStatus(18789);
+      console.log(`[OpenClawControl] 停止验证第 ${checkCount + 1} 次检查，端口状态: ${portStatus}`);
+      checkCount++;
+    }
     
     if (portStatus === 1) {
-      // 端口仍在监听，但检查脚本是否报告已停止
-      if (outputUpper.includes('SUCCESS') || outputUpper.includes('STOPPED')) {
-        console.warn(`[OpenClawControl] 警告: 端口仍在监听，但脚本报告成功。可能是僵尸进程或服务未正确停止。`);
-        // 仍然返回成功，但附带警告信息
-        return {
-          status: result.status,
-          message: result.message + ' (警告: 端口仍在监听)'
-        };
-      }
+      console.error(`[OpenClawControl] 停止失败: 经过 ${maxChecks} 次检查，端口 18789 仍在监听。服务可能被看门狗自动重启。`);
       return {
         status: OpenClawServiceStatus.ERROR,
-        message: '停止失败: 服务仍在运行'
-      };
-    } else if (portStatus === 2) {
-      // 进程存在但端口未监听，可能服务正在停止中
-      console.warn(`[OpenClawControl] 警告: openclaw 进程仍存在但端口已关闭。`);
-      return {
-        status: result.status,
-        message: result.message + ' (警告: 进程仍存在)'
+        message: '停止失败: 服务仍在运行（可能被自动重启）'
       };
     }
+    
+    console.log(`[OpenClawControl] 停止验证通过: 端口已关闭`);
   } else if (command === OpenClawCommandEnum.START || command === OpenClawCommandEnum.RESTART) {
     // 等待服务启动
     const maxWait = command === OpenClawCommandEnum.START ? 30 : 60;
