@@ -103,11 +103,16 @@ class ScriptExecutor {
         console.log(`[ScriptExecutor] 停止脚本退出码非零(${exitCode})，返回错误`);
         return { 
           status: OpenClawServiceStatus.ERROR, 
-          message: `停止失败: 脚本退出码 ${exitCode}` 
+          message: `停止失败: 脚本退出码 ${exitCode}`,
+          output: fullOutput
         };
       }
       
-      return result;
+      // 返回结果时附带原始输出
+      return {
+        ...result,
+        output: fullOutput
+      };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return { status: OpenClawServiceStatus.ERROR, message: `执行异常: ${msg}` };

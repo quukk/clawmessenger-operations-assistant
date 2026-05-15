@@ -85,30 +85,44 @@ async function manageWithServiceManager(command) {
 
 /**
  * 使用 ScriptExecutor 执行脚本（Docker 模式）
+ * @returns {Object} { result, output }
  */
 async function executeWithScript(command) {
   const executor = getExecutor();
   const scriptName = getScriptName(command);
   
   try {
-    return await executor.executeWithStatus(command, scriptName);
+    const result = await executor.executeWithStatus(command, scriptName);
+    // ScriptExecutor 现在返回 { status, message, output }
+    return { 
+      result: { status: result.status, message: result.message },
+      output: result.output || ''
+    };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.log(`[OpenClawControl] 脚本执行异常: ${msg}`);
     return {
-      status: OpenClawServiceStatus.ERROR,
-      message: `执行异常: ${msg}`
+      result: {
+        status: OpenClawServiceStatus.ERROR,
+        message: `执行异常: ${msg}`
+      },
+      output: ''
     };
   }
 }
 
 /**
  * 验证命令执行结果
+ * 
+ * 注意：在 Docker 环境中，端口检查可能不可靠（服务可能绑定到特定网络接口）
+ * 因此，如果脚本输出明确指示成功，但端口检查失败，会给出警告但保留脚本结果
  */
-async function verifyCommandResult(command, result) {
+async function verifyCommandResult(command, result, scriptOutput = '') {
   if (result.status === OpenClawServiceStatus.ERROR) {
     return result;
   }
+  
+  const outputUpper = (scriptOutput || '').toUpperCase();
   
   if (command === OpenClawCommandEnum.STOP) {
     // 等待 3 秒后验证端口
@@ -117,6 +131,15 @@ async function verifyCommandResult(command, result) {
     console.log(`[OpenClawControl] 停止后端口状态: ${portStatus === 1 ? '运行中' : '未运行'}`);
     
     if (portStatus === 1) {
+      // 端口仍在监听，但检查脚本是否报告已停止
+      if (outputUpper.includes('SUCCESS') || outputUpper.includes('STOPPED')) {
+        console.warn(`[OpenClawControl] 警告: 端口仍在监听，但脚本报告成功。可能是僵尸进程或服务未正确停止。`);
+        // 仍然返回成功，但附带警告信息
+        return {
+          status: result.status,
+          message: result.message + ' (警告: 端口仍在监听)'
+        };
+      }
       return {
         status: OpenClawServiceStatus.ERROR,
         message: '停止失败: 服务仍在运行'
@@ -138,6 +161,15 @@ async function verifyCommandResult(command, result) {
     console.log(`[OpenClawControl] ${getCommandName(command)}后端口状态: ${portStatus === 1 ? '运行中' : '未运行'}`);
     
     if (portStatus === 0) {
+      // 端口未监听，但检查脚本是否报告成功（可能是服务绑定到其他接口）
+      if (outputUpper.includes('SUCCESS') || outputUpper.includes('ALREADY RUNNING')) {
+        console.warn(`[OpenClawControl] 警告: 端口检查失败，但脚本报告成功。服务可能绑定到其他网络接口。`);
+        // 信任脚本结果，但添加警告
+        return {
+          status: result.status,
+          message: result.message + ' (警告: 端口检查可能不准确)'
+        };
+      }
       return {
         status: OpenClawServiceStatus.ERROR,
         message: `${getCommandName(command)}失败: 服务未运行`
@@ -160,12 +192,15 @@ async function executeCommand(command, window, sendResponse) {
   }
   
   // 如果 ServiceManager 失败或不是 Linux/macOS，使用脚本方式
+  let scriptOutput = '';
   if (!result) {
-    result = await executeWithScript(command);
+    const scriptResult = await executeWithScript(command);
+    result = scriptResult.result;
+    scriptOutput = scriptResult.output;
   }
   
-  // 验证结果
-  result = await verifyCommandResult(command, result);
+  // 验证结果（传递脚本输出用于后备检查）
+  result = await verifyCommandResult(command, result, scriptOutput);
 
   // 输出日志
   if (result.status === OpenClawServiceStatus.START_SUCCESS ||
