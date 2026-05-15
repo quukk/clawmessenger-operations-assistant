@@ -208,6 +208,7 @@ stop_docker() {
         log_info "OpenClaw 服务已停止。"
         log_info "服务已成功停止。"
         log_info "Success"
+        exit 0
     elif check_port "$PORT"; then
         log_error "OpenClaw 服务停止失败！端口 $PORT 仍在监听。"
         exit 1
@@ -215,6 +216,7 @@ stop_docker() {
         log_info "OpenClaw 服务已停止（端口已关闭）。"
         log_info "服务已成功停止。"
         log_info "Success"
+        exit 0
     fi
 }
 

@@ -88,14 +88,26 @@ class ScriptExecutor {
     const scriptPath = path.join(this.scriptDir, scriptName);
 
     try {
-      const { stdout, stderr } = await this.runScript(scriptPath);
+      const { stdout, stderr, exitCode } = await this.runScript(scriptPath);
       const fullOutput = stdout + stderr;
       
       // 调试日志：记录脚本实际输出
       console.log(`[ScriptExecutor] 执行脚本: ${scriptPath}`);
       console.log(`[ScriptExecutor] ${scriptName} 输出:\n${fullOutput}`);
+      console.log(`[ScriptExecutor] ${scriptName} 退出码: ${exitCode}`);
       
-      return this.parseStatus(command, fullOutput);
+      const result = this.parseStatus(command, fullOutput);
+      
+      // 对于 STOP 命令，如果脚本退出码非零，强制返回错误
+      if (command === OpenClawCommandEnum.STOP && exitCode !== 0) {
+        console.log(`[ScriptExecutor] 停止脚本退出码非零(${exitCode})，返回错误`);
+        return { 
+          status: OpenClawServiceStatus.ERROR, 
+          message: `停止失败: 脚本退出码 ${exitCode}` 
+        };
+      }
+      
+      return result;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return { status: OpenClawServiceStatus.ERROR, message: `执行异常: ${msg}` };
@@ -239,7 +251,7 @@ class ScriptExecutor {
             killed = true;
             clearTimeout(timer);
             this.killProcessTree(child);
-            resolve({ stdout, stderr });
+            resolve({ stdout, stderr, exitCode: 0 });
           }
         }
       });
@@ -252,7 +264,7 @@ class ScriptExecutor {
             killed = true;
             clearTimeout(timer);
             this.killProcessTree(child);
-            resolve({ stdout, stderr });
+            resolve({ stdout, stderr, exitCode: 0 });
           }
         }
       });
@@ -271,7 +283,7 @@ class ScriptExecutor {
           killed = true;
           clearTimeout(timer);
           console.log(`[ScriptExecutor] 脚本退出，code=${code}, stdout长度=${stdout.length}`);
-          resolve({ stdout, stderr });
+          resolve({ stdout, stderr, exitCode: code });
         }
       });
       
@@ -281,7 +293,7 @@ class ScriptExecutor {
           killed = true;
           clearTimeout(timer);
           console.log(`[ScriptExecutor] 脚本关闭，code=${code}, stdout长度=${stdout.length}`);
-          resolve({ stdout, stderr });
+          resolve({ stdout, stderr, exitCode: code });
         }
       });
       
