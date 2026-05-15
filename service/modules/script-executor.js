@@ -347,6 +347,7 @@ class ScriptExecutor {
 
     if (
       upper.includes('OPENCLAW COMMAND NOT FOUND') ||
+      upper.includes('OPENCLAW 命令未找到') ||
       output.includes('服务 openclaw-gateway.service 未安装') ||
       output.includes('服务 openclaw-gateway.service 不存在') ||
       upper.includes('OPENCLAW-GATEWAY.SERVICE 不存在')

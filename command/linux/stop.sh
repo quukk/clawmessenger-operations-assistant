@@ -42,27 +42,79 @@ PORT="18789"
 # 检查端口是否监听
 check_port() {
     local port=$1
-    if command -v netstat &>/dev/null; then
-        netstat -tnlp 2>/dev/null | grep -q ":$port "
+    if command -v ss &>/dev/null; then
+        ss -tln 2>/dev/null | grep -q ":$port "
+        return $?
+    elif command -v netstat &>/dev/null; then
+        netstat -tln 2>/dev/null | grep -q ":$port "
+        return $?
+    elif command -v lsof &>/dev/null; then
+        lsof -i :$port 2>/dev/null | grep -q LISTEN
+        return $?
+    elif command -v fuser &>/dev/null; then
+        fuser $port/tcp 2>/dev/null | grep -q '[0-9]'
+        return $?
     else
-        # 降级：直接检查进程
+        # 最后降级：直接检查进程
         [ -n "$(get_openclaw_pid)" ]
+        return $?
     fi
 }
 
 # 获取 openclaw 进程 PID
 get_openclaw_pid() {
-    # 只通过端口查找进程（最可靠，避免僵尸进程和误匹配）
-    if command -v netstat &>/dev/null; then
-        local pid
-        pid=$(netstat -tnlp 2>/dev/null | grep ":18789 " | head -1 | awk '{print $7}' | cut -d'/' -f1)
+    local port=18789
+    local pid=""
+    
+    # 按优先级尝试多种工具（适配精简 Docker 镜像）
+    if command -v lsof &>/dev/null; then
+        pid=$(lsof -i :${port} -t 2>/dev/null | head -1)
         if [ -n "$pid" ]; then
             echo "$pid"
             return
         fi
     fi
     
-    # 没有监听端口，返回空（不再使用 pgrep 避免误匹配）
+    if command -v fuser &>/dev/null; then
+        pid=$(fuser ${port}/tcp 2>/dev/null | tr -d ' ')
+        if [ -n "$pid" ]; then
+            echo "$pid"
+            return
+        fi
+    fi
+    
+    if command -v ss &>/dev/null; then
+        pid=$(ss -tlnp 2>/dev/null | grep ":${port} " | head -1 | sed -n 's/.*pid=\\([0-9]*\\).*/\\1/p')
+        if [ -n "$pid" ]; then
+            echo "$pid"
+            return
+        fi
+    fi
+    
+    if command -v netstat &>/dev/null; then
+        pid=$(netstat -tnlp 2>/dev/null | grep ":${port} " | head -1 | awk '{print $7}' | cut -d'/' -f1)
+        if [ -n "$pid" ]; then
+            echo "$pid"
+            return
+        fi
+    fi
+    
+    # 最后尝试 /proc 文件系统（最可靠，无需外部工具）
+    for proc_dir in /proc/[0-9]*; do
+        if [ -d "$proc_dir/fd" ]; then
+            for fd in $proc_dir/fd/*; do
+                if [ -L "$fd" ]; then
+                    local target
+                    target=$(readlink "$fd" 2>/dev/null)
+                    if [ -n "$target" ] && echo "$target" | grep -q ":${port}"; then
+                        basename "$proc_dir"
+                        return
+                    fi
+                fi
+            done
+        fi
+    done
+    
     echo ""
 }
 
