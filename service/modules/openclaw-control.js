@@ -136,25 +136,24 @@ async function verifyCommandResult(command, result, scriptOutput = '') {
   }
   
   if (command === OpenClawCommandEnum.STOP) {
-    // 停止命令验证：多次检查端口，处理看门狗自动重启的情况
+    // 停止命令验证：多次检查端口并重复执行停止，处理看门狗自动重启
     console.log(`[OpenClawControl] 开始验证停止结果...`);
     
     let portStatus = 1;
-    let checkCount = 0;
-    const maxChecks = 5; // 最多检查 5 次
+    let stopAttempts = 0;
+    const maxStopAttempts = 3; // 最多执行 3 次停止
     
-    while (checkCount < maxChecks && portStatus === 1) {
-      await new Promise(resolve => setTimeout(resolve, 3000)); // 每次等待 3 秒
-      portStatus = await getOpenClawStatus(18789);
-      console.log(`[OpenClawControl] 停止验证第 ${checkCount + 1} 次检查，端口状态: ${portStatus}`);
-      checkCount++;
-    }
+    // 等待 3 秒，给看门狗一次重启机会，然后验证
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    
+    portStatus = await getOpenClawStatus(18789);
+    console.log(`[OpenClawControl] 停止后端口状态: ${portStatus}`);
     
     if (portStatus === 1) {
-      console.error(`[OpenClawControl] 停止失败: 经过 ${maxChecks} 次检查，端口 18789 仍在监听。服务可能被看门狗自动重启。`);
+      console.error(`[OpenClawControl] 停止失败: 端口 18789 仍在监听。stop.sh 可能未能成功停止服务。`);
       return {
         status: OpenClawServiceStatus.ERROR,
-        message: '停止失败: 服务仍在运行（可能被自动重启）'
+        message: '停止失败: 服务仍在运行'
       };
     }
     

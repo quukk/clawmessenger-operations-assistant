@@ -7,6 +7,9 @@
 # 注意：不使用 set -e，因为我们已经实现了完善的错误处理和验证逻辑
 # set -e 可能导致 pgrep/pidof 找不到进程时脚本意外退出
 
+# 调试模式：记录每条执行的命令（用于排查问题）
+# set -x
+
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -161,16 +164,20 @@ get_openclaw_pid() {
 
 # Docker 模式：停止服务
 stop_docker() {
+    log_info "=== OpenClaw Docker 停止模式 ==="
     log_info "检查 OpenClaw 服务状态..."
     
     # 获取所有 openclaw 进程 PID
     local all_pids=""
     if command -v pgrep &>/dev/null; then
         all_pids=$(pgrep -f "openclaw" | tr '\n' ' ')
+        log_info "使用 pgrep 查找进程: $all_pids"
     elif command -v pidof &>/dev/null; then
         all_pids=$(pidof openclaw)
+        log_info "使用 pidof 查找进程: $all_pids"
     else
         all_pids=$(ps aux | grep -v grep | grep "openclaw" | awk '{print $2}' | tr '\n' ' ')
+        log_info "使用 ps 查找进程: $all_pids"
     fi
     
     local pid
@@ -209,14 +216,23 @@ stop_docker() {
     # 直接发送 SIGKILL（强制停止），避免 SIGTERM 被忽略
     log_info "正在强制停止 OpenClaw 服务（SIGKILL）..."
     for p in $all_pids; do
-        kill -9 "$p" 2>/dev/null || true
+        log_info "执行: kill -9 $p"
+        kill -9 "$p" 2>/dev/null || log_warn "kill -9 $p 失败"
     done
     # 额外使用 pkill 确保所有相关进程都被停止
-    pkill -9 -f "openclaw" 2>/dev/null || true
+    log_info "执行: pkill -9 -f openclaw"
+    pkill -9 -f "openclaw" 2>/dev/null || log_warn "pkill 失败"
+    log_info "执行: killall -9 openclaw"
+    killall -9 openclaw 2>/dev/null || log_warn "killall 失败"
     
-    # 等待进程退出（最多 3 秒）
+    # 连续监控模式：每秒检查并杀死看门狗重启的进程
+    # 这样即使看门狗立即重启，也会被再次杀死
+    log_info "进入连续监控模式（最多 10 秒），防止看门狗自动重启..."
     local elapsed=0
-    while [ $elapsed -lt 3 ]; do
+    local consecutive_empty=0
+    while [ $elapsed -lt 10 ]; do
+        sleep 1
+        
         # 检查是否还有 openclaw 进程
         local remaining_pids=""
         if command -v pgrep &>/dev/null; then
@@ -228,22 +244,26 @@ stop_docker() {
         fi
         
         if [ -z "$remaining_pids" ]; then
-            log_info "OpenClaw 服务已停止。（所有进程已退出）"
-            log_info "服务已成功停止。"
-            log_info "Success"
-            exit 0
+            consecutive_empty=$((consecutive_empty + 1))
+            log_info "第 $elapsed 秒: 无 openclaw 进程（连续 $consecutive_empty 次）"
+            # 连续 2 秒没有进程，认为已停止
+            if [ $consecutive_empty -ge 2 ]; then
+                log_info "OpenClaw 服务已停止。（看门狗已放弃重启）"
+                log_info "服务已成功停止。"
+                log_info "Success"
+                exit 0
+            fi
+        else
+            consecutive_empty=0
+            log_info "第 $elapsed 秒: 发现新进程 $remaining_pids，再次 kill..."
+            pkill -9 -f "openclaw" 2>/dev/null || true
+            killall -9 openclaw 2>/dev/null || true
         fi
-        sleep 1
+        
         elapsed=$((elapsed + 1))
     done
     
-    # 如果进程仍在，再次强制停止
-    log_warn "进程仍在运行，再次强制停止..."
-    pkill -9 -f "openclaw" 2>/dev/null || true
-    killall -9 openclaw 2>/dev/null || true
-    
-    # 最终检查
-    sleep 2
+    # 最终验证
     local remaining_pids=""
     if command -v pgrep &>/dev/null; then
         remaining_pids=$(pgrep -f "openclaw" | tr '\n' ' ')
@@ -251,6 +271,15 @@ stop_docker() {
         remaining_pids=$(pidof openclaw)
     else
         remaining_pids=$(ps aux | grep -v grep | grep "openclaw" | awk '{print $2}' | tr '\n' ' ')
+    fi
+    
+    # 最终验证：显示当前所有进程
+    log_info "最终验证: 当前 openclaw 进程: $remaining_pids"
+    log_info "最终验证: 当前端口状态:"
+    if command -v netstat &>/dev/null; then
+        netstat -tlnp 2>/dev/null | grep ":${PORT} " || log_info "端口 ${PORT} 未监听"
+    elif command -v ss &>/dev/null; then
+        ss -tlnp 2>/dev/null | grep ":${PORT} " || log_info "端口 ${PORT} 未监听"
     fi
     
     if [ -z "$remaining_pids" ]; then

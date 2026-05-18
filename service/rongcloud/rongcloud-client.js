@@ -42,7 +42,7 @@ class RongCloudClient {
     // 注册 command 自定义消息类型（与前端对齐）
     try {
       if (typeof RongIMLib.registerMessageType === 'function') {
-        this.SystemServiceMessage = RongIMLib.registerMessageType('command', true, false);
+        this.SystemServiceMessage = RongIMLib.registerMessageType('command', false, false);
         this.log?.info('[RongCloudClient] command 自定义消息类型已注册');
       } else {
         this.log?.warn('[RongCloudClient] SDK 不支持 registerMessageType');
