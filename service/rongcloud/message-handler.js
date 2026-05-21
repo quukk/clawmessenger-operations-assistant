@@ -507,33 +507,74 @@ class MessageHandler {
 
     // 图片消息
     if (msgType === 'RC:ImgMsg') {
-      const imageUri = content?.imageUri || content?.imageUrl || content?.url || '';
+      // content 可能是对象（包含 imageUri）或字符串（base64 缩略图）
+      let imageUri = '';
+      
+      if (typeof content === 'string') {
+        // content 是 base64 缩略图，需要查找其他字段获取 URL
+        imageUri = msg.imageUri || msg.imageUrl || msg.url || msg.localPath || '';
+      } else if (typeof content === 'object' && content !== null) {
+        // content 是对象，包含 imageUri
+        imageUri = content.imageUri || content.imageUrl || content.url || '';
+      }
+      
       this.log?.info(`[_extractMessageContent] 图片消息: imageUri=${imageUri}`);
+      
+      if (!imageUri) {
+        return '[图片]（无法获取图片地址）';
+      }
+      
       return `[图片] ${imageUri}`;
     }
 
     // 视频消息
     if (msgType === 'RC:SightMsg') {
-      const sightUrl = content?.sightUrl || content?.url || '';
-      const name = content?.name || '未知视频';
-      const duration = content?.duration || 0;
+      let sightUrl = '';
+      let name = '未知视频';
+      let duration = 0;
+      
+      if (typeof content === 'object' && content !== null) {
+        sightUrl = content.sightUrl || content.url || '';
+        name = content.name || '未知视频';
+        duration = content.duration || 0;
+      } else {
+        sightUrl = msg.sightUrl || msg.url || msg.localPath || '';
+      }
+      
       this.log?.info(`[_extractMessageContent] 视频消息: sightUrl=${sightUrl}`);
       return `[视频] ${sightUrl} ${name} ${duration}秒`;
     }
 
     // 文件消息
     if (msgType === 'RC:FileMsg') {
-      const fileUrl = content?.fileUrl || content?.fileUri || content?.url || '';
-      const name = content?.name || '未知文件';
-      const size = content?.size || 0;
+      let fileUrl = '';
+      let name = '未知文件';
+      let size = 0;
+      
+      if (typeof content === 'object' && content !== null) {
+        fileUrl = content.fileUrl || content.fileUri || content.url || '';
+        name = content.name || '未知文件';
+        size = content.size || 0;
+      } else {
+        fileUrl = msg.fileUrl || msg.fileUri || msg.url || msg.localPath || '';
+      }
+      
       this.log?.info(`[_extractMessageContent] 文件消息: fileUrl=${fileUrl}`);
       return `[文件] ${fileUrl} ${name} ${size}`;
     }
 
     // 语音消息
     if (msgType === 'RC:HQVCMsg') {
-      const remoteUrl = content?.remoteUrl || content?.url || '';
-      const duration = content?.duration || 0;
+      let remoteUrl = '';
+      let duration = 0;
+      
+      if (typeof content === 'object' && content !== null) {
+        remoteUrl = content.remoteUrl || content.url || '';
+        duration = content.duration || 0;
+      } else {
+        remoteUrl = msg.remoteUrl || msg.url || msg.localPath || '';
+      }
+      
       this.log?.info(`[_extractMessageContent] 语音消息: remoteUrl=${remoteUrl}`);
       return `[语音] ${remoteUrl} ${duration}秒`;
     }
