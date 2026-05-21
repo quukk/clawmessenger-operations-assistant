@@ -405,11 +405,30 @@ class OpenClawClient {
       headers['Authorization'] = `Bearer ${gatewayToken}`;
     }
 
+    // 检测消息是否包含图片 URL
+    const imageUrlMatch = message.match(/\[图片\]\s*(https?:\/\/[^\s]+)/);
+    let messages;
+    
+    if (imageUrlMatch) {
+      // 多模态格式：图片 + 文本
+      const imageUrl = imageUrlMatch[1];
+      const textContent = message.replace(/\[图片\]\s*https?:\/\/[^\s]+/, '').trim();
+      
+      messages = [{
+        role: 'user',
+        content: [
+          { type: 'text', text: textContent || '描述这张图片' },
+          { type: 'image_url', image_url: { url: imageUrl } }
+        ]
+      }];
+    } else {
+      // 纯文本格式
+      messages = [{ role: 'user', content: message }];
+    }
+
     const payload = {
       model: 'openclaw',
-      messages: [
-        { role: 'user', content: message }
-      ],
+      messages: messages,
       stream: true,
       max_tokens: 2048
     };
