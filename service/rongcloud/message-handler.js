@@ -518,6 +518,16 @@ class MessageHandler {
         imageUri = content.imageUri || content.imageUrl || content.url || '';
       }
       
+      // 如果还是没有找到 URL，尝试从 extra 字段获取
+      if (!imageUri && msg.extra) {
+        try {
+          const extraData = JSON.parse(msg.extra);
+          imageUri = extraData.imageUrl || extraData.imageUri || '';
+        } catch (e) {
+          // extra 不是 JSON，忽略
+        }
+      }
+      
       this.log?.info(`[_extractMessageContent] 图片消息: imageUri=${imageUri}`);
       
       if (!imageUri) {
