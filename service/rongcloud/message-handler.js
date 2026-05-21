@@ -3,6 +3,7 @@ const { OpenClawClient } = require('./openclaw-client');
 const { handleNormalMessage } = require('../modules/normal-message-handler');
 const { RongCloudServerAPI } = require('./rongcloud-server-api');
 const { SystemConfigManager } = require('../modules/system-config');
+const { UploadService } = require('../modules/upload-service');
 const axios = require('axios');
 const MENTION_REGEX = /@(claw_[a-zA-Z0-9]+)/g;
 
@@ -18,6 +19,9 @@ class MessageHandler {
     // 初始化融云服务端 API 客户端（直接调用融云 API，无需通过服务端代理）
     this.serverAPI = new RongCloudServerAPI(this.configManager, log);
     this.log?.info('[MessageHandler] 融云服务端 API 客户端已初始化（配置从服务端动态获取）');
+    // 初始化文件上传服务
+    this.uploadService = new UploadService(config, log);
+    this.log?.info('[MessageHandler] 文件上传服务已初始化');
     this.nodeId = config.accountId || '';
     this.handleNormalMessage = handleNormalMessage;
     this._streamQueue = Promise.resolve();
@@ -592,6 +596,21 @@ class MessageHandler {
       rawMessage: raw,
       senderId
     };
+  }
+
+  /**
+   * 上传文件（由 silent-service 代理上传）
+   * 
+   * @param {Object} options
+   * @param {string} options.filePath - 本地文件路径
+   * @param {string} options.fileType - 文件类型 (image, video, audio, file)
+   * @param {string} options.fileName - 原始文件名
+   * @param {number} options.fileSize - 文件大小
+   * @param {Function} options.onProgress - 进度回调
+   * @returns {Promise<{url: string, filename: string}>}
+   */
+  async uploadFile(options) {
+    return this.uploadService.uploadFile(options);
   }
 }
 
