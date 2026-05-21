@@ -363,10 +363,9 @@ class OpenClawClient {
     const sessionId = `clawmessenger-${fromUser}`;
 
     // 尝试多个可能的 SSE 端点，兼容不同版本 OpenClaw Gateway
-    // 注意：多模态图片必须使用 /v1/responses 端点
     const endpoints = [
-      'http://127.0.0.1:18789/v1/responses',
-      'http://127.0.0.1:18789/v1/chat/completions'
+      'http://127.0.0.1:18789/v1/chat/completions',
+      'http://127.0.0.1:18789/v1/responses'
     ];
 
     for (let i = 0; i < endpoints.length; i++) {
@@ -394,13 +393,29 @@ class OpenClawClient {
           if (err.response) {
             this.log?.error(`[OpenClawClient] 错误状态码: ${err.response.status}`);
             // 安全地提取错误信息
-            const errorData = err.response.data;
-            if (typeof errorData === 'string') {
-              this.log?.error(`[OpenClawClient] 错误响应: ${errorData}`);
-            } else if (errorData && typeof errorData === 'object') {
-              // 提取常见错误字段
-              const errorMsg = errorData.error?.message || errorData.message || errorData.error || JSON.stringify(errorData);
-              this.log?.error(`[OpenClawClient] 错误响应: ${errorMsg}`);
+            try {
+              const errorData = err.response.data;
+              if (typeof errorData === 'string') {
+                this.log?.error(`[OpenClawClient] 错误响应: ${errorData}`);
+              } else if (errorData && typeof errorData === 'object') {
+                // 检查是否是 IncomingMessage 对象（流）
+                if (errorData._readableState || errorData.socket) {
+                  // 这是一个流对象，尝试读取其中的数据
+                  const buffer = errorData._readableState?.buffer;
+                  if (buffer && buffer.length > 0) {
+                    const dataStr = buffer[0].toString('utf8');
+                    this.log?.error(`[OpenClawClient] 错误响应(流): ${dataStr}`);
+                  } else {
+                    this.log?.error(`[OpenClawClient] 错误响应(流对象，无法读取)`);
+                  }
+                } else {
+                  // 提取常见错误字段
+                  const errorMsg = errorData.error?.message || errorData.message || errorData.error || JSON.stringify(errorData);
+                  this.log?.error(`[OpenClawClient] 错误响应: ${errorMsg}`);
+                }
+              }
+            } catch (e) {
+              this.log?.error(`[OpenClawClient] 无法解析错误响应: ${e.message}`);
             }
           }
         }
@@ -462,39 +477,24 @@ class OpenClawClient {
         // 下载图片并转换为 base64
         const imageData = await this._downloadImageAsBase64(imageUrl);
         
-        if (isResponsesEndpoint) {
-          // /v1/responses 端点格式（推荐，支持多模态）
-          payload = {
-            model: 'openclaw',
-            input: [
-              { type: 'input_text', text: textContent || '描述这张图片' },
-              {
-                type: 'input_image',
-                source: {
-                  type: 'base64',
-                  media_type: imageData.mediaType,
-                  data: imageData.base64  // 纯 base64，不带 data URI 前缀
-                }
+        // 统一使用 messages 格式（OpenAI 兼容标准）
+        payload = {
+          model: 'openclaw',
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'text', text: textContent || '描述这张图片' },
+              { 
+                type: 'image_url', 
+                image_url: { 
+                  url: `data:${imageData.mediaType};base64,${imageData.base64}` 
+                } 
               }
-            ],
-            stream: true,
-            max_tokens: 2048
-          };
-        } else {
-          // /v1/chat/completions 端点格式（兼容旧版）
-          payload = {
-            model: 'openclaw',
-            messages: [{
-              role: 'user',
-              content: [
-                { type: 'text', text: textContent || '描述这张图片' },
-                { type: 'image_url', image_url: { url: `data:${imageData.mediaType};base64,${imageData.base64}` } }
-              ]
-            }],
-            stream: true,
-            max_tokens: 2048
-          };
-        }
+            ]
+          }],
+          stream: true,
+          max_tokens: 2048
+        };
       } catch (err) {
         this.log?.warn(`[OpenClawClient] 图片处理失败，回退到文本模式: ${err.message}`);
         // 回退到纯文本模式
@@ -506,24 +506,13 @@ class OpenClawClient {
         };
       }
     } else {
-      // 纯文本格式
-      if (isResponsesEndpoint) {
-        payload = {
-          model: 'openclaw',
-          input: [
-            { type: 'input_text', text: message }
-          ],
-          stream: true,
-          max_tokens: 2048
-        };
-      } else {
-        payload = {
-          model: 'openclaw',
-          messages: [{ role: 'user', content: message }],
-          stream: true,
-          max_tokens: 2048
-        };
-      }
+      // 纯文本格式 - 统一使用 messages 格式
+      payload = {
+        model: 'openclaw',
+        messages: [{ role: 'user', content: message }],
+        stream: true,
+        max_tokens: 2048
+      };
     }
 
     this.log?.info(`[OpenClawClient] SSE 请求 payload: ${JSON.stringify(payload)}`);
