@@ -507,12 +507,21 @@ class MessageHandler {
 
     // 图片消息
     if (msgType === 'RC:ImgMsg') {
-      // content 可能是对象（包含 imageUri）或字符串（base64 缩略图）
+      // content 可能是对象（包含 imageUri）或字符串（base64 缩略图或 JSON）
       let imageUri = '';
       
       if (typeof content === 'string') {
-        // content 是 base64 缩略图，需要查找其他字段获取 URL
-        imageUri = msg.imageUri || msg.imageUrl || msg.url || msg.localPath || '';
+        // 尝试解析 content 是否为 JSON（包含 imageUri）
+        try {
+          const contentObj = JSON.parse(content);
+          if (contentObj.imageUri) {
+            imageUri = contentObj.imageUri;
+          }
+        } catch (e) {
+          // content 不是 JSON，可能是 base64 缩略图
+          // 从 msg 其他字段查找 URL
+          imageUri = msg.imageUri || msg.imageUrl || msg.url || msg.localPath || '';
+        }
       } else if (typeof content === 'object' && content !== null) {
         // content 是对象，包含 imageUri
         imageUri = content.imageUri || content.imageUrl || content.url || '';
