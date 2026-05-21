@@ -363,9 +363,10 @@ class OpenClawClient {
     const sessionId = `clawmessenger-${fromUser}`;
 
     // 尝试多个可能的 SSE 端点，兼容不同版本 OpenClaw Gateway
+    // 注意：多模态图片必须使用 /v1/responses 端点
     const endpoints = [
-      'http://127.0.0.1:18789/v1/chat/completions',
-      'http://127.0.0.1:18789/v1/responses'
+      'http://127.0.0.1:18789/v1/responses',
+      'http://127.0.0.1:18789/v1/chat/completions'
     ];
 
     for (let i = 0; i < endpoints.length; i++) {
@@ -383,9 +384,9 @@ class OpenClawClient {
         }
 
         if (is404 && isLast) {
-          this.log?.error(`[OpenClawClient] 所有 SSE 端点均返回 404。OpenClaw chatCompletions 端点未启用。`);
+          this.log?.error(`[OpenClawClient] 所有 SSE 端点均返回 404。OpenClaw responses 端点未启用。`);
           this.log?.error(`[OpenClawClient] 请检查 ~/.openclaw/openclaw.json 中是否包含:`);
-          this.log?.error(`[OpenClawClient]   gateway.http.endpoints.chatCompletions.enabled = true`);
+          this.log?.error(`[OpenClawClient]   gateway.http.endpoints.responses.enabled = true`);
           this.log?.error(`[OpenClawClient] 修改后请重启 OpenClaw gateway: openclaw gateway`);
         } else {
           this.log?.error(`[OpenClawClient] SSE 请求失败: ${err.message}`);
@@ -425,7 +426,11 @@ class OpenClawClient {
       const contentType = response.headers['content-type'] || 'image/jpeg';
       this.log?.info(`[OpenClawClient] 图片下载完成: ${imageUrl}, size=${buffer.length}, type=${contentType}`);
       
-      return `data:${contentType};base64,${base64}`;
+      // 返回对象，包含纯 base64 和 MIME 类型
+      return {
+        base64: base64,
+        mediaType: contentType
+      };
     } catch (err) {
       this.log?.error(`[OpenClawClient] 图片下载失败: ${imageUrl}, ${err.message}`);
       throw err;
@@ -443,7 +448,10 @@ class OpenClawClient {
 
     // 检测消息是否包含图片 URL
     const imageUrlMatch = message.match(/\[图片\]\s*(https?:\/\/[^\s]+)/);
-    let messages;
+    let payload;
+    
+    // 判断使用哪个端点
+    const isResponsesEndpoint = apiUrl.includes('/v1/responses');
     
     if (imageUrlMatch) {
       // 多模态格式：图片 + 文本
@@ -452,31 +460,71 @@ class OpenClawClient {
       
       try {
         // 下载图片并转换为 base64
-        const base64Image = await this._downloadImageAsBase64(imageUrl);
+        const imageData = await this._downloadImageAsBase64(imageUrl);
         
-        messages = [{
-          role: 'user',
-          content: [
-            { type: 'text', text: textContent || '描述这张图片' },
-            { type: 'image_url', image_url: { url: base64Image } }
-          ]
-        }];
+        if (isResponsesEndpoint) {
+          // /v1/responses 端点格式（推荐，支持多模态）
+          payload = {
+            model: 'openclaw',
+            input: [
+              { type: 'input_text', text: textContent || '描述这张图片' },
+              {
+                type: 'input_image',
+                source: {
+                  type: 'base64',
+                  media_type: imageData.mediaType,
+                  data: imageData.base64  // 纯 base64，不带 data URI 前缀
+                }
+              }
+            ],
+            stream: true,
+            max_tokens: 2048
+          };
+        } else {
+          // /v1/chat/completions 端点格式（兼容旧版）
+          payload = {
+            model: 'openclaw',
+            messages: [{
+              role: 'user',
+              content: [
+                { type: 'text', text: textContent || '描述这张图片' },
+                { type: 'image_url', image_url: { url: `data:${imageData.mediaType};base64,${imageData.base64}` } }
+              ]
+            }],
+            stream: true,
+            max_tokens: 2048
+          };
+        }
       } catch (err) {
         this.log?.warn(`[OpenClawClient] 图片处理失败，回退到文本模式: ${err.message}`);
         // 回退到纯文本模式
-        messages = [{ role: 'user', content: message }];
+        payload = {
+          model: 'openclaw',
+          messages: [{ role: 'user', content: message }],
+          stream: true,
+          max_tokens: 2048
+        };
       }
     } else {
       // 纯文本格式
-      messages = [{ role: 'user', content: message }];
+      if (isResponsesEndpoint) {
+        payload = {
+          model: 'openclaw',
+          input: [
+            { type: 'input_text', text: message }
+          ],
+          stream: true,
+          max_tokens: 2048
+        };
+      } else {
+        payload = {
+          model: 'openclaw',
+          messages: [{ role: 'user', content: message }],
+          stream: true,
+          max_tokens: 2048
+        };
+      }
     }
-
-    const payload = {
-      model: 'openclaw',
-      messages: messages,
-      stream: true,
-      max_tokens: 2048
-    };
 
     this.log?.info(`[OpenClawClient] SSE 请求 payload: ${JSON.stringify(payload)}`);
 
