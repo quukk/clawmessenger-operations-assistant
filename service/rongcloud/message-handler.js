@@ -497,6 +497,9 @@ class MessageHandler {
     const msgType = msg.messageType;
     const content = msg.content;
 
+    // 调试：打印完整消息内容
+    this.log?.info(`[_extractMessageContent] msgType=${msgType}, content=${JSON.stringify(content).substring(0, 200)}`);
+
     // 文本消息
     if (msgType === 'RC:TxtMsg') {
       return typeof content === 'string' ? content : (content?.content || JSON.stringify(content));
@@ -504,30 +507,34 @@ class MessageHandler {
 
     // 图片消息
     if (msgType === 'RC:ImgMsg') {
-      const imageUri = content?.imageUri || '';
+      const imageUri = content?.imageUri || content?.imageUrl || content?.url || '';
+      this.log?.info(`[_extractMessageContent] 图片消息: imageUri=${imageUri}`);
       return `[图片] ${imageUri}`;
     }
 
     // 视频消息
     if (msgType === 'RC:SightMsg') {
-      const sightUrl = content?.sightUrl || '';
+      const sightUrl = content?.sightUrl || content?.url || '';
       const name = content?.name || '未知视频';
       const duration = content?.duration || 0;
+      this.log?.info(`[_extractMessageContent] 视频消息: sightUrl=${sightUrl}`);
       return `[视频] ${sightUrl} ${name} ${duration}秒`;
     }
 
     // 文件消息
     if (msgType === 'RC:FileMsg') {
-      const fileUrl = content?.fileUrl || '';
+      const fileUrl = content?.fileUrl || content?.fileUri || content?.url || '';
       const name = content?.name || '未知文件';
       const size = content?.size || 0;
+      this.log?.info(`[_extractMessageContent] 文件消息: fileUrl=${fileUrl}`);
       return `[文件] ${fileUrl} ${name} ${size}`;
     }
 
     // 语音消息
     if (msgType === 'RC:HQVCMsg') {
-      const remoteUrl = content?.remoteUrl || '';
+      const remoteUrl = content?.remoteUrl || content?.url || '';
       const duration = content?.duration || 0;
+      this.log?.info(`[_extractMessageContent] 语音消息: remoteUrl=${remoteUrl}`);
       return `[语音] ${remoteUrl} ${duration}秒`;
     }
 
