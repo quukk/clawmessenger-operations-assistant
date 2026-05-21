@@ -409,6 +409,29 @@ class OpenClawClient {
     }
   }
 
+  async _downloadImageAsBase64(imageUrl) {
+    try {
+      this.log?.info(`[OpenClawClient] 下载图片: ${imageUrl}`);
+      const response = await axios.get(imageUrl, {
+        responseType: 'arraybuffer',
+        timeout: 30000,
+        maxContentLength: 10 * 1024 * 1024 // 10MB
+      });
+      
+      const buffer = Buffer.from(response.data);
+      const base64 = buffer.toString('base64');
+      
+      // 检测 MIME 类型
+      const contentType = response.headers['content-type'] || 'image/jpeg';
+      this.log?.info(`[OpenClawClient] 图片下载完成: ${imageUrl}, size=${buffer.length}, type=${contentType}`);
+      
+      return `data:${contentType};base64,${base64}`;
+    } catch (err) {
+      this.log?.error(`[OpenClawClient] 图片下载失败: ${imageUrl}, ${err.message}`);
+      throw err;
+    }
+  }
+
   async _doChatStream(apiUrl, gatewayToken, sessionId, message, onDelta, onDone) {
     const headers = {
       'Content-Type': 'application/json',
@@ -427,13 +450,22 @@ class OpenClawClient {
       const imageUrl = imageUrlMatch[1];
       const textContent = message.replace(/\[图片\]\s*https?:\/\/[^\s]+/, '').trim();
       
-      messages = [{
-        role: 'user',
-        content: [
-          { type: 'text', text: textContent || '描述这张图片' },
-          { type: 'image_url', image_url: { url: imageUrl } }
-        ]
-      }];
+      try {
+        // 下载图片并转换为 base64
+        const base64Image = await this._downloadImageAsBase64(imageUrl);
+        
+        messages = [{
+          role: 'user',
+          content: [
+            { type: 'text', text: textContent || '描述这张图片' },
+            { type: 'image_url', image_url: { url: base64Image } }
+          ]
+        }];
+      } catch (err) {
+        this.log?.warn(`[OpenClawClient] 图片处理失败，回退到文本模式: ${err.message}`);
+        // 回退到纯文本模式
+        messages = [{ role: 'user', content: message }];
+      }
     } else {
       // 纯文本格式
       messages = [{ role: 'user', content: message }];
