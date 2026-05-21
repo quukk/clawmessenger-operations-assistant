@@ -392,10 +392,14 @@ class OpenClawClient {
           // 打印详细错误响应
           if (err.response) {
             this.log?.error(`[OpenClawClient] 错误状态码: ${err.response.status}`);
-            try {
-              this.log?.error(`[OpenClawClient] 错误响应数据: ${JSON.stringify(err.response.data)}`);
-            } catch (e) {
-              this.log?.error(`[OpenClawClient] 错误响应数据(无法JSON序列化): ${require('util').inspect(err.response.data, {depth: 2})}`);
+            // 安全地提取错误信息
+            const errorData = err.response.data;
+            if (typeof errorData === 'string') {
+              this.log?.error(`[OpenClawClient] 错误响应: ${errorData}`);
+            } else if (errorData && typeof errorData === 'object') {
+              // 提取常见错误字段
+              const errorMsg = errorData.error?.message || errorData.message || errorData.error || JSON.stringify(errorData);
+              this.log?.error(`[OpenClawClient] 错误响应: ${errorMsg}`);
             }
           }
         }
