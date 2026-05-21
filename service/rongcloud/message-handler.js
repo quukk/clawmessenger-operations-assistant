@@ -56,9 +56,9 @@ class MessageHandler {
       return false;
     }
 
-    const allowedTypes = ['RC:TxtMsg'];
+    const allowedTypes = ['RC:TxtMsg', 'RC:ImgMsg', 'RC:SightMsg', 'RC:FileMsg', 'RC:HQVCMsg'];
     if (!allowedTypes.includes(msg.messageType)) {
-      this.log?.info(`[MessageHandler] 忽略非文本消息: ${msg.messageType}`);
+      this.log?.info(`[MessageHandler] 忽略不支持的消息类型: ${msg.messageType}`);
       return false;
     }
 
@@ -253,6 +253,10 @@ class MessageHandler {
   }
 
   getMessageType(msg) {
+    // 如果是媒体消息，直接返回 NORMAL 类型
+    if (['RC:ImgMsg', 'RC:SightMsg', 'RC:FileMsg', 'RC:HQVCMsg'].includes(msg.messageType)) {
+      return MessageType.NORMAL;
+    }
     const text = typeof msg.content === 'string' ? msg.content : (msg.content?.content || '');
     if (text.startsWith('/')) {
       return MessageType.COMMAND;
@@ -324,7 +328,7 @@ class MessageHandler {
 
     try {
       // 确保传入的内容是字符串（claw 类型消息 content 可能是对象）
-      const chatContent = typeof msg.content === 'string' ? msg.content : (msg.content?.content || JSON.stringify(msg.content));
+      const chatContent = this._extractMessageContent(msg);
       this.log?.info(`[MessageHandler] 调用 chatStream, content_type=${typeof msg.content}, chatContent=${chatContent.substring(0, 50)}`);
       await this.openclawClient.chatStream(
         chatContent,
@@ -484,6 +488,51 @@ class MessageHandler {
     });
     
     await this._streamQueue;
+  }
+
+  /**
+   * 提取消息内容，支持文本、图片、视频、文件、语音
+   */
+  _extractMessageContent(msg) {
+    const msgType = msg.messageType;
+    const content = msg.content;
+
+    // 文本消息
+    if (msgType === 'RC:TxtMsg') {
+      return typeof content === 'string' ? content : (content?.content || JSON.stringify(content));
+    }
+
+    // 图片消息
+    if (msgType === 'RC:ImgMsg') {
+      const imageUri = content?.imageUri || '';
+      return `[图片] ${imageUri}`;
+    }
+
+    // 视频消息
+    if (msgType === 'RC:SightMsg') {
+      const sightUrl = content?.sightUrl || '';
+      const name = content?.name || '未知视频';
+      const duration = content?.duration || 0;
+      return `[视频] ${sightUrl} ${name} ${duration}秒`;
+    }
+
+    // 文件消息
+    if (msgType === 'RC:FileMsg') {
+      const fileUrl = content?.fileUrl || '';
+      const name = content?.name || '未知文件';
+      const size = content?.size || 0;
+      return `[文件] ${fileUrl} ${name} ${size}`;
+    }
+
+    // 语音消息
+    if (msgType === 'RC:HQVCMsg') {
+      const remoteUrl = content?.remoteUrl || '';
+      const duration = content?.duration || 0;
+      return `[语音] ${remoteUrl} ${duration}秒`;
+    }
+
+    // 兜底
+    return typeof content === 'string' ? content : JSON.stringify(content);
   }
 
   parseCommand(raw, senderId) {
