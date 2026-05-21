@@ -392,7 +392,11 @@ class OpenClawClient {
           // 打印详细错误响应
           if (err.response) {
             this.log?.error(`[OpenClawClient] 错误状态码: ${err.response.status}`);
-            this.log?.error(`[OpenClawClient] 错误响应数据: ${JSON.stringify(err.response.data)}`);
+            try {
+              this.log?.error(`[OpenClawClient] 错误响应数据: ${JSON.stringify(err.response.data)}`);
+            } catch (e) {
+              this.log?.error(`[OpenClawClient] 错误响应数据(无法JSON序列化): ${require('util').inspect(err.response.data, {depth: 2})}`);
+            }
           }
         }
         // 不再内部调用 onError，让错误通过 Promise reject 向上传播，便于调用方回退
