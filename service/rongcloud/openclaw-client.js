@@ -257,6 +257,8 @@ class OpenClawClient {
   static maxHistoryRounds = 50;
   // 单条消息最大长度（超过则截断）
   static maxMessageLength = 2000;
+  // 活跃请求管理：为每个用户跟踪当前正在进行的请求
+  static activeRequests = new Map();
 
   static async acquireSlot() {
     if (OpenClawClient.runningCount < OpenClawClient.maxConcurrency) {
@@ -414,6 +416,21 @@ class OpenClawClient {
    * @param {Function} onError - 出错时的回调 (error: Error) => void
    * @returns {Promise<void>}
    */
+  /**
+   * 取消用户的活跃请求
+   * @param {string} fromUser - 用户ID
+   */
+  cancelActiveRequest(fromUser) {
+    const activeRequest = OpenClawClient.activeRequests.get(fromUser);
+    if (activeRequest) {
+      this.log?.info(`[OpenClawClient] 取消用户 ${fromUser} 的活跃请求`);
+      activeRequest.abort();
+      OpenClawClient.activeRequests.delete(fromUser);
+      return true;
+    }
+    return false;
+  }
+
   async chatStream(message, fromUser, onDelta, onDone, onError) {
     if (!message || !message.trim()) {
       onError?.(new Error('消息内容为空'));
@@ -426,6 +443,12 @@ class OpenClawClient {
       this.log?.error('[OpenClawClient] ' + err.message);
       onError?.(err);
       return;
+    }
+
+    // 取消该用户之前的活跃请求（如果存在）
+    const hasCancelled = this.cancelActiveRequest(fromUser);
+    if (hasCancelled) {
+      this.log?.info(`[OpenClawClient] 用户 ${fromUser} 的新消息到达，已取消前一条消息的回复`);
     }
 
     this.log?.info(`[OpenClawClient] 准备 SSE 流式调用 OpenClaw，from=${fromUser}`);
@@ -445,7 +468,7 @@ class OpenClawClient {
     for (let i = 0; i < endpoints.length; i++) {
       const apiUrl = endpoints[i];
       try {
-        const fullText = await this._doChatStream(apiUrl, gatewayToken, sessionId, messagesWithHistory, onDelta, onDone);
+        const fullText = await this._doChatStream(apiUrl, gatewayToken, sessionId, fromUser, messagesWithHistory, onDelta, onDone);
         
         // 成功响应后，保存当前对话到历史记录
         this._addToHistory(fromUser, 'user', message);
@@ -453,6 +476,12 @@ class OpenClawClient {
         
         return; // 成功则直接返回
       } catch (err) {
+        // 检查是否是取消错误
+        if (err.name === 'AbortError' || err.message?.includes('aborted')) {
+          this.log?.info(`[OpenClawClient] 请求被用户取消: ${fromUser}`);
+          return;
+        }
+
         const is404 = err.response?.status === 404;
         const isLast = i === endpoints.length - 1;
 
@@ -531,7 +560,7 @@ class OpenClawClient {
     }
   }
 
-  async _doChatStream(apiUrl, gatewayToken, sessionId, messages, onDelta, onDone) {
+  async _doChatStream(apiUrl, gatewayToken, sessionId, fromUser, messages, onDelta, onDone) {
     const headers = {
       'Content-Type': 'application/json',
       'Accept': 'text/event-stream'
@@ -605,10 +634,17 @@ class OpenClawClient {
     let hasError = false;
     let errorMsg = '';
 
+    // 创建 AbortController 用于取消请求
+    const abortController = new AbortController();
+    
+    // 注册活跃请求
+    OpenClawClient.activeRequests.set(fromUser, abortController);
+
     const response = await axios.post(apiUrl, payload, {
       headers,
       responseType: 'stream',
-      timeout: 600000 // 10 分钟
+      timeout: 600000, // 10 分钟
+      signal: abortController.signal
     });
 
     return new Promise((resolve, reject) => {
@@ -677,6 +713,9 @@ class OpenClawClient {
       });
 
       response.data.on('end', async () => {
+        // 清理活跃请求
+        OpenClawClient.activeRequests.delete(fromUser);
+        
         this.log?.info(`[OpenClawClient] SSE 流结束，总长度: ${fullText.length}`);
 
         if (hasError) {
@@ -706,6 +745,9 @@ class OpenClawClient {
       });
 
       response.data.on('error', (err) => {
+        // 清理活跃请求
+        OpenClawClient.activeRequests.delete(fromUser);
+        
         this.log?.error(`[OpenClawClient] SSE 流错误: ${err.message}`);
         reject(err);
       });
