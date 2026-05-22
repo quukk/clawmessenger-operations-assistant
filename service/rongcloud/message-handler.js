@@ -633,11 +633,37 @@ class MessageHandler {
         sightUrl = content.sightUrl || content.url || '';
         name = content.name || '未知视频';
         duration = content.duration || 0;
+      } else if (typeof content === 'string') {
+        // 尝试解析 content 是否为 JSON（包含 sightUrl）
+        try {
+          const contentObj = JSON.parse(content);
+          if (contentObj.sightUrl) {
+            sightUrl = contentObj.sightUrl;
+          }
+        } catch (e) {
+          // content 不是 JSON，可能是 base64 缩略图
+          sightUrl = msg.sightUrl || msg.url || msg.localPath || '';
+        }
       } else {
         sightUrl = msg.sightUrl || msg.url || msg.localPath || '';
       }
       
+      // 如果还是没有找到 URL，尝试从 extra 字段获取
+      if (!sightUrl && msg.extra) {
+        try {
+          const extraData = JSON.parse(msg.extra);
+          sightUrl = extraData.videoUrl || extraData.sightUrl || '';
+        } catch (e) {
+          // extra 不是 JSON，忽略
+        }
+      }
+      
       this.log?.info(`[_extractMessageContent] 视频消息: sightUrl=${sightUrl}`);
+      
+      if (!sightUrl) {
+        return '[视频]（无法获取视频地址）';
+      }
+      
       return `[视频] ${sightUrl} ${name} ${duration}秒`;
     }
 
@@ -651,11 +677,37 @@ class MessageHandler {
         fileUrl = content.fileUrl || content.fileUri || content.url || '';
         name = content.name || '未知文件';
         size = content.size || 0;
+      } else if (typeof content === 'string') {
+        // 尝试解析 content 是否为 JSON（包含 fileUrl）
+        try {
+          const contentObj = JSON.parse(content);
+          if (contentObj.fileUrl) {
+            fileUrl = contentObj.fileUrl;
+          }
+        } catch (e) {
+          // content 不是 JSON
+          fileUrl = msg.fileUrl || msg.fileUri || msg.url || msg.localPath || '';
+        }
       } else {
         fileUrl = msg.fileUrl || msg.fileUri || msg.url || msg.localPath || '';
       }
       
+      // 如果还是没有找到 URL，尝试从 extra 字段获取
+      if (!fileUrl && msg.extra) {
+        try {
+          const extraData = JSON.parse(msg.extra);
+          fileUrl = extraData.fileUrl || extraData.fileUri || '';
+        } catch (e) {
+          // extra 不是 JSON，忽略
+        }
+      }
+      
       this.log?.info(`[_extractMessageContent] 文件消息: fileUrl=${fileUrl}`);
+      
+      if (!fileUrl) {
+        return '[文件]（无法获取文件地址）';
+      }
+      
       return `[文件] ${fileUrl} ${name} ${size}`;
     }
 
