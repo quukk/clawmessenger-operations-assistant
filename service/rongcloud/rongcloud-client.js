@@ -202,8 +202,11 @@ class RongCloudClient {
         }
       }
 
+      // 对于媒体消息，保留完整的 JSON 字符串，不要提取 content 字段
       const userContent = parsed && !parsed.msg_type
-        ? (parsed.content || parsed.text || JSON.stringify(parsed))
+        ? (['RC:ImgMsg', 'RC:SightMsg', 'RC:FileMsg', 'RC:HQVCMsg'].includes(msgType)
+            ? JSON.stringify(parsed)
+            : (parsed.content || parsed.text || JSON.stringify(parsed)))
         : content;
 
       if (!userContent || !userContent.trim || !userContent.trim()) {
