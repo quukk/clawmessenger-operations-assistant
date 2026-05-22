@@ -545,44 +545,6 @@ class MessageHandler {
         return '[图片]（无法获取图片地址）';
       }
       
-      // 检查是否有文字内容（从 content 或 extra 中提取）
-      let textContent = '';
-      
-      // 1. 从 content 对象中提取文字
-      if (typeof content === 'object' && content !== null && content.content) {
-        textContent = content.content;
-      } else if (typeof content === 'string') {
-        // 尝试解析 content 是否为 JSON
-        try {
-          const contentObj = JSON.parse(content);
-          if (contentObj.content) {
-            textContent = contentObj.content;
-          }
-        } catch (e) {
-          // content 不是 JSON，可能是纯文本
-          if (content && !content.startsWith('data:image')) {
-            textContent = content;
-          }
-        }
-      }
-      
-      // 2. 从 extra 字段中提取文字
-      if (!textContent && msg.extra) {
-        try {
-          const extraData = JSON.parse(msg.extra);
-          if (extraData.textContent) {
-            textContent = extraData.textContent;
-          }
-        } catch (e) {
-          // extra 不是 JSON，忽略
-        }
-      }
-      
-      // 构建返回内容：如果有文字，返回文字+图片；否则只返回图片
-      if (textContent) {
-        return `${textContent}\n[图片] ${imageUri}`;
-      }
-      
       return `[图片] ${imageUri}`;
     }
 
