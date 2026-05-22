@@ -251,6 +251,12 @@ class OpenClawClient {
   static waitQueue = [];
   // Session 级串行锁：确保同一 session 不会并发 spawn 多个进程
   static sessionLocks = new Map();
+  // 会话历史管理：为每个用户维护对话上下文
+  static conversationHistory = new Map();
+  // 最大历史轮数（用户+AI 各算一轮）
+  static maxHistoryRounds = 10;
+  // 单条消息最大长度（超过则截断）
+  static maxMessageLength = 2000;
 
   static async acquireSlot() {
     if (OpenClawClient.runningCount < OpenClawClient.maxConcurrency) {
@@ -273,6 +279,71 @@ class OpenClawClient {
     this.log = log;
     this.gatewayStarting = false;
     this.gatewayStarted = false;
+  }
+
+  /**
+   * 获取用户的会话历史
+   * @param {string} fromUser - 用户ID
+   * @returns {Array} 消息历史数组
+   */
+  _getConversationHistory(fromUser) {
+    return OpenClawClient.conversationHistory.get(fromUser) || [];
+  }
+
+  /**
+   * 添加消息到会话历史
+   * @param {string} fromUser - 用户ID
+   * @param {string} role - 角色 ('user' 或 'assistant')
+   * @param {string} content - 消息内容
+   */
+  _addToHistory(fromUser, role, content) {
+    let history = this._getConversationHistory(fromUser);
+    
+    // 截断过长的消息
+    let truncatedContent = content;
+    if (content.length > OpenClawClient.maxMessageLength) {
+      truncatedContent = content.substring(0, OpenClawClient.maxMessageLength) + '...';
+      this.log?.warn(`[OpenClawClient] 消息过长已截断: ${content.length} -> ${truncatedContent.length}`);
+    }
+    
+    history.push({ role, content: truncatedContent });
+    
+    // 保持历史记录在限制范围内（保留最近的 N 轮对话）
+    // 每轮包含 user + assistant 两条消息
+    const maxMessages = OpenClawClient.maxHistoryRounds * 2;
+    if (history.length > maxMessages) {
+      // 移除最旧的消息对
+      history = history.slice(history.length - maxMessages);
+      this.log?.info(`[OpenClawClient] 历史记录已裁剪，保留最近 ${OpenClawClient.maxHistoryRounds} 轮`);
+    }
+    
+    OpenClawClient.conversationHistory.set(fromUser, history);
+  }
+
+  /**
+   * 清空用户的会话历史
+   * @param {string} fromUser - 用户ID
+   */
+  clearHistory(fromUser) {
+    OpenClawClient.conversationHistory.delete(fromUser);
+    this.log?.info(`[OpenClawClient] 已清空用户 ${fromUser} 的对话历史`);
+  }
+
+  /**
+   * 构建包含历史记录的 messages 数组
+   * @param {string} fromUser - 用户ID
+   * @param {string} currentMessage - 当前用户消息
+   * @returns {Array} 完整的 messages 数组
+   */
+  _buildMessagesWithHistory(fromUser, currentMessage) {
+    const history = this._getConversationHistory(fromUser);
+    const messages = [...history];
+    
+    // 添加当前消息
+    messages.push({ role: 'user', content: currentMessage });
+    
+    this.log?.info(`[OpenClawClient] 构建消息上下文: 历史 ${history.length} 条 + 当前消息, 总共 ${messages.length} 条`);
+    return messages;
   }
 
   /**
@@ -368,10 +439,18 @@ class OpenClawClient {
       'http://127.0.0.1:18789/v1/responses'
     ];
 
+    // 构建包含历史记录的完整消息
+    const messagesWithHistory = this._buildMessagesWithHistory(fromUser, message);
+
     for (let i = 0; i < endpoints.length; i++) {
       const apiUrl = endpoints[i];
       try {
-        await this._doChatStream(apiUrl, gatewayToken, sessionId, message, onDelta, onDone);
+        const fullText = await this._doChatStream(apiUrl, gatewayToken, sessionId, messagesWithHistory, onDelta, onDone);
+        
+        // 成功响应后，保存当前对话到历史记录
+        this._addToHistory(fromUser, 'user', message);
+        this._addToHistory(fromUser, 'assistant', fullText);
+        
         return; // 成功则直接返回
       } catch (err) {
         const is404 = err.response?.status === 404;
@@ -452,7 +531,7 @@ class OpenClawClient {
     }
   }
 
-  async _doChatStream(apiUrl, gatewayToken, sessionId, message, onDelta, onDone) {
+  async _doChatStream(apiUrl, gatewayToken, sessionId, messages, onDelta, onDone) {
     const headers = {
       'Content-Type': 'application/json',
       'Accept': 'text/event-stream'
@@ -461,37 +540,40 @@ class OpenClawClient {
       headers['Authorization'] = `Bearer ${gatewayToken}`;
     }
 
-    // 检测消息是否包含图片 URL
-    const imageUrlMatch = message.match(/\[图片\]\s*(https?:\/\/[^\s]+)/);
-    let payload;
+    // messages 现在是数组，包含历史记录和当前消息
+    // 检测最后一条消息是否包含图片 URL
+    const lastMessage = messages[messages.length - 1];
+    const messageContent = typeof lastMessage.content === 'string' ? lastMessage.content : '';
+    const imageUrlMatch = messageContent.match(/\[图片\]\s*(https?:\/\/[^\s]+)/);
     
-    // 判断使用哪个端点
-    const isResponsesEndpoint = apiUrl.includes('/v1/responses');
+    let payload;
     
     if (imageUrlMatch) {
       // 多模态格式：图片 + 文本
       const imageUrl = imageUrlMatch[1];
-      const textContent = message.replace(/\[图片\]\s*https?:\/\/[^\s]+/, '').trim();
+      const textContent = messageContent.replace(/\[图片\]\s*https?:\/\/[^\s]+/, '').trim();
       
       try {
         // 下载图片并转换为 base64
         const imageData = await this._downloadImageAsBase64(imageUrl);
         
-        // 统一使用 messages 格式（OpenAI 兼容标准）
+        // 构建包含历史的 messages，最后一条替换为多模态格式
+        const messagesWithImage = messages.slice(0, -1).concat([{
+          role: 'user',
+          content: [
+            { type: 'text', text: textContent || '' },
+            { 
+              type: 'image_url', 
+              image_url: { 
+                url: `data:${imageData.mediaType};base64,${imageData.base64}` 
+              } 
+            }
+          ]
+        }]);
+        
         payload = {
           model: 'openclaw',
-          messages: [{
-            role: 'user',
-            content: [
-              { type: 'text', text: textContent || '' },
-              { 
-                type: 'image_url', 
-                image_url: { 
-                  url: `data:${imageData.mediaType};base64,${imageData.base64}` 
-                } 
-              }
-            ]
-          }],
+          messages: messagesWithImage,
           stream: true,
           max_tokens: 2048
         };
@@ -500,16 +582,16 @@ class OpenClawClient {
         // 回退到纯文本模式
         payload = {
           model: 'openclaw',
-          messages: [{ role: 'user', content: message }],
+          messages: messages,
           stream: true,
           max_tokens: 2048
         };
       }
     } else {
-      // 纯文本格式 - 统一使用 messages 格式
+      // 纯文本格式 - 使用包含历史记录的 messages
       payload = {
         model: 'openclaw',
-        messages: [{ role: 'user', content: message }],
+        messages: messages,
         stream: true,
         max_tokens: 2048
       };
@@ -617,7 +699,7 @@ class OpenClawClient {
         }
         try {
           await onDone?.(fullText);
-          resolve();
+          resolve(fullText); // 返回完整文本，用于保存到历史记录
         } catch (err) {
           reject(err);
         }

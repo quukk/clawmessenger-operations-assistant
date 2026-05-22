@@ -185,6 +185,8 @@ class MessageHandler {
           const payload = this.parseCommand(msg.content, msg.senderUserId);
           if (payload.command === 'newround') {
             this._resetGroupRoundCount(groupId);
+            // 清空 OpenClaw 对话历史，确保新一轮对话没有上下文
+            this.openclawClient.clearHistory(msg.senderUserId);
             await this.sendFn(groupId, `✅ 新一轮对话已开始，最大对话轮数为 ${maxRounds} 轮。`, msg.conversationType);
             return;
           }
