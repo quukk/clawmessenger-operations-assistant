@@ -29,6 +29,10 @@ class MessageHandler {
     this._groupConfigCache = new Map();
     this._defaultMaxRounds = 10;
     this._groupConfigCacheTTL = config.groupConfigCacheTTL || 60000; // 默认缓存 60 秒
+    
+    // 消息合并相关
+    this._pendingMessages = new Map(); // 待合并的消息
+    this._messageMergeTimeout = 500; // 合并等待时间（毫秒）
   }
 
   /**
@@ -215,42 +219,102 @@ class MessageHandler {
         });
       }
 
-      // 如果配置了代理地址，使用流式处理
-      if (this.isStreamingEnabled) {
-        try {
-          await this.handleNormalMessageStream(msg);
-          // 流式处理成功，群聊轮数 +1
-          if (msg.conversationType === 3) {
-            this._incrementGroupRoundCount(msg.targetId, maxRounds);
-          }
-        } catch (err) {
-          this.log?.error(`[MessageHandler] 流式处理失败，回退到非流式: ${err.message}`);
-          const reply = await this.handleNormalMessage(msg);
-          if (reply) {
-            const targetId = this.getReplyTarget(msg);
-            await this.sendFn(targetId, reply, msg.conversationType);
-            // 非流式回退成功，群聊轮数 +1
-            if (msg.conversationType === 3) {
-              this._incrementGroupRoundCount(msg.targetId, maxRounds);
-            }
-          }
+      // 消息合并逻辑：如果是图片消息，等待一段时间看是否有文字消息跟随
+      if (msg.messageType === 'RC:ImgMsg') {
+        await this._handleImageMessageWithMerge(msg, maxRounds);
+        return;
+      }
+
+      // 普通消息直接处理
+      await this._processMessage(msg, maxRounds);
+    } catch (err) {
+      this.log?.error(`[MessageHandler] 处理消息异常: ${err.message}`);
+      const targetId = msg.conversationType === 3 ? msg.targetId : msg.senderUserId;
+      await this.sendFn(targetId, `处理失败: ${err.message}`, msg.conversationType);
+    }
+  }
+
+  /**
+   * 处理图片消息，支持合并后续文字消息
+   */
+  async _handleImageMessageWithMerge(msg, maxRounds) {
+    const userId = msg.senderUserId;
+    const conversationKey = `${msg.conversationType}-${msg.targetId}-${userId}`;
+    
+    // 设置待处理图片消息
+    this._pendingMessages.set(conversationKey, {
+      imageMsg: msg,
+      timestamp: Date.now(),
+    });
+    
+    // 等待一段时间，看是否有文字消息跟随
+    await new Promise(resolve => setTimeout(resolve, this._messageMergeTimeout));
+    
+    // 获取待处理消息
+    const pending = this._pendingMessages.get(conversationKey);
+    this._pendingMessages.delete(conversationKey);
+    
+    if (!pending) {
+      return; // 消息已被处理
+    }
+    
+    // 构建合并后的消息内容
+    const imageContent = this._extractMessageContent(pending.imageMsg);
+    let mergedContent = imageContent;
+    
+    if (pending.textMsg) {
+      const textContent = typeof pending.textMsg.content === 'string' 
+        ? pending.textMsg.content 
+        : (pending.textMsg.content?.content || '');
+      mergedContent = `${textContent}\n${imageContent}`;
+      this.log?.info(`[MessageHandler] 合并消息: 图片+文字`);
+    }
+    
+    // 创建合并后的消息对象
+    const mergedMsg = {
+      ...pending.imageMsg,
+      content: mergedContent,
+      messageType: 'RC:TxtMsg', // 转为文本消息处理
+    };
+    
+    await this._processMessage(mergedMsg, maxRounds);
+  }
+
+  /**
+   * 处理普通消息（包括合并后的消息）
+   */
+  async _processMessage(msg, maxRounds) {
+    // 如果配置了代理地址，使用流式处理
+    if (this.isStreamingEnabled) {
+      try {
+        await this.handleNormalMessageStream(msg);
+        // 流式处理成功，群聊轮数 +1
+        if (msg.conversationType === 3) {
+          this._incrementGroupRoundCount(msg.targetId, maxRounds);
         }
-      } else {
-        // 降级到非流式处理
+      } catch (err) {
+        this.log?.error(`[MessageHandler] 流式处理失败，回退到非流式: ${err.message}`);
         const reply = await this.handleNormalMessage(msg);
         if (reply) {
           const targetId = this.getReplyTarget(msg);
           await this.sendFn(targetId, reply, msg.conversationType);
-          // 非流式处理成功，群聊轮数 +1
+          // 非流式回退成功，群聊轮数 +1
           if (msg.conversationType === 3) {
             this._incrementGroupRoundCount(msg.targetId, maxRounds);
           }
         }
       }
-    } catch (err) {
-      this.log?.error(`[MessageHandler] 处理消息异常: ${err.message}`);
-      const targetId = msg.conversationType === 3 ? msg.targetId : msg.senderUserId;
-      await this.sendFn(targetId, `处理失败: ${err.message}`, msg.conversationType);
+    } else {
+      // 降级到非流式处理
+      const reply = await this.handleNormalMessage(msg);
+      if (reply) {
+        const targetId = this.getReplyTarget(msg);
+        await this.sendFn(targetId, reply, msg.conversationType);
+        // 非流式处理成功，群聊轮数 +1
+        if (msg.conversationType === 3) {
+          this._incrementGroupRoundCount(msg.targetId, maxRounds);
+        }
+      }
     }
   }
 

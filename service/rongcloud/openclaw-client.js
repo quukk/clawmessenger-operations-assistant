@@ -254,7 +254,7 @@ class OpenClawClient {
   // 会话历史管理：为每个用户维护对话上下文
   static conversationHistory = new Map();
   // 最大历史轮数（用户+AI 各算一轮）
-  static maxHistoryRounds = 10;
+  static maxHistoryRounds = 50;
   // 单条消息最大长度（超过则截断）
   static maxMessageLength = 2000;
 
