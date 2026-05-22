@@ -294,14 +294,20 @@ class MessageHandler {
         }
       } catch (err) {
         this.log?.error(`[MessageHandler] 流式处理失败，回退到非流式: ${err.message}`);
-        const reply = await this.handleNormalMessage(msg);
-        if (reply) {
-          const targetId = this.getReplyTarget(msg);
-          await this.sendFn(targetId, reply, msg.conversationType);
-          // 非流式回退成功，群聊轮数 +1
-          if (msg.conversationType === 3) {
-            this._incrementGroupRoundCount(msg.targetId, maxRounds);
+        
+        // 只有非取消错误才回退到非流式处理
+        if (err.message !== 'canceled') {
+          const reply = await this.handleNormalMessage(msg);
+          if (reply) {
+            const targetId = this.getReplyTarget(msg);
+            await this.sendFn(targetId, reply, msg.conversationType);
+            // 非流式回退成功，群聊轮数 +1
+            if (msg.conversationType === 3) {
+              this._incrementGroupRoundCount(msg.targetId, maxRounds);
+            }
           }
+        } else {
+          this.log?.info(`[MessageHandler] 请求被取消，不回退到非流式处理`);
         }
       }
     } else {
