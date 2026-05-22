@@ -639,6 +639,8 @@ class MessageHandler {
           const contentObj = JSON.parse(content);
           if (contentObj.sightUrl) {
             sightUrl = contentObj.sightUrl;
+            name = contentObj.name || '未知视频';
+            duration = contentObj.duration || 0;
           }
         } catch (e) {
           // content 不是 JSON，可能是 base64 缩略图

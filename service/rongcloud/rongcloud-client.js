@@ -172,6 +172,9 @@ class RongCloudClient {
         // command 等结构化消息保留完整 JSON（上层需要 msg_type 等字段）
         if (message.messageType === 'command' || rawContent.msg_type) {
           rawContent = JSON.stringify(rawContent);
+        } else if (['RC:ImgMsg', 'RC:SightMsg', 'RC:FileMsg', 'RC:HQVCMsg'].includes(message.messageType)) {
+          // 媒体消息保留完整对象，以便上层提取 URL
+          rawContent = JSON.stringify(rawContent);
         } else {
           rawContent = rawContent.content || rawContent.text || JSON.stringify(rawContent);
         }
