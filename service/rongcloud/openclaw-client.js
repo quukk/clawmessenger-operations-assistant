@@ -483,7 +483,7 @@ class OpenClawClient {
           messages: [{
             role: 'user',
             content: [
-              { type: 'text', text: textContent || '描述这张图片' },
+              { type: 'text', text: textContent || '' },
               { 
                 type: 'image_url', 
                 image_url: { 
