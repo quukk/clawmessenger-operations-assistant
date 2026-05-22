@@ -683,8 +683,10 @@ class MessageHandler {
         // 尝试解析 content 是否为 JSON（包含 fileUrl）
         try {
           const contentObj = JSON.parse(content);
-          if (contentObj.fileUrl) {
-            fileUrl = contentObj.fileUrl;
+          if (contentObj.fileUrl || contentObj.fileUri) {
+            fileUrl = contentObj.fileUrl || contentObj.fileUri;
+            name = contentObj.name || '未知文件';
+            size = contentObj.size || 0;
           }
         } catch (e) {
           // content 不是 JSON
