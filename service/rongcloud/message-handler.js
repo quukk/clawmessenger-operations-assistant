@@ -472,7 +472,12 @@ class MessageHandler {
         typingTimer = null;
       }
       
-      await this._sendStreamChunk(fromUserId, targetId, conversationType, '抱歉，AI 响应出现错误，请稍后重试。', streamId, true, true, 1);
+      // 只有非取消错误才发送错误提示
+      if (err.message !== 'canceled') {
+        await this._sendStreamChunk(fromUserId, targetId, conversationType, '抱歉，AI 响应出现错误，请稍后重试。', streamId, true, true, 1);
+      } else {
+        this.log?.info(`[MessageHandler] 请求被取消，不发送错误提示消息`);
+      }
       
       // 错误时也要清理
       this._streamMessageUIDs.delete(streamId);
