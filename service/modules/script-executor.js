@@ -88,15 +88,22 @@ class ScriptExecutor {
     const scriptPath = path.join(this.scriptDir, scriptName);
 
     try {
+      console.log(`[ScriptExecutor] 开始执行脚本: ${scriptPath}`);
       const { stdout, stderr, exitCode } = await this.runScript(scriptPath);
       const fullOutput = stdout + stderr;
       
       // 调试日志：记录脚本实际输出
-      console.log(`[ScriptExecutor] 执行脚本: ${scriptPath}`);
-      console.log(`[ScriptExecutor] ${scriptName} 输出:\n${fullOutput}`);
+      console.log(`[ScriptExecutor] 执行脚本完成: ${scriptPath}`);
       console.log(`[ScriptExecutor] ${scriptName} 退出码: ${exitCode}`);
+      console.log(`[ScriptExecutor] ${scriptName} 输出长度: ${fullOutput.length}`);
+      if (fullOutput.length > 0) {
+        console.log(`[ScriptExecutor] ${scriptName} 输出:\n${fullOutput}`);
+      } else {
+        console.log(`[ScriptExecutor] ${scriptName} 无输出`);
+      }
       
       const result = this.parseStatus(command, fullOutput);
+      console.log(`[ScriptExecutor] ${scriptName} 解析结果: status=${result.status}, message=${result.message}`);
       
       // 对于 STOP 命令，如果脚本退出码非零，强制返回错误
       if (command === OpenClawCommandEnum.STOP && exitCode !== 0) {
@@ -115,6 +122,7 @@ class ScriptExecutor {
       };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[ScriptExecutor] 执行脚本异常: ${msg}`);
       return { status: OpenClawServiceStatus.ERROR, message: `执行异常: ${msg}` };
     }
   }

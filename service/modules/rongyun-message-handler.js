@@ -164,9 +164,27 @@ class RongyunMessageHandler {
         // 异步命令不在这里响应，因为已经提前响应了
         // 但我们可以在这里记录执行结果
         this.logInfo(`[RongyunMessageHandler] 命令执行完成: command=${command}, status=${response.status}, message=${response.message}`);
+      }).then(() => {
+        // 命令执行完成后，立即释放锁
+        this.commandLock = false;
+        if (this.commandLockTimer) {
+          clearTimeout(this.commandLockTimer);
+          this.commandLockTimer = null;
+        }
       }).catch(err => {
         this.logError(`[RongyunMessageHandler] 命令执行失败: ${err.message}`);
+        // 执行失败后也要释放锁
+        this.commandLock = false;
+        if (this.commandLockTimer) {
+          clearTimeout(this.commandLockTimer);
+          this.commandLockTimer = null;
+        }
       });
+      
+      // 异步命令立即返回，不等待执行完成
+      if (isAsyncCommand) {
+        return;
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.logError(`命令执行异常: ${msg}`);
@@ -176,7 +194,7 @@ class RongyunMessageHandler {
         status: 'error',
         message: msg
       }, requestId, sourceId);
-    } finally {
+      // 同步命令执行异常时释放锁
       this.commandLock = false;
       if (this.commandLockTimer) {
         clearTimeout(this.commandLockTimer);

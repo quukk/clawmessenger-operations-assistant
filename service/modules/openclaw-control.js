@@ -181,25 +181,40 @@ async function verifyCommandResult(command, result, scriptOutput = '') {
 
 async function executeCommand(command, window, sendResponse) {
   const cmdName = getCommandName(command);
-  console.log(`[OpenClawControl] ${cmdName} OpenClaw...`);
+  console.log(`[OpenClawControl] ====== 开始执行 ${cmdName} 命令 ======`);
+  console.log(`[OpenClawControl] 命令代码: ${command}`);
+  console.log(`[OpenClawControl] 平台: ${process.platform}`);
 
   let result;
 
   // 优先尝试 ServiceManager（systemd 模式）
   if (process.platform === 'linux' || process.platform === 'darwin') {
+    console.log(`[OpenClawControl] 尝试使用 ServiceManager...`);
     result = await manageWithServiceManager(command);
+    if (result) {
+      console.log(`[OpenClawControl] ServiceManager 结果: ${result.status} - ${result.message}`);
+    } else {
+      console.log(`[OpenClawControl] ServiceManager 不可用，回退到脚本方式`);
+    }
   }
   
   // 如果 ServiceManager 失败或不是 Linux/macOS，使用脚本方式
   let scriptOutput = '';
   if (!result) {
+    console.log(`[OpenClawControl] 使用脚本方式执行...`);
     const scriptResult = await executeWithScript(command);
     result = scriptResult.result;
     scriptOutput = scriptResult.output;
+    console.log(`[OpenClawControl] 脚本执行结果: ${result.status} - ${result.message}`);
+    if (scriptOutput) {
+      console.log(`[OpenClawControl] 脚本输出长度: ${scriptOutput.length}`);
+    }
   }
   
   // 验证结果（传递脚本输出用于后备检查）
+  console.log(`[OpenClawControl] 开始验证命令结果...`);
   result = await verifyCommandResult(command, result, scriptOutput);
+  console.log(`[OpenClawControl] 验证后结果: ${result.status} - ${result.message}`);
 
   // 输出日志
   if (result.status === OpenClawServiceStatus.START_SUCCESS ||
@@ -221,33 +236,41 @@ async function executeCommand(command, window, sendResponse) {
     
     // 获取操作后的真实状态
     let realStatus = result.status;
+    let realMessage = result.message;
     if (command === OpenClawCommandEnum.STOP || command === OpenClawCommandEnum.START || command === OpenClawCommandEnum.RESTART) {
       try {
+        console.log(`[OpenClawControl] 检测操作后的真实状态...`);
         const { getOpenClawStatus } = require('./port-checker');
         const portStatus = await getOpenClawStatus(18789);
+        console.log(`[OpenClawControl] 端口状态: ${portStatus}`);
         // 更新真实状态
         if (command === OpenClawCommandEnum.STOP) {
           realStatus = portStatus === 1 ? OpenClawServiceStatus.RUNNING : OpenClawServiceStatus.STOP_SUCCESS;
+          realMessage = portStatus === 1 ? '停止失败: 服务仍在运行' : '服务已停止';
         } else if (command === OpenClawCommandEnum.START) {
           realStatus = portStatus === 1 ? OpenClawServiceStatus.START_SUCCESS : OpenClawServiceStatus.ERROR;
+          realMessage = portStatus === 1 ? '服务已启动' : '启动失败: 服务未运行';
         } else if (command === OpenClawCommandEnum.RESTART) {
           realStatus = portStatus === 1 ? OpenClawServiceStatus.RESTART_SUCCESS : OpenClawServiceStatus.ERROR;
+          realMessage = portStatus === 1 ? '服务已重启' : '重启失败: 服务未运行';
         }
-        console.log(`[OpenClawControl] 操作后真实状态检测: portStatus=${portStatus}, realStatus=${realStatus}`);
+        console.log(`[OpenClawControl] 操作后真实状态: portStatus=${portStatus}, realStatus=${realStatus}, message=${realMessage}`);
       } catch (e) {
         console.error(`[OpenClawControl] 真实状态检测失败: ${e.message}`);
       }
     }
     
+    console.log(`[OpenClawControl] 发送响应: status=${httpStatus}, message=${realMessage}`);
     sendResponse({
       type: 'command_result',
       command,
       status: httpStatus,
-      message: result.message,
+      message: realMessage,
       service_status: realStatus
     });
   }
 
+  console.log(`[OpenClawControl] ====== ${cmdName} 命令执行完成 ======`);
   return result;
 }
 

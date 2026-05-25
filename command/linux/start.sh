@@ -17,6 +17,14 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 
+# 调试模式：如果 DEBUG=1，输出更多日志
+DEBUG="${DEBUG:-0}"
+debug_log() {
+    if [ "$DEBUG" = "1" ]; then
+        echo -e "${YELLOW}[DEBUG]${NC} $1"
+    fi
+}
+
 SERVICE_NAME="openclaw-gateway.service"
 MAX_WAIT=300  # 最长等待5分钟
 PORT="18789"
@@ -187,10 +195,13 @@ start_docker() {
     fi
     
     # 检查 openclaw 命令是否存在
+    debug_log "检查 openclaw 命令..."
     if ! command -v openclaw &>/dev/null; then
         log_error "openclaw 命令未找到，请先安装 OpenClaw。"
+        log_error "PATH: $PATH"
         exit 1
     fi
+    debug_log "openclaw 命令存在: $(which openclaw)"
     
     # 确保日志目录存在
     local log_dir="/tmp/openclaw"
@@ -201,8 +212,18 @@ start_docker() {
     
     log_info "正在启动 OpenClaw 服务..."
     
-    # 使用 nohup 后台启动
-    nohup openclaw gateway --port "$PORT" > "$log_file" 2>&1 &
+    # 使用 nohup 后台启动，指定 host 为 0.0.0.0（Docker 环境需要）
+    # 注意：openclaw gateway 可能需要不同的参数格式
+    log_info "执行命令: nohup openclaw gateway --port $PORT --host 0.0.0.0"
+    debug_log "当前工作目录: $(pwd)"
+    debug_log "当前用户: $(whoami)"
+    debug_log "环境变量 PATH: $PATH"
+    
+    # 先检查 openclaw 版本
+    debug_log "openclaw 版本信息:"
+    openclaw --version 2>&1 | head -5 || true
+    
+    nohup openclaw gateway --port "$PORT" --host 0.0.0.0 > "$log_file" 2>&1 &
     
     log_info "OpenClaw 服务启动命令已发送（PID: $!）"
     log_info "日志文件: $log_file"

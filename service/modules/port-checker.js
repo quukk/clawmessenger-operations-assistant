@@ -27,7 +27,13 @@ function checkPortListening(port, host = '127.0.0.1') {
       resolve(false);
     });
     
-    sock.connect(port, host);
+    try {
+      sock.connect(port, host);
+    } catch (err) {
+      console.error(`[PortChecker] 连接异常: ${err.message}`);
+      sock.destroy();
+      resolve(false);
+    }
   });
 }
 
