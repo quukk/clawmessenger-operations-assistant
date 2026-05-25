@@ -57,9 +57,30 @@ function getCommandName(command) {
 }
 
 /**
+ * 检测是否在 Docker 环境（无 systemd）
+ */
+function isDockerEnvironment() {
+  try {
+    const fs = require('fs');
+    // 检查 /proc/1/cgroup 是否包含 docker
+    const cgroup = fs.readFileSync('/proc/1/cgroup', 'utf8');
+    return cgroup.includes('docker');
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
  * 使用 ServiceManager 管理服务（systemd 模式）
+ * 注意：在 Docker 环境中不应该使用 ServiceManager，因为 Docker 通常没有 systemd
  */
 async function manageWithServiceManager(command) {
+  // 如果在 Docker 环境中，直接返回 null，让上层回退到脚本方式
+  if (isDockerEnvironment()) {
+    console.log('[OpenClawControl] 检测到 Docker 环境，跳过 ServiceManager，使用脚本方式');
+    return null;
+  }
+  
   const serviceMgr = new ServiceManager('openclaw-gateway', 'OpenClaw Gateway');
   
   try {
