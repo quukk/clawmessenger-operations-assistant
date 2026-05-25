@@ -238,10 +238,19 @@ start_docker() {
         cat /tmp/openclaw-help.txt | head -30
     fi
     
+    # 检查 openclaw gateway run --help，确认 run 子命令的参数
+    log_info "检查 openclaw gateway run --help..."
+    openclaw gateway run --help > /tmp/openclaw-run-help.txt 2>&1 || true
+    if [ -f /tmp/openclaw-run-help.txt ]; then
+        log_info "openclaw gateway run help 输出:"
+        cat /tmp/openclaw-run-help.txt | head -30
+    fi
+    
     # 尝试使用正确的参数启动
     # 注意：openclaw gateway 可能使用不同的参数名
-    log_info "尝试启动: openclaw gateway --port $PORT"
-    nohup openclaw gateway --port "$PORT" > "$log_file" 2>&1 &
+    # 在 Docker 环境中，使用 run 子命令前台运行，而不是后台启动
+    log_info "尝试启动: openclaw gateway run --port $PORT"
+    nohup openclaw gateway run --port "$PORT" > "$log_file" 2>&1 &
     
     # 等待 5 秒检查进程是否启动（给更多时间）
     sleep 5
