@@ -224,9 +224,9 @@ stop_docker() {
             kill -15 "$p" 2>/dev/null || log_warn "kill -15 $p 失败"
         done
         
-        # 等待 3 秒让服务优雅退出
-        log_info "等待 3 秒让服务优雅退出..."
-        sleep 3
+        # 等待 5 秒让服务优雅退出
+        log_info "等待 5 秒让服务优雅退出..."
+        sleep 5
         
         # 检查是否已停止
         local pid_after_graceful
@@ -243,7 +243,20 @@ stop_docker() {
     
     # 强制停止模式（直接发送 SIGKILL）
     log_info "正在强制停止 OpenClaw 服务（SIGKILL）..."
-    for p in $all_pids; do
+    
+    # 获取最新的进程列表（因为优雅停止后可能有新进程）
+    local current_pids=""
+    if command -v pgrep &>/dev/null; then
+        current_pids=$(pgrep -f "openclaw" | tr '\n' ' ')
+    elif command -v pidof &>/dev/null; then
+        current_pids=$(pidof openclaw)
+    else
+        current_pids=$(ps aux | grep -v grep | grep "openclaw" | awk '{print $2}' | tr '\n' ' ')
+    fi
+    
+    log_info "当前 openclaw 进程: $current_pids"
+    
+    for p in $current_pids; do
         log_info "执行: kill -9 $p"
         kill -9 "$p" 2>/dev/null || log_warn "kill -9 $p 失败"
     done
@@ -253,12 +266,15 @@ stop_docker() {
     log_info "执行: killall -9 openclaw"
     killall -9 openclaw 2>/dev/null || log_warn "killall 失败"
     
+    # 等待 2 秒让进程退出
+    sleep 2
+    
     # 连续监控模式：每秒检查并杀死看门狗重启的进程
     # 这样即使看门狗立即重启，也会被再次杀死
-    log_info "进入连续监控模式（最多 15 秒），防止看门狗自动重启..."
+    log_info "进入连续监控模式（最多 20 秒），防止看门狗自动重启..."
     local elapsed=0
     local consecutive_empty=0
-    while [ $elapsed -lt 15 ]; do
+    while [ $elapsed -lt 20 ]; do
         sleep 1
         
         # 检查是否还有 openclaw 进程
@@ -291,6 +307,9 @@ stop_docker() {
             consecutive_empty=0
             if [ -n "$remaining_pids" ]; then
                 log_info "第 $elapsed 秒: 发现新进程 $remaining_pids，再次 kill..."
+                for rp in $remaining_pids; do
+                    kill -9 "$rp" 2>/dev/null || true
+                done
             fi
             if [ "$port_listening" = true ]; then
                 log_info "第 $elapsed 秒: 端口 $PORT 仍在监听，尝试 fuser 终止..."
@@ -304,6 +323,14 @@ stop_docker() {
         
         elapsed=$((elapsed + 1))
     done
+    
+    # 最终验证前，再执行一次全面清理
+    log_info "执行最终清理..."
+    pkill -9 -f "openclaw" 2>/dev/null || true
+    killall -9 openclaw 2>/dev/null || true
+    
+    # 等待 2 秒
+    sleep 2
     
     # 最终验证
     local remaining_pids=""

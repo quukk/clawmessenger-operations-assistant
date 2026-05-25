@@ -337,10 +337,23 @@ class RongyunMessageHandler {
     this.logInfo(`[RongyunMessageHandler] 收到设备状态请求, from=${targetId}, requestId=${requestId}`);
 
     try {
-      // 获取 OpenClaw 运行状态（检查端口 18789）
+      // 获取 OpenClaw 真实运行状态（检查端口 18789）
       const openClawStatus = await getOpenClawStatus();
       
-      // 构建状态数据
+      // 获取真实的版本信息（如果可能）
+      let version = 'unknown';
+      try {
+        const { execSync } = require('child_process');
+        const versionOutput = execSync('openclaw --version', { encoding: 'utf8', timeout: 5000 }).trim();
+        const match = versionOutput.match(/(\d+\.\d+\.\d+)/);
+        if (match) {
+          version = match[1];
+        }
+      } catch (e) {
+        // 忽略版本获取失败
+      }
+      
+      // 构建真实状态数据
       // openClawStatus: 1=端口监听正常(服务可用), 0=未运行(端口未监听)
       const statusMessage = openClawStatus === 1 ? '运行中' : '未运行';
       
@@ -348,11 +361,11 @@ class RongyunMessageHandler {
         open_claw_status: openClawStatus,  // 1=运行中, 0=未运行
         status_message: statusMessage,
         mac_address: getMacAddress(),
-        version: '0.0.20',
+        version: version,
         timestamp: Date.now(),
       };
       
-      this.logInfo(`[RongyunMessageHandler] 设备状态: openClawStatus=${openClawStatus}`);
+      this.logInfo(`[RongyunMessageHandler] 设备真实状态: openClawStatus=${openClawStatus}, version=${version}`);
       await this.sendDeviceStatusReport(targetId, requestId, statusData);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);

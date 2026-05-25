@@ -168,26 +168,46 @@ async function verifyCommandResult(command, result, scriptOutput = '') {
     }
 
     if (portStatus === 1) {
-      console.error(`[OpenClawControl] 停止失败: 端口 18789 仍在监听。尝试强制停止...`);
+      console.error(`[OpenClawControl] 停止失败: 端口 18789 仍在监听。尝试直接强制终止进程...`);
       
-      // 尝试强制停止
-      const forceScriptResult = await executeWithScript(command);
-      const forceResult = forceScriptResult.result;
-      console.log(`[OpenClawControl] 强制停止结果: ${forceResult.status} - ${forceResult.message}`);
-      
-      // 再次验证端口
-      await new Promise(resolve => setTimeout(resolve, 3000));
-      const finalPortStatus = await getOpenClawStatus(18789);
-      
-      if (finalPortStatus !== 1) {
-        console.log(`[OpenClawControl] 强制停止成功: 端口已关闭`);
-        return {
-          status: OpenClawServiceStatus.STOP_SUCCESS,
-          message: '服务已停止（强制停止）'
-        };
+      // 直接执行强制终止命令（不通过脚本）
+      try {
+        const { execSync } = require('child_process');
+        
+        // 先尝试 pkill
+        try {
+          execSync('pkill -9 -f "openclaw"', { timeout: 5000 });
+          console.log('[OpenClawControl] pkill -9 -f openclaw 执行成功');
+        } catch (e) {
+          console.log('[OpenClawControl] pkill 执行失败或没有匹配进程');
+        }
+        
+        // 再尝试 killall
+        try {
+          execSync('killall -9 openclaw', { timeout: 5000 });
+          console.log('[OpenClawControl] killall -9 openclaw 执行成功');
+        } catch (e) {
+          console.log('[OpenClawControl] killall 执行失败或没有匹配进程');
+        }
+        
+        // 等待进程退出
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        
+        // 再次验证端口
+        const finalPortStatus = await getOpenClawStatus(18789);
+        
+        if (finalPortStatus !== 1) {
+          console.log(`[OpenClawControl] 强制停止成功: 端口已关闭`);
+          return {
+            status: OpenClawServiceStatus.STOP_SUCCESS,
+            message: '服务已停止（强制停止）'
+          };
+        }
+      } catch (err) {
+        console.error(`[OpenClawControl] 强制停止异常: ${err.message}`);
       }
       
-      console.error(`[OpenClawControl] 停止失败: 端口 18789 仍在监听。stop.sh 可能未能成功停止服务。`);
+      console.error(`[OpenClawControl] 停止失败: 端口 18789 仍在监听。所有停止方法均已尝试。`);
       return {
         status: OpenClawServiceStatus.ERROR,
         message: '停止失败: 服务仍在运行'
@@ -276,12 +296,33 @@ async function executeCommand(command, window, sendResponse) {
   if (sendResponse) {
     let httpStatus = 'success';
     if (result.status === OpenClawServiceStatus.ERROR) httpStatus = 'error';
+    
+    // 获取操作后的真实状态
+    let realStatus = result.status;
+    if (command === OpenClawCommandEnum.STOP || command === OpenClawCommandEnum.START || command === OpenClawCommandEnum.RESTART) {
+      try {
+        const { getOpenClawStatus } = require('./port-checker');
+        const portStatus = await getOpenClawStatus(18789);
+        // 更新真实状态
+        if (command === OpenClawCommandEnum.STOP) {
+          realStatus = portStatus === 1 ? OpenClawServiceStatus.RUNNING : OpenClawServiceStatus.STOP_SUCCESS;
+        } else if (command === OpenClawCommandEnum.START) {
+          realStatus = portStatus === 1 ? OpenClawServiceStatus.START_SUCCESS : OpenClawServiceStatus.ERROR;
+        } else if (command === OpenClawCommandEnum.RESTART) {
+          realStatus = portStatus === 1 ? OpenClawServiceStatus.RESTART_SUCCESS : OpenClawServiceStatus.ERROR;
+        }
+        console.log(`[OpenClawControl] 操作后真实状态检测: portStatus=${portStatus}, realStatus=${realStatus}`);
+      } catch (e) {
+        console.error(`[OpenClawControl] 真实状态检测失败: ${e.message}`);
+      }
+    }
+    
     sendResponse({
       type: 'command_result',
       command,
       status: httpStatus,
       message: result.message,
-      service_status: result.status
+      service_status: realStatus
     });
   }
 
