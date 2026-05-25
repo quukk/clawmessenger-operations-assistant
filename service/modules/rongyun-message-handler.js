@@ -64,27 +64,40 @@ class RongyunMessageHandler {
         return;
       }
 
-      const msgType = parsed.msg_type;
+      // 解析 content 字段（前端将业务数据放在 content 内）
+      let data = parsed;
+      if (parsed.content && typeof parsed.content === 'string') {
+        try {
+          const contentData = JSON.parse(parsed.content);
+          // 将 content 内的数据合并到顶层，方便处理器直接访问
+          // 保留原始 content 字段（用于聊天消息等场景）
+          data = { ...parsed, ...contentData, _raw_content: parsed.content };
+        } catch (e) {
+          this.logWarn(`解析 content 失败: ${e.message}`);
+        }
+      }
+
+      const msgType = data.msg_type;
       this.logInfo(`[RongyunMessageHandler] 处理消息类型: ${msgType}`);
 
       switch (msgType) {
         case RongyunMessageTypeEnum.COMMAND:
-          await this.handleCommand(parsed);
+          await this.handleCommand(data);
           break;
         case RongyunMessageTypeEnum.CHAT_MESSAGE:
-          await this.handleChatMessage(parsed);
+          await this.handleChatMessage(data);
           break;
         case RongyunMessageTypeEnum.CREATE_OPENCODE_SESSION:
-          await this.handleCreateSession(parsed);
+          await this.handleCreateSession(data);
           break;
         case RongyunMessageTypeEnum.DELETE_OPENCODE_SESSION:
-          await this.handleDeleteSession(parsed);
+          await this.handleDeleteSession(data);
           break;
         case RongyunMessageTypeEnum.DEVICE_CONTROL:
-          await this.handleDeviceControl(parsed);
+          await this.handleDeviceControl(data);
           break;
         case RongyunMessageTypeEnum.DEVICE_STATUS_REQUEST:
-          await this.handleDeviceStatusRequest(parsed);
+          await this.handleDeviceStatusRequest(data);
           break;
         default:
           this.logWarn(`未处理的消息类型: ${msgType}`);
@@ -100,8 +113,9 @@ class RongyunMessageHandler {
     const commandId = data.command_id;
     const requestId = data.request_id;
     const sourceId = data.source_im_id;
+    const force = data.force === true;  // 是否强制停止
 
-    this.logInfo(`[RongyunMessageHandler] 收到命令: command=${command}, command_id=${commandId}, from=${sourceId || 'guardserver'}`);
+    this.logInfo(`[RongyunMessageHandler] 收到命令: command=${command}, command_id=${commandId}, force=${force}, from=${sourceId || 'guardserver'}`);
 
     // 验证命令是否有效
     const validCommands = Object.values(OpenClawCommandEnum);
@@ -143,11 +157,12 @@ class RongyunMessageHandler {
       
       if (isAsyncCommand) {
         // 立即响应，告知前端命令已接收
+        const actionName = force ? '强制' + getCommandName(command) : getCommandName(command);
         await this.sendResponse(RongyunMessageTypeEnum.COMMAND_RESULT, {
           command,
           command_id: commandId,
           status: 'success',
-          message: `${getCommandName(command)}命令已接收，正在执行...`
+          message: `${actionName}命令已接收，正在执行...`
         }, requestId, sourceId);
       }
       
@@ -163,8 +178,8 @@ class RongyunMessageHandler {
         }
         // 异步命令不在这里响应，因为已经提前响应了
         // 但我们可以在这里记录执行结果
-        this.logInfo(`[RongyunMessageHandler] 命令执行完成: command=${command}, status=${response.status}, message=${response.message}`);
-      }).then(() => {
+        this.logInfo(`[RongyunMessageHandler] 命令执行完成: command=${command}, force=${force}, status=${response.status}, message=${response.message}`);
+      }, force).then(() => {
         // 命令执行完成后，立即释放锁
         this.commandLock = false;
         if (this.commandLockTimer) {
@@ -206,7 +221,8 @@ class RongyunMessageHandler {
   async handleChatMessage(data) {
     const roomId = data.room_id;
     const sessionId = data.gateway_session_id || data.session_id;
-    const content = data.content;
+    // 使用解析后的 content（聊天内容），如果没有则使用原始 content
+    const content = data.content || data._raw_content;
     const requestId = data.request_id;
 
     this.logInfo(`[RongyunMessageHandler] 收到聊天消息, roomId=${roomId}, sessionId=${sessionId}`);

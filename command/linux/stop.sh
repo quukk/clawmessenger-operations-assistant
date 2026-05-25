@@ -460,6 +460,12 @@ show_help() {
 main() {
     local force=""
     
+    # 检查 FORCE 环境变量（来自 script-executor 的强制停止模式）
+    if [ "${FORCE:-}" = "1" ]; then
+        force="1"
+        log_info "检测到 FORCE=1 环境变量，启用强制停止模式"
+    fi
+    
     # 解析命令行参数
     while [ $# -gt 0 ]; do
         case $1 in

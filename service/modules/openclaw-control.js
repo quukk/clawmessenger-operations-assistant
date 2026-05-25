@@ -112,14 +112,16 @@ async function manageWithServiceManager(command) {
 
 /**
  * 使用 ScriptExecutor 执行脚本（Docker 模式）
+ * @param {number} command - 命令代码
+ * @param {boolean} force - 是否强制停止
  * @returns {Object} { result, output }
  */
-async function executeWithScript(command) {
+async function executeWithScript(command, force = false) {
   const executor = getExecutor();
   const scriptName = getScriptName(command);
   
   try {
-    const result = await executor.executeWithStatus(command, scriptName);
+    const result = await executor.executeWithStatus(command, scriptName, force);
     // ScriptExecutor 现在返回 { status, message, output }
     return { 
       result: { status: result.status, message: result.message },
@@ -200,10 +202,11 @@ async function verifyCommandResult(command, result, scriptOutput = '') {
   return result;
 }
 
-async function executeCommand(command, window, sendResponse) {
+async function executeCommand(command, window, sendResponse, force = false) {
   const cmdName = getCommandName(command);
-  console.log(`[OpenClawControl] ====== 开始执行 ${cmdName} 命令 ======`);
-  console.log(`[OpenClawControl] 命令代码: ${command}`);
+  const actionName = force ? '强制' + cmdName : cmdName;
+  console.log(`[OpenClawControl] ====== 开始执行 ${actionName} 命令 ======`);
+  console.log(`[OpenClawControl] 命令代码: ${command}, force: ${force}`);
   console.log(`[OpenClawControl] 平台: ${process.platform}`);
 
   let result;
@@ -223,7 +226,7 @@ async function executeCommand(command, window, sendResponse) {
   let scriptOutput = '';
   if (!result) {
     console.log(`[OpenClawControl] 使用脚本方式执行...`);
-    const scriptResult = await executeWithScript(command);
+    const scriptResult = await executeWithScript(command, force);
     result = scriptResult.result;
     scriptOutput = scriptResult.output;
     console.log(`[OpenClawControl] 脚本执行结果: ${result.status} - ${result.message}`);
@@ -242,13 +245,13 @@ async function executeCommand(command, window, sendResponse) {
       result.status === OpenClawServiceStatus.STOP_SUCCESS ||
       result.status === OpenClawServiceStatus.RESTART_SUCCESS ||
       result.status === OpenClawServiceStatus.CONFIG_FIX_SUCCESS) {
-    console.log(`[OpenClawControl] ${cmdName} 成功: ${result.message}`);
+    console.log(`[OpenClawControl] ${actionName} 成功: ${result.message}`);
   } else if (result.status === OpenClawServiceStatus.ERROR) {
-    console.log(`[OpenClawControl] ${cmdName} 失败: ${result.message}`);
+    console.log(`[OpenClawControl] ${actionName} 失败: ${result.message}`);
   } else if (result.status === OpenClawServiceStatus.NOT_INSTALL) {
-    console.log(`[OpenClawControl] ${cmdName}: OpenClaw未安装`);
+    console.log(`[OpenClawControl] ${actionName}: OpenClaw未安装`);
   } else {
-    console.log(`[OpenClawControl] ${cmdName} 状态: ${result.message}`);
+    console.log(`[OpenClawControl] ${actionName} 状态: ${result.message}`);
   }
 
   if (sendResponse) {
@@ -264,16 +267,19 @@ async function executeCommand(command, window, sendResponse) {
         const { getOpenClawStatus } = require('./port-checker');
         const portStatus = await getOpenClawStatus(18789);
         console.log(`[OpenClawControl] 端口状态: ${portStatus}`);
-        // 更新真实状态
+        // 更新真实状态 - 始终以端口检测结果为准
         if (command === OpenClawCommandEnum.STOP) {
           realStatus = portStatus === 1 ? OpenClawServiceStatus.RUNNING : OpenClawServiceStatus.STOP_SUCCESS;
           realMessage = portStatus === 1 ? '停止失败: 服务仍在运行' : '服务已停止';
+          if (portStatus === 1) httpStatus = 'error';
         } else if (command === OpenClawCommandEnum.START) {
           realStatus = portStatus === 1 ? OpenClawServiceStatus.START_SUCCESS : OpenClawServiceStatus.ERROR;
           realMessage = portStatus === 1 ? '服务已启动' : '启动失败: 服务未运行';
+          if (portStatus !== 1) httpStatus = 'error';
         } else if (command === OpenClawCommandEnum.RESTART) {
           realStatus = portStatus === 1 ? OpenClawServiceStatus.RESTART_SUCCESS : OpenClawServiceStatus.ERROR;
           realMessage = portStatus === 1 ? '服务已重启' : '重启失败: 服务未运行';
+          if (portStatus !== 1) httpStatus = 'error';
         }
         console.log(`[OpenClawControl] 操作后真实状态: portStatus=${portStatus}, realStatus=${realStatus}, message=${realMessage}`);
       } catch (e) {

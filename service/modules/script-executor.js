@@ -79,7 +79,7 @@ class ScriptExecutor {
     }
   }
 
-  async executeWithStatus(command, scriptName) {
+  async executeWithStatus(command, scriptName, force = false) {
     // 配置修复命令特殊处理：直接执行命令，不需要脚本
     if (command === OpenClawCommandEnum.CONFIG_FIX) {
       return await this.executeCommandDirect('openclaw doctor --fix', 120);
@@ -88,8 +88,8 @@ class ScriptExecutor {
     const scriptPath = path.join(this.scriptDir, scriptName);
 
     try {
-      console.log(`[ScriptExecutor] 开始执行脚本: ${scriptPath}`);
-      const { stdout, stderr, exitCode } = await this.runScript(scriptPath);
+      console.log(`[ScriptExecutor] 开始执行脚本: ${scriptPath}, force=${force}`);
+      const { stdout, stderr, exitCode } = await this.runScript(scriptPath, force);
       const fullOutput = stdout + stderr;
       
       // 调试日志：记录脚本实际输出
@@ -206,7 +206,7 @@ class ScriptExecutor {
     });
   }
 
-  runScript(scriptPath) {
+  runScript(scriptPath, force = false) {
     // Linux/Mac 系统：自动修复 shell 脚本的 CRLF 换行符
     if (process.platform !== 'win32') {
       try {
@@ -232,6 +232,12 @@ class ScriptExecutor {
       } else {
         cmd = 'bash';
         args = [scriptPath];
+      }
+      
+      // 如果是强制停止，添加 FORCE 环境变量
+      if (force) {
+        args.unshift('FORCE=1');
+        console.log(`[ScriptExecutor] 强制停止模式: FORCE=1`);
       }
 
       // 调试日志：记录执行环境

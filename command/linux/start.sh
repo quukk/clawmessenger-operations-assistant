@@ -252,8 +252,8 @@ start_docker() {
     log_info "尝试启动: openclaw gateway run --port $PORT"
     nohup openclaw gateway run --port "$PORT" > "$log_file" 2>&1 &
     
-    # 等待 5 秒检查进程是否启动（给更多时间）
-    sleep 5
+    # 等待 10 秒检查进程是否启动（给更多时间）
+    sleep 10
     local started_pid=$!
     log_info "启动的进程 PID: $started_pid"
     
@@ -272,7 +272,7 @@ start_docker() {
     
     # 检查进程监听的端口
     log_info "检查进程监听的端口..."
-    sleep 2
+    sleep 5
     local listening_ports=$(netstat -tlnp 2>/dev/null | grep "$started_pid" || ss -tlnp 2>/dev/null | grep "$started_pid" || echo "")
     if [ -n "$listening_ports" ]; then
         log_info "进程 $started_pid 监听的端口:"
