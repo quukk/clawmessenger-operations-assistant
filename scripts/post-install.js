@@ -37,7 +37,45 @@ function isWindowsAdmin() {
   }
 }
 
+function fixShellScriptLineEndings() {
+  if (process.platform === 'win32') return;
+
+  const fs = require('fs');
+  const path = require('path');
+  const scriptDir = path.join(__dirname, '..', 'command', 'linux');
+
+  try {
+    if (!fs.existsSync(scriptDir)) return;
+    const files = fs.readdirSync(scriptDir);
+    let fixedCount = 0;
+
+    for (const file of files) {
+      if (!file.endsWith('.sh')) continue;
+      const filePath = path.join(scriptDir, file);
+      try {
+        const content = fs.readFileSync(filePath, 'utf8');
+        if (content.includes('\r\n')) {
+          fs.writeFileSync(filePath, content.replace(/\r\n/g, '\n'));
+          fixedCount++;
+          console.log(`[postinstall] 已修复 ${file} 换行符（CRLF → LF）`);
+        }
+      } catch (e) {
+        console.warn(`[postinstall] 修复 ${file} 失败: ${e.message}`);
+      }
+    }
+
+    if (fixedCount > 0) {
+      console.log(`[postinstall] 共修复 ${fixedCount} 个脚本换行符`);
+    }
+  } catch (e) {
+    console.warn(`[postinstall] 修复换行符失败: ${e.message}`);
+  }
+}
+
 function installAndStartService() {
+  // 先修复 Linux 脚本的换行符
+  fixShellScriptLineEndings();
+
   if (process.platform !== 'win32') {
     console.log(`[postinstall] 跳过（非 Windows: ${process.platform}）`);
     return;

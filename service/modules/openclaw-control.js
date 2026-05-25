@@ -128,6 +128,12 @@ async function manageWithServiceManager(command) {
     return null;
   }
   
+  // 强制 Docker 模式：通过环境变量强制使用脚本方式（用于自动检测失败的情况）
+  if (process.env.FORCE_DOCKER_MODE === 'true' || process.env.FORCE_DOCKER_MODE === '1') {
+    console.log('[OpenClawControl] FORCE_DOCKER_MODE 已设置，跳过 ServiceManager，使用脚本方式');
+    return null;
+  }
+  
   const serviceMgr = new ServiceManager('openclaw-gateway', 'OpenClaw Gateway');
   
   try {
