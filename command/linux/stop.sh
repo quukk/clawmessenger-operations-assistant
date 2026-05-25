@@ -410,33 +410,8 @@ stop_systemd() {
     log_info "正在停止 OpenClaw 服务..."
     
     if systemctl --user stop "$SERVICE_NAME"; then
-
-# Systemd 模式：停止服务
-# 参数: $1 = force (1=强制停止, 空=优雅停止)
-stop_systemd() {
-    local force="$1"
-    
-    # 检查服务是否存在
-    if ! systemctl --user list-unit-files "$SERVICE_NAME" &>/dev/null; then
-        log_error "服务 $SERVICE_NAME 不存在。"
-        exit 1
-    fi
-    
-    # 检查服务状态
-    log_info "检查 OpenClaw 服务状态..."
-    if systemctl --user is-active --quiet "$SERVICE_NAME"; then
-        log_info "OpenClaw 服务正在运行，准备停止..."
-    else
-        log_warn "OpenClaw 服务未在运行。"
-        exit 0
-    fi
-    
-    # 停止服务
-    log_info "正在停止 OpenClaw 服务..."
-    
-    if systemctl --user stop "$SERVICE_NAME"; then
         log_info "OpenClaw 服务停止成功！"
-
+        
         # 等待服务完全停止
         sleep 2
         
