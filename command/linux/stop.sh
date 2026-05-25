@@ -204,11 +204,24 @@ stop_docker() {
             fi
         fi
         
-        if ! check_port "$PORT" && [ -z "$(ps aux | grep -v grep | grep 'openclaw' | awk '{print $2}')" ]; then
+        # 再次检查进程和端口
+        local final_check_pid
+        final_check_pid=$(get_openclaw_pid)
+        local final_check_port=false
+        if check_port "$PORT"; then
+            final_check_port=true
+        fi
+        
+        if [ -z "$final_check_pid" ] && [ "$final_check_port" = false ]; then
             log_warn "OpenClaw 服务未在运行。"
             exit 0
         else
-            log_error "OpenClaw 服务停止失败！"
+            if [ -n "$final_check_pid" ]; then
+                log_error "OpenClaw 服务停止失败！进程仍然存在: $final_check_pid"
+            fi
+            if [ "$final_check_port" = true ]; then
+                log_error "OpenClaw 服务停止失败！端口 $PORT 仍在监听。"
+            fi
             exit 1
         fi
     fi
@@ -372,6 +385,31 @@ stop_docker() {
         exit 1
     fi
 }
+
+# Systemd 模式：停止服务
+# 参数: $1 = force (1=强制停止, 空=优雅停止)
+stop_systemd() {
+    local force="$1"
+    
+    # 检查服务是否存在
+    if ! systemctl --user list-unit-files "$SERVICE_NAME" &>/dev/null; then
+        log_error "服务 $SERVICE_NAME 不存在。"
+        exit 1
+    fi
+    
+    # 检查服务状态
+    log_info "检查 OpenClaw 服务状态..."
+    if systemctl --user is-active --quiet "$SERVICE_NAME"; then
+        log_info "OpenClaw 服务正在运行，准备停止..."
+    else
+        log_warn "OpenClaw 服务未在运行。"
+        exit 0
+    fi
+    
+    # 停止服务
+    log_info "正在停止 OpenClaw 服务..."
+    
+    if systemctl --user stop "$SERVICE_NAME"; then
 
 # Systemd 模式：停止服务
 # 参数: $1 = force (1=强制停止, 空=优雅停止)

@@ -184,11 +184,19 @@ restart_docker() {
         log_warn "服务未运行"
     fi
     
-    # 如果正在运行，先停止
+    # 如果正在运行，先停止（包括进程存在但端口未监听的情况）
     if [ -n "$pid" ] || check_port "$PORT"; then
         log_info "正在停止 OpenClaw 服务..."
         if [ -n "$pid" ]; then
-            kill "$pid" &>/dev/null || true
+            log_info "停止进程 $pid..."
+            kill -15 "$pid" &>/dev/null || true
+            sleep 2
+            # 检查是否还在运行
+            if ps -p "$pid" > /dev/null 2>&1; then
+                log_warn "进程 $pid 仍在运行，强制停止..."
+                kill -9 "$pid" &>/dev/null || true
+                sleep 1
+            fi
         fi
         
         # 等待停止（最多 10 秒），使用端口双重验证
@@ -204,10 +212,12 @@ restart_docker() {
         done
         
         # 如果还在运行，强制停止并使用备选方案
-        if check_port "$PORT"; then
+        local current_pid_after_wait
+        current_pid_after_wait=$(get_openclaw_pid)
+        if [ -n "$current_pid_after_wait" ] || check_port "$PORT"; then
             log_warn "服务未在 10 秒内停止，正在强制停止..."
-            if [ -n "$pid" ]; then
-                kill -9 "$pid" &>/dev/null || true
+            if [ -n "$current_pid_after_wait" ]; then
+                kill -9 "$current_pid_after_wait" &>/dev/null || true
             fi
             pkill -9 -f "openclaw" &>/dev/null || true
             if command -v fuser &>/dev/null; then
@@ -216,8 +226,10 @@ restart_docker() {
             sleep 2
             
             # 最终验证
-            if check_port "$PORT"; then
-                log_error "OpenClaw 服务停止失败！端口 $PORT 仍在监听。"
+            local final_pid
+            final_pid=$(get_openclaw_pid)
+            if [ -n "$final_pid" ] || check_port "$PORT"; then
+                log_error "OpenClaw 服务停止失败！进程或端口仍在运行。"
                 exit 1
             fi
         fi
@@ -240,8 +252,16 @@ restart_docker() {
     
     log_info "正在启动 OpenClaw 服务..."
     
-    # 使用 nohup 后台启动
-    nohup openclaw gateway --port "$PORT" > "$log_file" 2>&1 &
+    # 使用 setsid 创建新会话，完全脱离父进程
+    # 这样即使父进程（Node.js）退出，openclaw 也不会被终止
+    log_info "使用 setsid 启动，确保进程脱离父进程..."
+    if command -v setsid &>/dev/null; then
+        setsid bash -c "openclaw gateway run --port $PORT" > "$log_file" 2>&1 &
+    else
+        # 如果没有 setsid，使用 nohup 作为后备
+        log_warn "setsid 不可用，使用 nohup 作为后备..."
+        nohup openclaw gateway run --port "$PORT" > "$log_file" 2>&1 &
+    fi
     
     log_info "OpenClaw 服务启动命令已发送（PID: $!）"
     log_info "日志文件: $log_file"

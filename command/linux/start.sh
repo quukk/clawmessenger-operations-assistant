@@ -186,12 +186,25 @@ start_docker() {
     local pid
     pid=$(get_openclaw_pid)
     if [ -n "$pid" ]; then
-        log_info "OpenClaw 服务已经在运行中。"
+        log_info "检测到 openclaw 进程 (PID: $pid)"
         if check_port "$PORT"; then
+            log_info "OpenClaw 服务已经在运行中。"
             log_info "控制界面访问地址: http://127.0.0.1:$PORT/"
+            log_info "Success"
+            exit 0
+        else
+            log_warn "进程存在但端口 $PORT 未监听，进程可能未正确启动或已崩溃"
+            log_warn "将停止现有进程并重新启动..."
+            # 停止现有进程
+            kill -15 "$pid" 2>/dev/null || true
+            sleep 2
+            # 检查是否还在运行
+            if ps -p "$pid" > /dev/null 2>&1; then
+                log_warn "进程仍在运行，强制停止..."
+                kill -9 "$pid" 2>/dev/null || true
+                sleep 1
+            fi
         fi
-        log_info "Success"
-        exit 0
     fi
     
     # 检查 openclaw 命令是否存在
@@ -288,13 +301,21 @@ start_docker() {
     # 注意：openclaw gateway 可能使用不同的参数名
     log_info "尝试启动: openclaw gateway run --port $PORT"
     
-    # 使用 nohup 后台启动，将输出重定向到日志文件
-    nohup openclaw gateway run --port "$PORT" > "$log_file" 2>&1 &
+    # 使用 setsid 创建新会话，完全脱离父进程
+    # 这样即使父进程（Node.js）退出，openclaw 也不会被终止
+    log_info "使用 setsid 启动，确保进程脱离父进程..."
+    if command -v setsid &>/dev/null; then
+        setsid bash -c "openclaw gateway run --port $PORT" > "$log_file" 2>&1 &
+    else
+        # 如果没有 setsid，使用 nohup 作为后备
+        log_warn "setsid 不可用，使用 nohup 作为后备..."
+        nohup openclaw gateway run --port "$PORT" > "$log_file" 2>&1 &
+    fi
+    local started_pid=$!
+    log_info "启动的进程 PID: $started_pid"
     
     # 等待 15 秒检查进程是否启动（给更多时间初始化）
     sleep 15
-    local started_pid=$!
-    log_info "启动的进程 PID: $started_pid"
     
     # 检查进程是否存在
     if ! ps -p "$started_pid" > /dev/null 2>&1; then

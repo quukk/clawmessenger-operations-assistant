@@ -247,10 +247,17 @@ class ScriptExecutor {
         console.log(`[ScriptExecutor-DEBUG] SHELL: ${process.env.SHELL}`);
       }
 
-      const child = spawn(cmd, args, {
-        detached: false,
+      // 对于启动脚本，使用 detached: true 允许子进程脱离父进程
+      // 这样 openclaw 进程不会在脚本结束后被终止
+      const isStartScript = scriptPath.includes('start');
+      const spawnOptions = {
+        detached: isStartScript,  // 启动脚本使用 detached 模式
         windowsHide: true
-      });
+      };
+      
+      console.log(`[ScriptExecutor] spawn 选项: detached=${spawnOptions.detached}`);
+      
+      const child = spawn(cmd, args, spawnOptions);
 
       let stdout = '';
       let stderr = '';
