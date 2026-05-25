@@ -223,9 +223,30 @@ start_docker() {
     debug_log "openclaw 版本信息:"
     openclaw --version 2>&1 | head -5 || true
     
+    # 检查 openclaw gateway help，确认参数格式
+    debug_log "openclaw gateway help 信息:"
+    openclaw gateway --help 2>&1 | head -20 || true
+    
+    # 尝试启动，如果失败则尝试其他参数格式
+    log_info "尝试启动 openclaw gateway..."
     nohup openclaw gateway --port "$PORT" --host 0.0.0.0 > "$log_file" 2>&1 &
     
-    log_info "OpenClaw 服务启动命令已发送（PID: $!）"
+    # 等待 2 秒检查进程是否启动
+    sleep 2
+    local started_pid=$!
+    if ! ps -p "$started_pid" > /dev/null 2>&1; then
+        log_warn "进程 $started_pid 已退出，尝试其他启动方式..."
+        # 尝试不带 --host 参数
+        nohup openclaw gateway --port "$PORT" > "$log_file" 2>&1 &
+        started_pid=$!
+        sleep 2
+        if ! ps -p "$started_pid" > /dev/null 2>&1; then
+            log_error "所有启动方式均失败，请检查日志：$log_file"
+            exit 1
+        fi
+    fi
+    
+    log_info "OpenClaw 服务启动命令已发送（PID: $started_pid）"
     log_info "日志文件: $log_file"
     
     # 等待端口就绪

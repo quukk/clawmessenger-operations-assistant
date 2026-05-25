@@ -156,6 +156,27 @@ async function getOpenClawStatus(port = 18789) {
   const processExists = checkProcessExists();
   if (processExists) {
     console.warn(`[PortChecker] 警告: openclaw 进程存在，但端口 ${port} 未监听。服务可能未正确启动或已崩溃。`);
+    // 尝试获取进程详细信息
+    try {
+      const { execSync } = require('child_process');
+      const psOutput = execSync('ps aux | grep -v grep | grep openclaw', { encoding: 'utf8', timeout: 5000 }).trim();
+      console.log(`[PortChecker] 进程详细信息:\n${psOutput}`);
+      
+      // 尝试获取进程监听的端口
+      const pid = psOutput.split(/\s+/)[1];
+      if (pid) {
+        try {
+          const netstatOutput = execSync(`netstat -tlnp 2>/dev/null | grep ${pid} || ss -tlnp 2>/dev/null | grep ${pid}`, { encoding: 'utf8', timeout: 5000 }).trim();
+          if (netstatOutput) {
+            console.log(`[PortChecker] 进程 ${pid} 监听的端口:\n${netstatOutput}`);
+          }
+        } catch (e) {
+          // 忽略错误
+        }
+      }
+    } catch (e) {
+      // 忽略错误
+    }
   }
   
   console.log(`[PortChecker] 端口 ${port} 检测为未运行`);
