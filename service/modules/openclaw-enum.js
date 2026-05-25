@@ -40,9 +40,21 @@ function isValidCommand(command) {
   return Object.values(OpenClawCommandEnum).includes(command);
 }
 
+function getCommandName(command) {
+  const names = {
+    [OpenClawCommandEnum.START]: '启动',
+    [OpenClawCommandEnum.STOP]: '停止',
+    [OpenClawCommandEnum.RESTART]: '重启',
+    [OpenClawCommandEnum.STATUS]: '状态检查',
+    [OpenClawCommandEnum.CONFIG_FIX]: '配置修复'
+  };
+  return names[command] || '未知命令';
+}
+
 module.exports = {
   OpenClawCommandEnum,
   OpenClawServiceStatus,
   getServiceStatusMessage,
-  isValidCommand
+  isValidCommand,
+  getCommandName
 };

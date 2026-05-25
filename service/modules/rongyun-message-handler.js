@@ -8,7 +8,7 @@
  * - DELETE_OPENCODE_SESSION: 删除会话
  */
 const { RongyunMessageTypeEnum } = require('./rongyun-message-types');
-const { OpenClawCommandEnum } = require('./openclaw-enum');
+const { OpenClawCommandEnum, getCommandName } = require('./openclaw-enum');
 const { executeCommand } = require('./openclaw-control');
 const { createOpencodeSession, deleteOpencodeSession, forwardChatMessage } = require('./opencode-service');
 const { ServiceManager } = require('./service-manager');
@@ -128,21 +128,39 @@ class RongyunMessageHandler {
     }
 
     this.commandLock = true;
-    // 设置 60 秒超时保护，防止命令永久卡住导致锁无法释放
+    // 设置 120 秒超时保护，防止命令永久卡住导致锁无法释放
+    // 启动命令可能需要较长时间（等待服务启动）
     this.commandLockTimer = setTimeout(() => {
-      this.logWarn('[RongyunMessageHandler] 命令锁超时（60秒），自动释放');
+      this.logWarn('[RongyunMessageHandler] 命令锁超时（120秒），自动释放');
       this.commandLock = false;
       this.commandLockTimer = null;
-    }, 60000);
+    }, 120000);
 
     try {
-      await executeCommand(command, null, async (response) => {
-        // 增加短暂延迟，避免融云 SDK 在收到消息后立刻回复时消息丢失
-        await new Promise(resolve => setTimeout(resolve, 500));
+      // 先发送响应，再执行命令（避免前端超时）
+      // 启动/停止/重启命令是异步的，前端只需要知道命令已接收
+      const isAsyncCommand = [OpenClawCommandEnum.START, OpenClawCommandEnum.STOP, OpenClawCommandEnum.RESTART].includes(command);
+      
+      if (isAsyncCommand) {
+        // 立即响应，告知前端命令已接收
         await this.sendResponse(RongyunMessageTypeEnum.COMMAND_RESULT, {
-          ...response,
-          command_id: commandId
+          command,
+          command_id: commandId,
+          status: 'success',
+          message: `${getCommandName(command)}命令已接收，正在执行...`
         }, requestId, sourceId);
+      }
+      
+      // 执行命令
+      await executeCommand(command, null, async (response) => {
+        if (!isAsyncCommand) {
+          // 同步命令立即响应
+          await this.sendResponse(RongyunMessageTypeEnum.COMMAND_RESULT, {
+            ...response,
+            command_id: commandId
+          }, requestId, sourceId);
+        }
+        // 异步命令不在这里响应，因为已经提前响应了
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
