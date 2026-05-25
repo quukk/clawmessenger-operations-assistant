@@ -151,8 +151,9 @@ class RongyunMessageHandler {
         }, requestId, sourceId);
       }
       
-      // 执行命令
-      await executeCommand(command, null, async (response) => {
+      // 执行命令（在后台异步执行，不阻塞响应）
+      // 使用 Promise 避免阻塞，让命令在后台执行
+      executeCommand(command, null, async (response) => {
         if (!isAsyncCommand) {
           // 同步命令立即响应
           await this.sendResponse(RongyunMessageTypeEnum.COMMAND_RESULT, {
@@ -161,6 +162,10 @@ class RongyunMessageHandler {
           }, requestId, sourceId);
         }
         // 异步命令不在这里响应，因为已经提前响应了
+        // 但我们可以在这里记录执行结果
+        this.logInfo(`[RongyunMessageHandler] 命令执行完成: command=${command}, status=${response.status}, message=${response.message}`);
+      }).catch(err => {
+        this.logError(`[RongyunMessageHandler] 命令执行失败: ${err.message}`);
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
