@@ -446,6 +446,7 @@ class ScriptExecutor {
         upper.includes('服务停止成功') ||
         upper.includes('服务已成功停止') ||
         upper.includes('GATEWAY STOP SIGNAL SENT') ||
+        upper.includes('STOPPED SUCCESSFULLY AFTER FORCE STOP') ||
         (upper.includes('[INFO] STOPPING SERVICE') && upper.includes('STOP SIGNAL'))
       ) {
         if (

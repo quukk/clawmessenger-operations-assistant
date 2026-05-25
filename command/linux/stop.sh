@@ -163,7 +163,9 @@ get_openclaw_pid() {
 }
 
 # Docker 模式：停止服务
+# 参数: $1 = force (1=强制停止, 空=优雅停止)
 stop_docker() {
+    local force="$1"
     log_info "=== OpenClaw Docker 停止模式 ==="
     log_info "检查 OpenClaw 服务状态..."
     
@@ -213,7 +215,33 @@ stop_docker() {
     
     log_info "发现 OpenClaw 进程: $all_pids"
     
-    # 直接发送 SIGKILL（强制停止），避免 SIGTERM 被忽略
+    # 如果不是强制模式，先尝试优雅停止
+    if [ -z "$force" ]; then
+        log_info "正在优雅停止 OpenClaw 服务..."
+        # 尝试发送 SIGTERM
+        for p in $all_pids; do
+            log_info "执行: kill -15 $p"
+            kill -15 "$p" 2>/dev/null || log_warn "kill -15 $p 失败"
+        done
+        
+        # 等待 3 秒让服务优雅退出
+        log_info "等待 3 秒让服务优雅退出..."
+        sleep 3
+        
+        # 检查是否已停止
+        local pid_after_graceful
+        pid_after_graceful=$(get_openclaw_pid)
+        if [ -z "$pid_after_graceful" ] && ! check_port "$PORT"; then
+            log_info "OpenClaw 服务已通过优雅停止退出。"
+            log_info "服务已成功停止。"
+            log_info "Success"
+            exit 0
+        fi
+        
+        log_warn "优雅停止失败，服务仍在运行，切换到强制停止..."
+    fi
+    
+    # 强制停止模式（直接发送 SIGKILL）
     log_info "正在强制停止 OpenClaw 服务（SIGKILL）..."
     for p in $all_pids; do
         log_info "执行: kill -9 $p"
@@ -227,10 +255,10 @@ stop_docker() {
     
     # 连续监控模式：每秒检查并杀死看门狗重启的进程
     # 这样即使看门狗立即重启，也会被再次杀死
-    log_info "进入连续监控模式（最多 10 秒），防止看门狗自动重启..."
+    log_info "进入连续监控模式（最多 15 秒），防止看门狗自动重启..."
     local elapsed=0
     local consecutive_empty=0
-    while [ $elapsed -lt 10 ]; do
+    while [ $elapsed -lt 15 ]; do
         sleep 1
         
         # 检查是否还有 openclaw 进程
@@ -243,11 +271,17 @@ stop_docker() {
             remaining_pids=$(ps aux | grep -v grep | grep "openclaw" | awk '{print $2}' | tr '\n' ' ')
         fi
         
-        if [ -z "$remaining_pids" ]; then
+        # 同时检查端口是否仍在监听
+        local port_listening=false
+        if check_port "$PORT"; then
+            port_listening=true
+        fi
+        
+        if [ -z "$remaining_pids" ] && [ "$port_listening" = false ]; then
             consecutive_empty=$((consecutive_empty + 1))
-            log_info "第 $elapsed 秒: 无 openclaw 进程（连续 $consecutive_empty 次）"
-            # 连续 2 秒没有进程，认为已停止
-            if [ $consecutive_empty -ge 2 ]; then
+            log_info "第 $elapsed 秒: 无 openclaw 进程且端口未监听（连续 $consecutive_empty 次）"
+            # 连续 3 秒没有进程且端口未监听，认为已停止
+            if [ $consecutive_empty -ge 3 ]; then
                 log_info "OpenClaw 服务已停止。（看门狗已放弃重启）"
                 log_info "服务已成功停止。"
                 log_info "Success"
@@ -255,7 +289,15 @@ stop_docker() {
             fi
         else
             consecutive_empty=0
-            log_info "第 $elapsed 秒: 发现新进程 $remaining_pids，再次 kill..."
+            if [ -n "$remaining_pids" ]; then
+                log_info "第 $elapsed 秒: 发现新进程 $remaining_pids，再次 kill..."
+            fi
+            if [ "$port_listening" = true ]; then
+                log_info "第 $elapsed 秒: 端口 $PORT 仍在监听，尝试 fuser 终止..."
+                if command -v fuser &>/dev/null; then
+                    fuser -k "${PORT}/tcp" 2>/dev/null || true
+                fi
+            fi
             pkill -9 -f "openclaw" 2>/dev/null || true
             killall -9 openclaw 2>/dev/null || true
         fi
@@ -282,19 +324,33 @@ stop_docker() {
         ss -tlnp 2>/dev/null | grep ":${PORT} " || log_info "端口 ${PORT} 未监听"
     fi
     
-    if [ -z "$remaining_pids" ]; then
+    # 最终验证：同时检查进程和端口
+    local port_listening_final=false
+    if check_port "$PORT"; then
+        port_listening_final=true
+    fi
+    
+    if [ -z "$remaining_pids" ] && [ "$port_listening_final" = false ]; then
         log_info "OpenClaw 服务已停止。"
         log_info "服务已成功停止。"
         log_info "Success"
         exit 0
     else
-        log_error "OpenClaw 服务停止失败！进程仍然存在: $remaining_pids"
+        if [ -n "$remaining_pids" ]; then
+            log_error "OpenClaw 服务停止失败！进程仍然存在: $remaining_pids"
+        fi
+        if [ "$port_listening_final" = true ]; then
+            log_error "OpenClaw 服务停止失败！端口 $PORT 仍在监听。"
+        fi
         exit 1
     fi
 }
 
 # Systemd 模式：停止服务
+# 参数: $1 = force (1=强制停止, 空=优雅停止)
 stop_systemd() {
+    local force="$1"
+    
     # 检查服务是否存在
     if ! systemctl --user list-unit-files "$SERVICE_NAME" &>/dev/null; then
         log_error "服务 $SERVICE_NAME 不存在。"
@@ -321,8 +377,33 @@ stop_systemd() {
         
         # 验证服务状态
         if systemctl --user is-active --quiet "$SERVICE_NAME"; then
-            log_warn "服务可能仍在运行，请检查进程。"
-            systemctl --user status "$SERVICE_NAME" --no-pager
+            if [ -n "$force" ]; then
+                log_warn "服务仍在运行，执行强制停止..."
+                # 获取进程 PID 并强制终止
+                local main_pid
+                main_pid=$(systemctl --user show "$SERVICE_NAME" --property=MainPID --value)
+                if [ -n "$main_pid" ] && [ "$main_pid" != "0" ]; then
+                    log_info "强制终止进程 PID: $main_pid"
+                    kill -9 "$main_pid" 2>/dev/null || true
+                fi
+                # 同时清理所有 openclaw 相关进程
+                pkill -9 -f "openclaw" 2>/dev/null || true
+                killall -9 openclaw 2>/dev/null || true
+                
+                sleep 2
+                
+                if ! systemctl --user is-active --quiet "$SERVICE_NAME"; then
+                    log_info "服务已成功强制停止。"
+                    log_info "Success"
+                    exit 0
+                else
+                    log_error "强制停止失败！服务仍在运行。"
+                    exit 1
+                fi
+            else
+                log_warn "服务可能仍在运行，请检查进程。"
+                systemctl --user status "$SERVICE_NAME" --no-pager
+            fi
         else
             log_info "服务已成功停止。"
             log_info "Success"
@@ -372,9 +453,9 @@ main() {
     done
     
     if is_docker; then
-        stop_docker
+        stop_docker "$force"
     else
-        stop_systemd
+        stop_systemd "$force"
     fi
 }
 

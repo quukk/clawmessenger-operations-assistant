@@ -138,25 +138,62 @@ async function verifyCommandResult(command, result, scriptOutput = '') {
   if (command === OpenClawCommandEnum.STOP) {
     // 停止命令验证：多次检查端口并重复执行停止，处理看门狗自动重启
     console.log(`[OpenClawControl] 开始验证停止结果...`);
-    
+
     let portStatus = 1;
     let stopAttempts = 0;
     const maxStopAttempts = 3; // 最多执行 3 次停止
-    
+
     // 等待 3 秒，给看门狗一次重启机会，然后验证
     await new Promise(resolve => setTimeout(resolve, 3000));
-    
-    portStatus = await getOpenClawStatus(18789);
-    console.log(`[OpenClawControl] 停止后端口状态: ${portStatus}`);
-    
+
+    while (stopAttempts < maxStopAttempts) {
+      portStatus = await getOpenClawStatus(18789);
+      console.log(`[OpenClawControl] 停止后端口状态 (尝试 ${stopAttempts + 1}/${maxStopAttempts}): ${portStatus}`);
+
+      if (portStatus !== 1) {
+        console.log(`[OpenClawControl] 停止验证通过: 端口已关闭`);
+        break;
+      }
+
+      stopAttempts++;
+      if (stopAttempts < maxStopAttempts) {
+        console.log(`[OpenClawControl] 端口仍在监听，尝试第 ${stopAttempts + 1} 次停止...`);
+        const scriptResult = await executeWithScript(command);
+        const retryResult = scriptResult.result;
+        console.log(`[OpenClawControl] 第 ${stopAttempts} 次重试停止结果: ${retryResult.status} - ${retryResult.message}`);
+
+        // 等待看门狗重启后再检查
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
+    }
+
     if (portStatus === 1) {
+      console.error(`[OpenClawControl] 停止失败: 端口 18789 仍在监听。尝试强制停止...`);
+      
+      // 尝试强制停止
+      const forceScriptResult = await executeWithScript(command);
+      const forceResult = forceScriptResult.result;
+      console.log(`[OpenClawControl] 强制停止结果: ${forceResult.status} - ${forceResult.message}`);
+      
+      // 再次验证端口
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      const finalPortStatus = await getOpenClawStatus(18789);
+      
+      if (finalPortStatus !== 1) {
+        console.log(`[OpenClawControl] 强制停止成功: 端口已关闭`);
+        return {
+          status: OpenClawServiceStatus.STOP_SUCCESS,
+          message: '服务已停止（强制停止）'
+        };
+      }
+      
       console.error(`[OpenClawControl] 停止失败: 端口 18789 仍在监听。stop.sh 可能未能成功停止服务。`);
       return {
         status: OpenClawServiceStatus.ERROR,
         message: '停止失败: 服务仍在运行'
       };
     }
-    
+
     console.log(`[OpenClawControl] 停止验证通过: 端口已关闭`);
   } else if (command === OpenClawCommandEnum.START || command === OpenClawCommandEnum.RESTART) {
     // 等待服务启动
