@@ -246,14 +246,53 @@ start_docker() {
         cat /tmp/openclaw-run-help.txt | head -30
     fi
     
+    # 先停止所有已有的 openclaw 进程，避免端口冲突
+    log_info "检查并停止已有的 openclaw 进程..."
+    local existing_pids=""
+    if command -v pgrep &>/dev/null; then
+        existing_pids=$(pgrep -f "openclaw" | tr '\n' ' ')
+    elif command -v pidof &>/dev/null; then
+        existing_pids=$(pidof openclaw)
+    else
+        existing_pids=$(ps aux | grep -v grep | grep "openclaw" | awk '{print $2}' | tr '\n' ' ')
+    fi
+    
+    if [ -n "$existing_pids" ]; then
+        log_warn "发现已有 openclaw 进程: $existing_pids，先停止它们..."
+        for ep in $existing_pids; do
+            log_info "停止进程 $ep..."
+            kill -15 "$ep" 2>/dev/null || true
+        done
+        # 等待 3 秒让进程优雅退出
+        sleep 3
+        # 检查是否还有残留进程，如果有则强制停止
+        local remaining_pids=""
+        if command -v pgrep &>/dev/null; then
+            remaining_pids=$(pgrep -f "openclaw" | tr '\n' ' ')
+        fi
+        if [ -n "$remaining_pids" ]; then
+            log_warn "强制停止残留进程: $remaining_pids"
+            for rp in $remaining_pids; do
+                kill -9 "$rp" 2>/dev/null || true
+            done
+            sleep 1
+        fi
+    fi
+    
+    # 确保端口未被占用
+    if command -v fuser &>/dev/null; then
+        fuser -k "${PORT}/tcp" 2>/dev/null || true
+    fi
+    
     # 尝试使用正确的参数启动
     # 注意：openclaw gateway 可能使用不同的参数名
-    # 在 Docker 环境中，使用 run 子命令前台运行，而不是后台启动
     log_info "尝试启动: openclaw gateway run --port $PORT"
+    
+    # 使用 nohup 后台启动，将输出重定向到日志文件
     nohup openclaw gateway run --port "$PORT" > "$log_file" 2>&1 &
     
-    # 等待 10 秒检查进程是否启动（给更多时间）
-    sleep 10
+    # 等待 15 秒检查进程是否启动（给更多时间初始化）
+    sleep 15
     local started_pid=$!
     log_info "启动的进程 PID: $started_pid"
     
