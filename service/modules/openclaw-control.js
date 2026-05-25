@@ -58,14 +58,61 @@ function getCommandName(command) {
 
 /**
  * 检测是否在 Docker 环境（无 systemd）
+ * 使用多种方法检测，提高可靠性
  */
 function isDockerEnvironment() {
   try {
     const fs = require('fs');
-    // 检查 /proc/1/cgroup 是否包含 docker
-    const cgroup = fs.readFileSync('/proc/1/cgroup', 'utf8');
-    return cgroup.includes('docker');
+    const { execSync } = require('child_process');
+    
+    // 方法1: 检查 /proc/1/cgroup 是否包含 docker
+    try {
+      const cgroup = fs.readFileSync('/proc/1/cgroup', 'utf8');
+      if (cgroup.includes('docker') || cgroup.includes('containerd')) {
+        console.log('[OpenClawControl] Docker 检测: /proc/1/cgroup 包含 docker/containerd');
+        return true;
+      }
+    } catch (e) {
+      // 文件不存在或读取失败
+    }
+    
+    // 方法2: 检查 /.dockerenv 文件是否存在
+    try {
+      fs.accessSync('/.dockerenv', fs.constants.F_OK);
+      console.log('[OpenClawControl] Docker 检测: /.dockerenv 文件存在');
+      return true;
+    } catch (e) {
+      // 文件不存在
+    }
+    
+    // 方法3: 检查环境变量
+    if (process.env.DOCKER_CONTAINER || process.env.KUBERNETES_SERVICE_HOST) {
+      console.log('[OpenClawControl] Docker 检测: 环境变量指示 Docker/K8s');
+      return true;
+    }
+    
+    // 方法4: 检查 systemd 是否运行（Docker 通常没有 systemd）
+    try {
+      // 如果 systemctl 命令不存在，可能是 Docker
+      execSync('command -v systemctl', { stdio: 'ignore' });
+      // systemctl 存在，检查是否实际运行
+      try {
+        execSync('systemctl status', { stdio: 'ignore', timeout: 2000 });
+        // systemd 正在运行，不是 Docker
+        console.log('[OpenClawControl] Docker 检测: systemd 正在运行，不是 Docker');
+        return false;
+      } catch (e) {
+        // systemctl 存在但无法使用，可能是 Docker
+        console.log('[OpenClawControl] Docker 检测: systemctl 存在但无法使用，可能是 Docker');
+        return true;
+      }
+    } catch (e) {
+      // systemctl 命令不存在，可能是 Docker
+      console.log('[OpenClawControl] Docker 检测: systemctl 命令不存在，可能是 Docker');
+      return true;
+    }
   } catch (e) {
+    console.error('[OpenClawControl] Docker 检测异常:', e.message);
     return false;
   }
 }
