@@ -59,6 +59,14 @@ function fixShellScriptLineEndings() {
           fixedCount++;
           console.log(`[postinstall] 已修复 ${file} 换行符（CRLF → LF）`);
         }
+        // 确保脚本有执行权限
+        try {
+          fs.accessSync(filePath, fs.constants.X_OK);
+        } catch (e) {
+          // 没有执行权限，添加
+          fs.chmodSync(filePath, 0o755);
+          console.log(`[postinstall] 已添加 ${file} 执行权限`);
+        }
       } catch (e) {
         console.warn(`[postinstall] 修复 ${file} 失败: ${e.message}`);
       }
