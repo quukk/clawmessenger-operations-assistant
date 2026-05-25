@@ -229,20 +229,58 @@ start_docker() {
     
     # 尝试启动，如果失败则尝试其他参数格式
     log_info "尝试启动 openclaw gateway..."
-    nohup openclaw gateway --port "$PORT" --host 0.0.0.0 > "$log_file" 2>&1 &
     
-    # 等待 2 秒检查进程是否启动
-    sleep 2
+    # 先尝试查看 openclaw gateway 的帮助信息，确认正确的参数格式
+    log_info "检查 openclaw gateway 支持的参数..."
+    openclaw gateway --help > /tmp/openclaw-help.txt 2>&1 || true
+    if [ -f /tmp/openclaw-help.txt ]; then
+        log_info "openclaw gateway help 输出:"
+        cat /tmp/openclaw-help.txt | head -30
+    fi
+    
+    # 尝试使用正确的参数启动
+    # 注意：openclaw gateway 可能使用不同的参数名
+    log_info "尝试启动: openclaw gateway --port $PORT"
+    nohup openclaw gateway --port "$PORT" > "$log_file" 2>&1 &
+    
+    # 等待 5 秒检查进程是否启动（给更多时间）
+    sleep 5
     local started_pid=$!
+    log_info "启动的进程 PID: $started_pid"
+    
+    # 检查进程是否存在
     if ! ps -p "$started_pid" > /dev/null 2>&1; then
-        log_warn "进程 $started_pid 已退出，尝试其他启动方式..."
-        # 尝试不带 --host 参数
-        nohup openclaw gateway --port "$PORT" > "$log_file" 2>&1 &
-        started_pid=$!
-        sleep 2
-        if ! ps -p "$started_pid" > /dev/null 2>&1; then
-            log_error "所有启动方式均失败，请检查日志：$log_file"
-            exit 1
+        log_warn "进程 $started_pid 已退出，检查日志..."
+        if [ -f "$log_file" ]; then
+            log_warn "openclaw 日志内容:"
+            cat "$log_file" | tail -20
+        fi
+        log_error "启动失败，请检查日志：$log_file"
+        exit 1
+    fi
+    
+    log_info "进程 $started_pid 正在运行"
+    
+    # 检查进程监听的端口
+    log_info "检查进程监听的端口..."
+    sleep 2
+    local listening_ports=$(netstat -tlnp 2>/dev/null | grep "$started_pid" || ss -tlnp 2>/dev/null | grep "$started_pid" || echo "")
+    if [ -n "$listening_ports" ]; then
+        log_info "进程 $started_pid 监听的端口:"
+        echo "$listening_ports"
+    else
+        log_warn "进程 $started_pid 未监听任何端口，检查是否有子进程..."
+        # 检查子进程
+        local child_pids=$(pgrep -P "$started_pid" 2>/dev/null || echo "")
+        if [ -n "$child_pids" ]; then
+            log_info "发现子进程: $child_pids"
+            for child_pid in $child_pids; do
+                local child_ports=$(netstat -tlnp 2>/dev/null | grep "$child_pid" || ss -tlnp 2>/dev/null | grep "$child_pid" || echo "")
+                if [ -n "$child_ports" ]; then
+                    log_info "子进程 $child_pid 监听的端口:"
+                    echo "$child_ports"
+                fi
+            done
         fi
     fi
     
@@ -256,6 +294,10 @@ start_docker() {
         log_info "Success"
     else
         log_error "服务启动超时，请检查日志：$log_file"
+        log_info "openclaw 进程状态:"
+        ps aux | grep -v grep | grep openclaw || true
+        log_info "端口监听状态:"
+        netstat -tlnp 2>/dev/null | grep openclaw || ss -tlnp 2>/dev/null | grep openclaw || true
         exit 1
     fi
 }
