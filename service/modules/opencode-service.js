@@ -164,9 +164,11 @@ async function forwardChatMessage(sessionId, content, onDelta, logFn, timeoutMs 
   log('DEBUG', `发送消息: ${content}`);
   log('DEBUG', `请求超时: ${timeoutMs}ms`);
   
-  // 构建请求体，包含 system 参数
+  // 构建请求体，包含 system 和 model 参数
+  // model 字段是必需的，告诉 Gateway 使用哪个 AI 提供商和模型
   const requestBody = {
     system: SYSTEM_PROMPT,
+    model: { providerID: 'opencode', modelID: 'default' },
     parts: [{ type: 'text', text: content }]
   };
   
