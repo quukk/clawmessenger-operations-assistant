@@ -28,6 +28,31 @@ let crashCount = 0;
 let lastCrashTime = 0;
 const updater = new Updater();
 
+// 检测是否是 npm 更新后的重启
+const VERSION_FILE = path.join(os.tmpdir(), '.claw-subagent-service.version');
+function detectUpdateRestart() {
+  try {
+    const currentVersion = updater.loadCurrentVersion();
+    let previousVersion = null;
+    
+    if (fs.existsSync(VERSION_FILE)) {
+      previousVersion = fs.readFileSync(VERSION_FILE, 'utf8').trim();
+    }
+    
+    // 写入当前版本
+    fs.writeFileSync(VERSION_FILE, currentVersion);
+    
+    // 如果之前有版本记录，且当前版本不同，说明是更新后的重启
+    if (previousVersion && previousVersion !== currentVersion) {
+      log.info(`[DAEMON] 检测到版本变化: ${previousVersion} → ${currentVersion}，这是更新后的重启`);
+      return true;
+    }
+  } catch (err) {
+    log.warn(`[DAEMON] 检测版本变化失败: ${err.message}`);
+  }
+  return false;
+}
+
 process.chdir(__dirname);
 
 /**
@@ -359,7 +384,14 @@ process.on('message', (msg) => {
   if (msg === 'shutdown') gracefulShutdown();
 });
 
-startWorker(false, null);
+// 检测是否是 npm 更新后的重启
+const isAfterNpmUpdate = detectUpdateRestart();
+if (isAfterNpmUpdate) {
+  log.info('[DAEMON] npm 更新后的重启，启动 Worker 并设置健康观察...');
+  startWorker(true, null);
+} else {
+  startWorker(false, null);
+}
 updater.startSchedule(restartWorkerWithUpdate);
 
 process.on('uncaughtException', (err) => {

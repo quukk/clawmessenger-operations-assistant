@@ -251,6 +251,14 @@ class OpenClawClient {
   static waitQueue = [];
   // Session 级串行锁：确保同一 session 不会并发 spawn 多个进程
   static sessionLocks = new Map();
+  // 会话历史管理：为每个用户维护对话上下文
+  static conversationHistory = new Map();
+  // 最大历史轮数（用户+AI 各算一轮）
+  static maxHistoryRounds = 50;
+  // 单条消息最大长度（超过则截断）
+  static maxMessageLength = 2000;
+  // 活跃请求管理：为每个用户跟踪当前正在进行的请求
+  static activeRequests = new Map();
 
   static async acquireSlot() {
     if (OpenClawClient.runningCount < OpenClawClient.maxConcurrency) {
@@ -273,6 +281,71 @@ class OpenClawClient {
     this.log = log;
     this.gatewayStarting = false;
     this.gatewayStarted = false;
+  }
+
+  /**
+   * 获取用户的会话历史
+   * @param {string} fromUser - 用户ID
+   * @returns {Array} 消息历史数组
+   */
+  _getConversationHistory(fromUser) {
+    return OpenClawClient.conversationHistory.get(fromUser) || [];
+  }
+
+  /**
+   * 添加消息到会话历史
+   * @param {string} fromUser - 用户ID
+   * @param {string} role - 角色 ('user' 或 'assistant')
+   * @param {string} content - 消息内容
+   */
+  _addToHistory(fromUser, role, content) {
+    let history = this._getConversationHistory(fromUser);
+    
+    // 截断过长的消息
+    let truncatedContent = content;
+    if (content.length > OpenClawClient.maxMessageLength) {
+      truncatedContent = content.substring(0, OpenClawClient.maxMessageLength) + '...';
+      this.log?.warn(`[OpenClawClient] 消息过长已截断: ${content.length} -> ${truncatedContent.length}`);
+    }
+    
+    history.push({ role, content: truncatedContent });
+    
+    // 保持历史记录在限制范围内（保留最近的 N 轮对话）
+    // 每轮包含 user + assistant 两条消息
+    const maxMessages = OpenClawClient.maxHistoryRounds * 2;
+    if (history.length > maxMessages) {
+      // 移除最旧的消息对
+      history = history.slice(history.length - maxMessages);
+      this.log?.info(`[OpenClawClient] 历史记录已裁剪，保留最近 ${OpenClawClient.maxHistoryRounds} 轮`);
+    }
+    
+    OpenClawClient.conversationHistory.set(fromUser, history);
+  }
+
+  /**
+   * 清空用户的会话历史
+   * @param {string} fromUser - 用户ID
+   */
+  clearHistory(fromUser) {
+    OpenClawClient.conversationHistory.delete(fromUser);
+    this.log?.info(`[OpenClawClient] 已清空用户 ${fromUser} 的对话历史`);
+  }
+
+  /**
+   * 构建包含历史记录的 messages 数组
+   * @param {string} fromUser - 用户ID
+   * @param {string} currentMessage - 当前用户消息
+   * @returns {Array} 完整的 messages 数组
+   */
+  _buildMessagesWithHistory(fromUser, currentMessage) {
+    const history = this._getConversationHistory(fromUser);
+    const messages = [...history];
+    
+    // 添加当前消息
+    messages.push({ role: 'user', content: currentMessage });
+    
+    this.log?.info(`[OpenClawClient] 构建消息上下文: 历史 ${history.length} 条 + 当前消息, 总共 ${messages.length} 条`);
+    return messages;
   }
 
   /**
@@ -343,6 +416,21 @@ class OpenClawClient {
    * @param {Function} onError - 出错时的回调 (error: Error) => void
    * @returns {Promise<void>}
    */
+  /**
+   * 取消用户的活跃请求
+   * @param {string} fromUser - 用户ID
+   */
+  cancelActiveRequest(fromUser) {
+    const activeRequest = OpenClawClient.activeRequests.get(fromUser);
+    if (activeRequest) {
+      this.log?.info(`[OpenClawClient] 取消用户 ${fromUser} 的活跃请求`);
+      activeRequest.abort();
+      OpenClawClient.activeRequests.delete(fromUser);
+      return true;
+    }
+    return false;
+  }
+
   async chatStream(message, fromUser, onDelta, onDone, onError) {
     if (!message || !message.trim()) {
       onError?.(new Error('消息内容为空'));
@@ -357,6 +445,12 @@ class OpenClawClient {
       return;
     }
 
+    // 取消该用户之前的活跃请求（如果存在）
+    const hasCancelled = this.cancelActiveRequest(fromUser);
+    if (hasCancelled) {
+      this.log?.info(`[OpenClawClient] 用户 ${fromUser} 的新消息到达，已取消前一条消息的回复`);
+    }
+
     this.log?.info(`[OpenClawClient] 准备 SSE 流式调用 OpenClaw，from=${fromUser}`);
 
     const gatewayToken = getGatewayToken();
@@ -368,12 +462,26 @@ class OpenClawClient {
       'http://127.0.0.1:18789/v1/responses'
     ];
 
+    // 构建包含历史记录的完整消息
+    const messagesWithHistory = this._buildMessagesWithHistory(fromUser, message);
+
     for (let i = 0; i < endpoints.length; i++) {
       const apiUrl = endpoints[i];
       try {
-        await this._doChatStream(apiUrl, gatewayToken, sessionId, message, onDelta, onDone);
+        const fullText = await this._doChatStream(apiUrl, gatewayToken, sessionId, fromUser, messagesWithHistory, onDelta, onDone);
+        
+        // 成功响应后，保存当前对话到历史记录
+        this._addToHistory(fromUser, 'user', message);
+        this._addToHistory(fromUser, 'assistant', fullText);
+        
         return; // 成功则直接返回
       } catch (err) {
+        // 检查是否是取消错误
+        if (err.name === 'AbortError' || err.message?.includes('aborted')) {
+          this.log?.info(`[OpenClawClient] 请求被用户取消: ${fromUser}`);
+          return;
+        }
+
         const is404 = err.response?.status === 404;
         const isLast = i === endpoints.length - 1;
 
@@ -383,12 +491,41 @@ class OpenClawClient {
         }
 
         if (is404 && isLast) {
-          this.log?.error(`[OpenClawClient] 所有 SSE 端点均返回 404。OpenClaw chatCompletions 端点未启用。`);
+          this.log?.error(`[OpenClawClient] 所有 SSE 端点均返回 404。OpenClaw responses 端点未启用。`);
           this.log?.error(`[OpenClawClient] 请检查 ~/.openclaw/openclaw.json 中是否包含:`);
-          this.log?.error(`[OpenClawClient]   gateway.http.endpoints.chatCompletions.enabled = true`);
+          this.log?.error(`[OpenClawClient]   gateway.http.endpoints.responses.enabled = true`);
           this.log?.error(`[OpenClawClient] 修改后请重启 OpenClaw gateway: openclaw gateway`);
         } else {
           this.log?.error(`[OpenClawClient] SSE 请求失败: ${err.message}`);
+          // 打印详细错误响应
+          if (err.response) {
+            this.log?.error(`[OpenClawClient] 错误状态码: ${err.response.status}`);
+            // 安全地提取错误信息
+            try {
+              const errorData = err.response.data;
+              if (typeof errorData === 'string') {
+                this.log?.error(`[OpenClawClient] 错误响应: ${errorData}`);
+              } else if (errorData && typeof errorData === 'object') {
+                // 检查是否是 IncomingMessage 对象（流）
+                if (errorData._readableState || errorData.socket) {
+                  // 这是一个流对象，尝试读取其中的数据
+                  const buffer = errorData._readableState?.buffer;
+                  if (buffer && buffer.length > 0) {
+                    const dataStr = buffer[0].toString('utf8');
+                    this.log?.error(`[OpenClawClient] 错误响应(流): ${dataStr}`);
+                  } else {
+                    this.log?.error(`[OpenClawClient] 错误响应(流对象，无法读取)`);
+                  }
+                } else {
+                  // 提取常见错误字段
+                  const errorMsg = errorData.error?.message || errorData.message || errorData.error || JSON.stringify(errorData);
+                  this.log?.error(`[OpenClawClient] 错误响应: ${errorMsg}`);
+                }
+              }
+            } catch (e) {
+              this.log?.error(`[OpenClawClient] 无法解析错误响应: ${e.message}`);
+            }
+          }
         }
         // 不再内部调用 onError，让错误通过 Promise reject 向上传播，便于调用方回退
         throw err;
@@ -396,7 +533,34 @@ class OpenClawClient {
     }
   }
 
-  async _doChatStream(apiUrl, gatewayToken, sessionId, message, onDelta, onDone) {
+  async _downloadImageAsBase64(imageUrl) {
+    try {
+      this.log?.info(`[OpenClawClient] 下载图片: ${imageUrl}`);
+      const response = await axios.get(imageUrl, {
+        responseType: 'arraybuffer',
+        timeout: 30000,
+        maxContentLength: 10 * 1024 * 1024 // 10MB
+      });
+      
+      const buffer = Buffer.from(response.data);
+      const base64 = buffer.toString('base64');
+      
+      // 检测 MIME 类型
+      const contentType = response.headers['content-type'] || 'image/jpeg';
+      this.log?.info(`[OpenClawClient] 图片下载完成: ${imageUrl}, size=${buffer.length}, type=${contentType}`);
+      
+      // 返回对象，包含纯 base64 和 MIME 类型
+      return {
+        base64: base64,
+        mediaType: contentType
+      };
+    } catch (err) {
+      this.log?.error(`[OpenClawClient] 图片下载失败: ${imageUrl}, ${err.message}`);
+      throw err;
+    }
+  }
+
+  async _doChatStream(apiUrl, gatewayToken, sessionId, fromUser, messages, onDelta, onDone) {
     const headers = {
       'Content-Type': 'application/json',
       'Accept': 'text/event-stream'
@@ -405,14 +569,62 @@ class OpenClawClient {
       headers['Authorization'] = `Bearer ${gatewayToken}`;
     }
 
-    const payload = {
-      model: 'openclaw',
-      messages: [
-        { role: 'user', content: message }
-      ],
-      stream: true,
-      max_tokens: 2048
-    };
+    // messages 现在是数组，包含历史记录和当前消息
+    // 检测最后一条消息是否包含图片 URL
+    const lastMessage = messages[messages.length - 1];
+    const messageContent = typeof lastMessage.content === 'string' ? lastMessage.content : '';
+    const imageUrlMatch = messageContent.match(/\[图片\]\s*(https?:\/\/[^\s]+)/);
+    
+    let payload;
+    
+    if (imageUrlMatch) {
+      // 多模态格式：图片 + 文本
+      const imageUrl = imageUrlMatch[1];
+      const textContent = messageContent.replace(/\[图片\]\s*https?:\/\/[^\s]+/, '').trim();
+      
+      try {
+        // 下载图片并转换为 base64
+        const imageData = await this._downloadImageAsBase64(imageUrl);
+        
+        // 构建包含历史的 messages，最后一条替换为多模态格式
+        const messagesWithImage = messages.slice(0, -1).concat([{
+          role: 'user',
+          content: [
+            { type: 'text', text: textContent || '' },
+            { 
+              type: 'image_url', 
+              image_url: { 
+                url: `data:${imageData.mediaType};base64,${imageData.base64}` 
+              } 
+            }
+          ]
+        }]);
+        
+        payload = {
+          model: 'openclaw',
+          messages: messagesWithImage,
+          stream: true,
+          max_tokens: 2048
+        };
+      } catch (err) {
+        this.log?.warn(`[OpenClawClient] 图片处理失败，回退到文本模式: ${err.message}`);
+        // 回退到纯文本模式
+        payload = {
+          model: 'openclaw',
+          messages: messages,
+          stream: true,
+          max_tokens: 2048
+        };
+      }
+    } else {
+      // 纯文本格式 - 使用包含历史记录的 messages
+      payload = {
+        model: 'openclaw',
+        messages: messages,
+        stream: true,
+        max_tokens: 2048
+      };
+    }
 
     this.log?.info(`[OpenClawClient] SSE 请求 payload: ${JSON.stringify(payload)}`);
 
@@ -422,10 +634,17 @@ class OpenClawClient {
     let hasError = false;
     let errorMsg = '';
 
+    // 创建 AbortController 用于取消请求
+    const abortController = new AbortController();
+    
+    // 注册活跃请求
+    OpenClawClient.activeRequests.set(fromUser, abortController);
+
     const response = await axios.post(apiUrl, payload, {
       headers,
       responseType: 'stream',
-      timeout: 600000 // 10 分钟
+      timeout: 600000, // 10 分钟
+      signal: abortController.signal
     });
 
     return new Promise((resolve, reject) => {
@@ -494,6 +713,9 @@ class OpenClawClient {
       });
 
       response.data.on('end', async () => {
+        // 清理活跃请求
+        OpenClawClient.activeRequests.delete(fromUser);
+        
         this.log?.info(`[OpenClawClient] SSE 流结束，总长度: ${fullText.length}`);
 
         if (hasError) {
@@ -516,13 +738,16 @@ class OpenClawClient {
         }
         try {
           await onDone?.(fullText);
-          resolve();
+          resolve(fullText); // 返回完整文本，用于保存到历史记录
         } catch (err) {
           reject(err);
         }
       });
 
       response.data.on('error', (err) => {
+        // 清理活跃请求
+        OpenClawClient.activeRequests.delete(fromUser);
+        
         this.log?.error(`[OpenClawClient] SSE 流错误: ${err.message}`);
         reject(err);
       });

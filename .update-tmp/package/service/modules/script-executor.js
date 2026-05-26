@@ -79,7 +79,7 @@ class ScriptExecutor {
     }
   }
 
-  async executeWithStatus(command, scriptName) {
+  async executeWithStatus(command, scriptName, force = false) {
     // 配置修复命令特殊处理：直接执行命令，不需要脚本
     if (command === OpenClawCommandEnum.CONFIG_FIX) {
       return await this.executeCommandDirect('openclaw doctor --fix', 120);
@@ -88,16 +88,41 @@ class ScriptExecutor {
     const scriptPath = path.join(this.scriptDir, scriptName);
 
     try {
-      const { stdout, stderr } = await this.runScript(scriptPath);
+      console.log(`[ScriptExecutor] 开始执行脚本: ${scriptPath}, force=${force}`);
+      const { stdout, stderr, exitCode } = await this.runScript(scriptPath, force);
       const fullOutput = stdout + stderr;
       
       // 调试日志：记录脚本实际输出
-      console.log(`[ScriptExecutor-DEBUG] ${scriptName} 原始输出:\n${fullOutput}`);
-      console.log(`[ScriptExecutor-DEBUG] ${scriptName} 输出长度: ${fullOutput.length}`);
+      console.log(`[ScriptExecutor] 执行脚本完成: ${scriptPath}`);
+      console.log(`[ScriptExecutor] ${scriptName} 退出码: ${exitCode}`);
+      console.log(`[ScriptExecutor] ${scriptName} 输出长度: ${fullOutput.length}`);
+      if (fullOutput.length > 0) {
+        console.log(`[ScriptExecutor] ${scriptName} 输出:\n${fullOutput}`);
+      } else {
+        console.log(`[ScriptExecutor] ${scriptName} 无输出`);
+      }
       
-      return this.parseStatus(command, fullOutput);
+      const result = this.parseStatus(command, fullOutput);
+      console.log(`[ScriptExecutor] ${scriptName} 解析结果: status=${result.status}, message=${result.message}`);
+      
+      // 对于 STOP 命令，如果脚本退出码非零，强制返回错误
+      if (command === OpenClawCommandEnum.STOP && exitCode !== 0) {
+        console.log(`[ScriptExecutor] 停止脚本退出码非零(${exitCode})，返回错误`);
+        return { 
+          status: OpenClawServiceStatus.ERROR, 
+          message: `停止失败: 脚本退出码 ${exitCode}`,
+          output: fullOutput
+        };
+      }
+      
+      // 返回结果时附带原始输出
+      return {
+        ...result,
+        output: fullOutput
+      };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
+      console.error(`[ScriptExecutor] 执行脚本异常: ${msg}`);
       return { status: OpenClawServiceStatus.ERROR, message: `执行异常: ${msg}` };
     }
   }
@@ -181,7 +206,7 @@ class ScriptExecutor {
     });
   }
 
-  runScript(scriptPath) {
+  runScript(scriptPath, force = false) {
     // Linux/Mac 系统：自动修复 shell 脚本的 CRLF 换行符
     if (process.platform !== 'win32') {
       try {
@@ -208,6 +233,12 @@ class ScriptExecutor {
         cmd = 'bash';
         args = [scriptPath];
       }
+      
+      // 如果是强制停止，添加 FORCE 环境变量
+      if (force) {
+        args.unshift('FORCE=1');
+        console.log(`[ScriptExecutor] 强制停止模式: FORCE=1`);
+      }
 
       // 调试日志：记录执行环境
       if (process.platform !== 'win32') {
@@ -216,10 +247,17 @@ class ScriptExecutor {
         console.log(`[ScriptExecutor-DEBUG] SHELL: ${process.env.SHELL}`);
       }
 
-      const child = spawn(cmd, args, {
-        detached: false,
+      // 对于启动脚本，使用 detached: true 允许子进程脱离父进程
+      // 这样 openclaw 进程不会在脚本结束后被终止
+      const isStartScript = scriptPath.includes('start');
+      const spawnOptions = {
+        detached: isStartScript,  // 启动脚本使用 detached 模式
         windowsHide: true
-      });
+      };
+      
+      console.log(`[ScriptExecutor] spawn 选项: detached=${spawnOptions.detached}`);
+      
+      const child = spawn(cmd, args, spawnOptions);
 
       let stdout = '';
       let stderr = '';
@@ -239,7 +277,7 @@ class ScriptExecutor {
             killed = true;
             clearTimeout(timer);
             this.killProcessTree(child);
-            resolve({ stdout, stderr });
+            resolve({ stdout, stderr, exitCode: 0 });
           }
         }
       });
@@ -252,7 +290,7 @@ class ScriptExecutor {
             killed = true;
             clearTimeout(timer);
             this.killProcessTree(child);
-            resolve({ stdout, stderr });
+            resolve({ stdout, stderr, exitCode: 0 });
           }
         }
       });
@@ -271,7 +309,7 @@ class ScriptExecutor {
           killed = true;
           clearTimeout(timer);
           console.log(`[ScriptExecutor] 脚本退出，code=${code}, stdout长度=${stdout.length}`);
-          resolve({ stdout, stderr });
+          resolve({ stdout, stderr, exitCode: code });
         }
       });
       
@@ -281,19 +319,10 @@ class ScriptExecutor {
           killed = true;
           clearTimeout(timer);
           console.log(`[ScriptExecutor] 脚本关闭，code=${code}, stdout长度=${stdout.length}`);
-          resolve({ stdout, stderr });
+          resolve({ stdout, stderr, exitCode: code });
         }
       });
       
-      // 错误处理
-      child.on('error', (err) => {
-        console.error(`[ScriptExecutor] 子进程错误: ${err.message}`);
-        if (!killed) {
-          killed = true;
-          clearTimeout(timer);
-          reject(err);
-        }
-      });
     });
   }
 
@@ -306,9 +335,12 @@ class ScriptExecutor {
       if (upper.includes(kw.toUpperCase())) return true;
     }
 
-    // 对于 START 命令，不提前返回，让脚本完整执行
-    // 因为 start.bat 有等待循环，需要完整输出才能判断状态
-    if (command === OpenClawCommandEnum.START) {
+    // 对于 START/STOP/RESTART 命令，不提前返回
+    // 让脚本完整执行到 exit，由 exit code 判断成功失败
+    // 提前返回可能导致 kill 命令未执行完成
+    if (command === OpenClawCommandEnum.START ||
+        command === OpenClawCommandEnum.STOP ||
+        command === OpenClawCommandEnum.RESTART) {
       return false;
     }
 
@@ -356,6 +388,7 @@ class ScriptExecutor {
 
     if (
       upper.includes('OPENCLAW COMMAND NOT FOUND') ||
+      upper.includes('OPENCLAW 命令未找到') ||
       output.includes('服务 openclaw-gateway.service 未安装') ||
       output.includes('服务 openclaw-gateway.service 不存在') ||
       upper.includes('OPENCLAW-GATEWAY.SERVICE 不存在')
@@ -434,6 +467,7 @@ class ScriptExecutor {
         upper.includes('服务停止成功') ||
         upper.includes('服务已成功停止') ||
         upper.includes('GATEWAY STOP SIGNAL SENT') ||
+        upper.includes('STOPPED SUCCESSFULLY AFTER FORCE STOP') ||
         (upper.includes('[INFO] STOPPING SERVICE') && upper.includes('STOP SIGNAL'))
       ) {
         if (

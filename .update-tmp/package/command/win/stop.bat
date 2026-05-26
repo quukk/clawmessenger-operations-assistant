@@ -43,13 +43,33 @@ echo.
 REM Wait and verify stopped
 timeout /t 3 /nobreak >nul
 
+REM Check if port is still listening
 netstat -an | findstr ":18789 " | findstr "LISTENING" >nul
 if errorlevel 1 (
     echo [OK] Service stopped successfully
     echo.
     echo Success
     exit /b 0
-) else (
-    echo [WARN] Service may still be running
+)
+
+REM Port still listening, try graceful stop again with force flag
+echo [WARN] Service may still be running, attempting force stop...
+echo.
+
+REM Kill openclaw processes
+taskkill /f /im openclaw.exe >nul 2>&1
+
+REM Wait for processes to terminate
+timeout /t 2 /nobreak >nul
+
+REM Final check
+netstat -an | findstr ":18789 " | findstr "LISTENING" >nul
+if errorlevel 1 (
+    echo [OK] Service stopped successfully after force stop
+    echo.
+    echo Success
     exit /b 0
+) else (
+    echo [ERROR] Service stop failed: port 18789 still listening after force stop
+    exit /b 1
 )

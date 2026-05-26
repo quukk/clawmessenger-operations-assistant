@@ -42,7 +42,7 @@ class RongCloudClient {
     // 注册 command 自定义消息类型（与前端对齐）
     try {
       if (typeof RongIMLib.registerMessageType === 'function') {
-        this.SystemServiceMessage = RongIMLib.registerMessageType('command', true, false);
+        this.SystemServiceMessage = RongIMLib.registerMessageType('command', false, false);
         this.log?.info('[RongCloudClient] command 自定义消息类型已注册');
       } else {
         this.log?.warn('[RongCloudClient] SDK 不支持 registerMessageType');
@@ -169,7 +169,15 @@ class RongCloudClient {
       // 自定义消息 content 可能是对象，提取文本内容并保留 mentionedInfo
       if (rawContent && typeof rawContent === 'object') {
         mentionedInfo = mentionedInfo || rawContent.mentionedInfo || null;
-        rawContent = rawContent.content || rawContent.text || JSON.stringify(rawContent);
+        // command 等结构化消息保留完整 JSON（上层需要 msg_type 等字段）
+        if (message.messageType === 'command' || rawContent.msg_type) {
+          rawContent = JSON.stringify(rawContent);
+        } else if (['RC:ImgMsg', 'RC:SightMsg', 'RC:FileMsg', 'RC:HQVCMsg'].includes(message.messageType)) {
+          // 媒体消息保留完整对象，以便上层提取 URL
+          rawContent = JSON.stringify(rawContent);
+        } else {
+          rawContent = rawContent.content || rawContent.text || JSON.stringify(rawContent);
+        }
       }
 
       const content = rawContent || '';
@@ -194,8 +202,11 @@ class RongCloudClient {
         }
       }
 
+      // 对于媒体消息，保留完整的 JSON 字符串，不要提取 content 字段
       const userContent = parsed && !parsed.msg_type
-        ? (parsed.content || parsed.text || JSON.stringify(parsed))
+        ? (['RC:ImgMsg', 'RC:SightMsg', 'RC:FileMsg', 'RC:HQVCMsg'].includes(msgType)
+            ? JSON.stringify(parsed)
+            : (parsed.content || parsed.text || JSON.stringify(parsed)))
         : content;
 
       if (!userContent || !userContent.trim || !userContent.trim()) {

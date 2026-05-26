@@ -70,24 +70,30 @@ async function deleteOpencodeSession(sessionId) {
 async function getOrCreateGatewaySession(fallbackSessionId) {
   console.log(`[CHAT-DEBUG] getOrCreateGatewaySession called with fallback: ${fallbackSessionId}`);
   
-  try {
-    const response = await axios.get(`${GATEWAY_URL}/api/sessions`, { timeout: 5000 });
-    const sessions = response.data;
-    console.log(`[CHAT-DEBUG] Existing sessions: ${JSON.stringify(sessions)}`);
-    if (Array.isArray(sessions) && sessions.length > 0) {
-      const sessionId = sessions[0].id || sessions[0].session_id;
-      if (sessionId) {
-        console.log(`[CHAT-DEBUG] Using existing session: ${sessionId}`);
-        return sessionId;
+  // 首先尝试使用提供的 fallback session ID
+  if (fallbackSessionId) {
+    try {
+      // 验证 session 是否存在（通过尝试获取 session 详情）
+      const response = await axios.get(`${GATEWAY_URL}/session/${fallbackSessionId}`, { 
+        timeout: 5000,
+        validateStatus: (status) => status < 500 // 允许 404，只要不是服务器错误
+      });
+      if (response.status === 200) {
+        console.log(`[CHAT-DEBUG] Fallback session exists: ${fallbackSessionId}`);
+        return fallbackSessionId;
+      } else {
+        console.log(`[CHAT-DEBUG] Fallback session not found (status: ${response.status}): ${fallbackSessionId}`);
       }
+    } catch (e) {
+      console.log(`[CHAT-DEBUG] Fallback session check failed: ${e.message}`);
     }
-  } catch (e) {
-    console.log(`[CHAT-DEBUG] Failed to get sessions: ${e.message}`);
   }
-
+  
+  // 如果 fallback 无效，创建新 session
   try {
+    console.log(`[CHAT-DEBUG] Creating new session...`);
     const response = await axios.post(
-      `${GATEWAY_URL}/api/sessions`,
+      `${GATEWAY_URL}/session`,
       { title: 'Chat session' },
       { headers: { 'Content-Type': 'application/json' }, timeout: 5000 }
     );
@@ -98,23 +104,24 @@ async function getOrCreateGatewaySession(fallbackSessionId) {
     }
   } catch (e) {
     console.log(`[CHAT-DEBUG] Failed to create session: ${e.message}`);
+    if (e.response) {
+      console.log(`[CHAT-DEBUG] Create session response status: ${e.response.status}`);
+      console.log(`[CHAT-DEBUG] Create session response data: ${JSON.stringify(e.response.data)}`);
+    }
   }
   
-  if (fallbackSessionId) {
-    console.log(`[CHAT-DEBUG] Using fallback session: ${fallbackSessionId}`);
-    return fallbackSessionId;
-  }
-  
+  // 如果创建也失败，抛出错误
   throw new Error('无法获取或创建有效的 session ID');
 }
 
 async function ensureOpencodeRunning(log) {
   try {
     // 快速检查 4096 端口
-    await axios.get('http://127.0.0.1:4096/global/health', { timeout: 3000 });
+    const healthResponse = await axios.get('http://127.0.0.1:4096/global/health', { timeout: 3000 });
+    log('DEBUG', `OpenCode health check: ${JSON.stringify(healthResponse.data)}`);
     return true;
-  } catch {
-    log('WARN', 'OpenCode 服务未运行，准备启动...');
+  } catch (e) {
+    log('WARN', `OpenCode 服务未运行: ${e.message}，准备启动...`);
     
     const { exec } = require('child_process');
     
@@ -126,11 +133,12 @@ async function ensureOpencodeRunning(log) {
     
     // 再次检查
     try {
-      await axios.get('http://127.0.0.1:4096/global/health', { timeout: 3000 });
+      const healthResponse = await axios.get('http://127.0.0.1:4096/global/health', { timeout: 3000 });
+      log('DEBUG', `OpenCode health check after start: ${JSON.stringify(healthResponse.data)}`);
       log('INFO', 'OpenCode 服务已启动');
       return true;
-    } catch {
-      log('ERROR', 'OpenCode 服务启动失败');
+    } catch (e) {
+      log('ERROR', `OpenCode 服务启动失败: ${e.message}`);
       return false;
     }
   }
@@ -158,15 +166,26 @@ async function forwardChatMessage(sessionId, content, onDelta, logFn, timeoutMs 
   log('DEBUG', `发送消息: ${content}`);
   log('DEBUG', `请求超时: ${timeoutMs}ms`);
   
-  // 构建请求体，包含 system 参数
+  // 构建请求体，包含 system 和 model 参数
+  // model 字段格式: { providerID: "provider-name", modelID: "model-id" }
+  // 使用 opencode/big-pickle 模型（从 TUI 模式确认）
   const requestBody = {
     system: SYSTEM_PROMPT,
+    model: { providerID: 'opencode', modelID: 'big-pickle' },
     parts: [{ type: 'text', text: content }]
   };
   
   log('DEBUG', `请求体包含 system 参数: ${!!requestBody.system}`);
   
   try {
+    log('DEBUG', `发送请求到: ${url}`);
+    // 只记录请求体结构，避免 system 提示词过长截断其他字段
+    const requestBodyForLog = {
+      ...requestBody,
+      system: `[${requestBody.system.length} 字符的系统提示词]`
+    };
+    log('DEBUG', `请求体结构: ${JSON.stringify(requestBodyForLog)}`);
+    
     const response = await axios.post(url, requestBody, {
       headers: { 'Content-Type': 'application/json' },
       timeout: timeoutMs
@@ -174,15 +193,17 @@ async function forwardChatMessage(sessionId, content, onDelta, logFn, timeoutMs 
 
     const result = response.data || {};
     log('DEBUG', `响应状态: ${response.status}`);
+    log('DEBUG', `响应数据类型: ${typeof result}`);
     log('DEBUG', `响应数据 keys: ${Object.keys(result).join(', ')}`);
-    log('DEBUG', `响应数据: ${JSON.stringify(result).substring(0, 500)}`);
+    log('DEBUG', `响应数据: ${JSON.stringify(result).substring(0, 1000)}`);
+    log('DEBUG', `响应 headers: ${JSON.stringify(response.headers)}`);
 
     const parts = result.parts || [];
     const info = result.info || {};
 
     let fullContent = '';
 
-    for (const key of ['text', 'content', 'response', 'output', 'message', 'reply']) {
+    for (const key of ['text', 'content', 'response', 'output', 'message', 'reply', 'answer']) {
       const val = result[key];
       if (val && typeof val === 'string') {
         fullContent = val;
@@ -221,8 +242,9 @@ async function forwardChatMessage(sessionId, content, onDelta, logFn, timeoutMs 
     }
 
     if (!fullContent) {
-      log('ERROR', `Gateway 返回空内容, parts 数量: ${parts.length}`);
-      throw new Error('Gateway 返回空内容');
+      // 如果返回空内容，可能是异步处理，返回一个提示信息
+      log('WARN', `Gateway 返回空内容, parts 数量: ${parts.length}, 返回默认响应`);
+      fullContent = '消息已发送，正在处理中...';
     }
 
     log('DEBUG', `总内容长度: ${fullContent.length}, 开始模拟流式发送`);

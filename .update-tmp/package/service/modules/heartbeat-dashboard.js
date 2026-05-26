@@ -20,13 +20,14 @@ class HeartbeatManager {
 
       try {
         const mac = getMacAddress();
+        // 真实检测 openclaw 状态（通过端口检查）
         const status = await getOpenClawStatus(this.config.openclawPort || 18789);
         const sent = await this.messageSender.sendProtocolMessage(
           RongyunMessageTypeEnum.HEARTBEAT,
           {
             mac_address: mac,
             nickname: this.config.nodeName,
-            open_claw_status: status,
+            open_claw_status: status,  // 1=运行中, 0=未运行（真实检测）
             client_status: 1,
           }
         );

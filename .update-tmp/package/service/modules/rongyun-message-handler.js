@@ -8,11 +8,13 @@
  * - DELETE_OPENCODE_SESSION: 删除会话
  */
 const { RongyunMessageTypeEnum } = require('./rongyun-message-types');
-const { OpenClawCommandEnum } = require('./openclaw-enum');
+const { OpenClawCommandEnum, getCommandName } = require('./openclaw-enum');
 const { executeCommand } = require('./openclaw-control');
 const { createOpencodeSession, deleteOpencodeSession, forwardChatMessage } = require('./opencode-service');
 const { ServiceManager } = require('./service-manager');
 const { collectDashboardData } = require('./dashboard-collector');
+const { getOpenClawStatus } = require('./port-checker');
+const { getMacAddress } = require('./mac-address');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -23,6 +25,7 @@ class RongyunMessageHandler {
     this.config = config;
     this.log = log;
     this.commandLock = false;
+    this.commandLockTimer = null;
     this.messageSender = null;
   }
 
@@ -61,27 +64,40 @@ class RongyunMessageHandler {
         return;
       }
 
-      const msgType = parsed.msg_type;
+      // 解析 content 字段（前端将业务数据放在 content 内）
+      let data = parsed;
+      if (parsed.content && typeof parsed.content === 'string') {
+        try {
+          const contentData = JSON.parse(parsed.content);
+          // 将 content 内的数据合并到顶层，方便处理器直接访问
+          // 保留原始 content 字段（用于聊天消息等场景）
+          data = { ...parsed, ...contentData, _raw_content: parsed.content };
+        } catch (e) {
+          this.logWarn(`解析 content 失败: ${e.message}`);
+        }
+      }
+
+      const msgType = data.msg_type;
       this.logInfo(`[RongyunMessageHandler] 处理消息类型: ${msgType}`);
 
       switch (msgType) {
         case RongyunMessageTypeEnum.COMMAND:
-          await this.handleCommand(parsed);
+          await this.handleCommand(data);
           break;
         case RongyunMessageTypeEnum.CHAT_MESSAGE:
-          await this.handleChatMessage(parsed);
+          await this.handleChatMessage(data);
           break;
         case RongyunMessageTypeEnum.CREATE_OPENCODE_SESSION:
-          await this.handleCreateSession(parsed);
+          await this.handleCreateSession(data);
           break;
         case RongyunMessageTypeEnum.DELETE_OPENCODE_SESSION:
-          await this.handleDeleteSession(parsed);
+          await this.handleDeleteSession(data);
           break;
         case RongyunMessageTypeEnum.DEVICE_CONTROL:
-          await this.handleDeviceControl(parsed);
+          await this.handleDeviceControl(data);
           break;
         case RongyunMessageTypeEnum.DEVICE_STATUS_REQUEST:
-          await this.handleDeviceStatusRequest(parsed);
+          await this.handleDeviceStatusRequest(data);
           break;
         default:
           this.logWarn(`未处理的消息类型: ${msgType}`);
@@ -93,16 +109,18 @@ class RongyunMessageHandler {
   }
 
   async handleCommand(data) {
-    const command = data.command;
+    const command = Number(data.command);  // 确保是数字类型
     const commandId = data.command_id;
     const requestId = data.request_id;
     const sourceId = data.source_im_id;
+    const force = data.force === true;  // 是否强制停止
 
-    this.logInfo(`[RongyunMessageHandler] 收到命令: command=${command}, command_id=${commandId}, from=${sourceId || 'guardserver'}`);
+    this.logInfo(`[RongyunMessageHandler] 收到命令: command=${command}, command_id=${commandId}, force=${force}, from=${sourceId || 'guardserver'}`);
 
     // 验证命令是否有效
     const validCommands = Object.values(OpenClawCommandEnum);
     if (!validCommands.includes(command)) {
+      this.logError(`[RongyunMessageHandler] 未知命令: ${command}, 有效命令: ${validCommands.join(', ')}`);
       await this.sendResponse(RongyunMessageTypeEnum.COMMAND_RESULT, {
         command,
         command_id: commandId,
@@ -124,15 +142,64 @@ class RongyunMessageHandler {
     }
 
     this.commandLock = true;
+    // 设置 120 秒超时保护，防止命令永久卡住导致锁无法释放
+    // 启动命令可能需要较长时间（等待服务启动）
+    this.commandLockTimer = setTimeout(() => {
+      this.logWarn('[RongyunMessageHandler] 命令锁超时（120秒），自动释放');
+      this.commandLock = false;
+      this.commandLockTimer = null;
+    }, 120000);
+
     try {
-      await executeCommand(command, null, async (response) => {
-        // 增加短暂延迟，避免融云 SDK 在收到消息后立刻回复时消息丢失
-        await new Promise(resolve => setTimeout(resolve, 500));
+      // 先发送响应，再执行命令（避免前端超时）
+      // 启动/停止/重启命令是异步的，前端只需要知道命令已接收
+      const isAsyncCommand = [OpenClawCommandEnum.START, OpenClawCommandEnum.STOP, OpenClawCommandEnum.RESTART].includes(command);
+      
+      if (isAsyncCommand) {
+        // 立即响应，告知前端命令已接收
+        const actionName = force ? '强制' + getCommandName(command) : getCommandName(command);
         await this.sendResponse(RongyunMessageTypeEnum.COMMAND_RESULT, {
-          ...response,
-          command_id: commandId
+          command,
+          command_id: commandId,
+          status: 'success',
+          message: `${actionName}命令已接收，正在执行...`
         }, requestId, sourceId);
+      }
+      
+      // 执行命令（在后台异步执行，不阻塞响应）
+      // 使用 Promise 避免阻塞，让命令在后台执行
+      executeCommand(command, null, async (response) => {
+        if (!isAsyncCommand) {
+          // 同步命令立即响应
+          await this.sendResponse(RongyunMessageTypeEnum.COMMAND_RESULT, {
+            ...response,
+            command_id: commandId
+          }, requestId, sourceId);
+        }
+        // 异步命令不在这里响应，因为已经提前响应了
+        // 但我们可以在这里记录执行结果
+        this.logInfo(`[RongyunMessageHandler] 命令执行完成: command=${command}, force=${force}, status=${response.status}, message=${response.message}`);
+      }, force).then(() => {
+        // 命令执行完成后，立即释放锁
+        this.commandLock = false;
+        if (this.commandLockTimer) {
+          clearTimeout(this.commandLockTimer);
+          this.commandLockTimer = null;
+        }
+      }).catch(err => {
+        this.logError(`[RongyunMessageHandler] 命令执行失败: ${err.message}`);
+        // 执行失败后也要释放锁
+        this.commandLock = false;
+        if (this.commandLockTimer) {
+          clearTimeout(this.commandLockTimer);
+          this.commandLockTimer = null;
+        }
       });
+      
+      // 异步命令立即返回，不等待执行完成
+      if (isAsyncCommand) {
+        return;
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.logError(`命令执行异常: ${msg}`);
@@ -142,18 +209,24 @@ class RongyunMessageHandler {
         status: 'error',
         message: msg
       }, requestId, sourceId);
-    } finally {
+      // 同步命令执行异常时释放锁
       this.commandLock = false;
+      if (this.commandLockTimer) {
+        clearTimeout(this.commandLockTimer);
+        this.commandLockTimer = null;
+      }
     }
   }
 
   async handleChatMessage(data) {
     const roomId = data.room_id;
     const sessionId = data.gateway_session_id || data.session_id;
-    const content = data.content;
+    // 使用解析后的 content（聊天内容），如果没有则使用原始 content
+    const content = data.content || data._raw_content;
     const requestId = data.request_id;
+    const sourceId = data.source_im_id;
 
-    this.logInfo(`[RongyunMessageHandler] 收到聊天消息, roomId=${roomId}, sessionId=${sessionId}`);
+    this.logInfo(`[RongyunMessageHandler] 收到聊天消息, roomId=${roomId}, sessionId=${sessionId}, from=${sourceId}`);
 
     if (!roomId || !sessionId || !content) {
       await this.sendResponse(RongyunMessageTypeEnum.CHAT_MESSAGE, {
@@ -161,7 +234,7 @@ class RongyunMessageHandler {
         message: '缺少必要参数',
         content: '[错误] 缺少必要参数',
         metadata: {}
-      }, requestId);
+      }, requestId, sourceId);
       return;
     }
 
@@ -186,7 +259,7 @@ class RongyunMessageHandler {
         message: 'Response received',
         content: fullResponse,
         metadata: {}
-      }, requestId);
+      }, requestId, sourceId);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.logError(`聊天消息处理异常: ${msg}`);
@@ -195,15 +268,16 @@ class RongyunMessageHandler {
         message: msg,
         content: `[错误] 转发失败: ${msg}`,
         metadata: {}
-      }, requestId);
+      }, requestId, sourceId);
     }
   }
 
   async handleCreateSession(data) {
     const requestId = data.request_id;
     const title = data.title || '新会话';
+    const sourceId = data.source_im_id;
 
-    this.logInfo(`[RongyunMessageHandler] 创建会话, title=${title}`);
+    this.logInfo(`[RongyunMessageHandler] 创建会话, title=${title}, from=${sourceId}`);
 
     try {
       const session = await createOpencodeSession(title);
@@ -211,14 +285,14 @@ class RongyunMessageHandler {
       await this.sendResponse(RongyunMessageTypeEnum.OPENCODE_SESSION_CREATED, {
         status: 'success',
         opencode_session_id: session.id
-      }, requestId);
+      }, requestId, sourceId);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.logError(`创建会话失败: ${msg}`);
       await this.sendResponse(RongyunMessageTypeEnum.OPENCODE_SESSION_CREATED, {
         status: 'error',
         message: msg
-      }, requestId);
+      }, requestId, sourceId);
     }
   }
 
@@ -258,11 +332,17 @@ class RongyunMessageHandler {
       let result;
       switch (command) {
         case 'disable': {
-          const svcMgr = new ServiceManager('claw-subagent-service', 'OpenClaw Guard CLI Client', process.argv[1], this.log);
-          await svcMgr.stop();
-          await svcMgr.uninstall();
+          // 先发送响应，再停止服务
           result = { status: 'success', message: '设备服务已禁用' };
-          break;
+          await this.sendDeviceControlResult(targetId, requestId, command, result.status, result.message, result.data);
+          
+          setTimeout(async () => {
+            const svcMgr = new ServiceManager('claw-subagent-service', 'OpenClaw Guard CLI Client', process.argv[1], this.log);
+            try { await svcMgr.stop(); } catch (e) {}
+            try { await svcMgr.uninstall(); } catch (e) {}
+          }, 2000);
+          
+          return;
         }
         case 'enable': {
           const svcMgr = new ServiceManager('claw-subagent-service', 'OpenClaw Guard CLI Client', process.argv[1], this.log);
@@ -271,21 +351,28 @@ class RongyunMessageHandler {
           break;
         }
         case 'delete': {
-          const svcMgr = new ServiceManager('claw-subagent-service', 'OpenClaw Guard CLI Client', process.argv[1], this.log);
-          try { await svcMgr.stop(); } catch (e) {}
-          try { await svcMgr.uninstall(); } catch (e) {}
-          const homeDir = os.homedir();
-          const configPaths = [
-            path.join(homeDir, '.claw-bridge', 'config.json'),
-            path.join(__dirname, '..', '..', 'rongcloud-config.json')
-          ];
-          for (const p of configPaths) {
-            if (fs.existsSync(p)) {
-              fs.unlinkSync(p);
-            }
-          }
+          // 先发送响应，再停止服务（否则服务停止后无法发送响应）
           result = { status: 'success', message: '设备已删除，本地配置已清除' };
-          break;
+          await this.sendDeviceControlResult(targetId, requestId, command, result.status, result.message, result.data);
+          
+          // 延迟执行实际的删除操作
+          setTimeout(async () => {
+            const svcMgr = new ServiceManager('claw-subagent-service', 'OpenClaw Guard CLI Client', process.argv[1], this.log);
+            try { await svcMgr.stop(); } catch (e) {}
+            try { await svcMgr.uninstall(); } catch (e) {}
+            const homeDir = os.homedir();
+            const configPaths = [
+              path.join(homeDir, '.claw-bridge', 'config.json'),
+              path.join(__dirname, '..', '..', 'rongcloud-config.json')
+            ];
+            for (const p of configPaths) {
+              if (fs.existsSync(p)) {
+                fs.unlinkSync(p);
+              }
+            }
+          }, 2000);
+          
+          return; // 已经发送了响应，直接返回
         }
         case 'status': {
           const dashboard = await collectDashboardData();
@@ -306,11 +393,39 @@ class RongyunMessageHandler {
     const requestId = data.request_id;
     const targetId = data.source_im_id;
 
-    this.logInfo(`[RongyunMessageHandler] 收到设备状态请求, from=${targetId}`);
+    this.logInfo(`[RongyunMessageHandler] 收到设备状态请求, from=${targetId}, requestId=${requestId}`);
 
     try {
-      const dashboard = await collectDashboardData();
-      await this.sendDeviceStatusReport(targetId, requestId, dashboard);
+      // 获取 OpenClaw 真实运行状态（检查端口 18789）
+      const openClawStatus = await getOpenClawStatus();
+      
+      // 获取真实的版本信息（如果可能）
+      let version = 'unknown';
+      try {
+        const { execSync } = require('child_process');
+        const versionOutput = execSync('openclaw --version', { encoding: 'utf8', timeout: 5000 }).trim();
+        const match = versionOutput.match(/(\d+\.\d+\.\d+)/);
+        if (match) {
+          version = match[1];
+        }
+      } catch (e) {
+        // 忽略版本获取失败
+      }
+      
+      // 构建真实状态数据
+      // openClawStatus: 1=端口监听正常(服务可用), 0=未运行(端口未监听)
+      const statusMessage = openClawStatus === 1 ? '运行中' : '未运行';
+      
+      const statusData = {
+        open_claw_status: openClawStatus,  // 1=运行中, 0=未运行
+        status_message: statusMessage,
+        mac_address: getMacAddress(),
+        version: version,
+        timestamp: Date.now(),
+      };
+      
+      this.logInfo(`[RongyunMessageHandler] 设备真实状态: openClawStatus=${openClawStatus}, version=${version}`);
+      await this.sendDeviceStatusReport(targetId, requestId, statusData);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.logError(`设备状态查询异常: ${msg}`);
