@@ -115,10 +115,11 @@ async function getOrCreateGatewaySession(fallbackSessionId) {
 async function ensureOpencodeRunning(log) {
   try {
     // 快速检查 4096 端口
-    await axios.get('http://127.0.0.1:4096/global/health', { timeout: 3000 });
+    const healthResponse = await axios.get('http://127.0.0.1:4096/global/health', { timeout: 3000 });
+    log('DEBUG', `OpenCode health check: ${JSON.stringify(healthResponse.data)}`);
     return true;
-  } catch {
-    log('WARN', 'OpenCode 服务未运行，准备启动...');
+  } catch (e) {
+    log('WARN', `OpenCode 服务未运行: ${e.message}，准备启动...`);
     
     const { exec } = require('child_process');
     
@@ -130,11 +131,12 @@ async function ensureOpencodeRunning(log) {
     
     // 再次检查
     try {
-      await axios.get('http://127.0.0.1:4096/global/health', { timeout: 3000 });
+      const healthResponse = await axios.get('http://127.0.0.1:4096/global/health', { timeout: 3000 });
+      log('DEBUG', `OpenCode health check after start: ${JSON.stringify(healthResponse.data)}`);
       log('INFO', 'OpenCode 服务已启动');
       return true;
-    } catch {
-      log('ERROR', 'OpenCode 服务启动失败');
+    } catch (e) {
+      log('ERROR', `OpenCode 服务启动失败: ${e.message}`);
       return false;
     }
   }
@@ -171,6 +173,9 @@ async function forwardChatMessage(sessionId, content, onDelta, logFn, timeoutMs 
   log('DEBUG', `请求体包含 system 参数: ${!!requestBody.system}`);
   
   try {
+    log('DEBUG', `发送请求到: ${url}`);
+    log('DEBUG', `请求体: ${JSON.stringify(requestBody).substring(0, 500)}`);
+    
     const response = await axios.post(url, requestBody, {
       headers: { 'Content-Type': 'application/json' },
       timeout: timeoutMs
@@ -181,6 +186,7 @@ async function forwardChatMessage(sessionId, content, onDelta, logFn, timeoutMs 
     log('DEBUG', `响应数据类型: ${typeof result}`);
     log('DEBUG', `响应数据 keys: ${Object.keys(result).join(', ')}`);
     log('DEBUG', `响应数据: ${JSON.stringify(result).substring(0, 1000)}`);
+    log('DEBUG', `响应 headers: ${JSON.stringify(response.headers)}`);
 
     const parts = result.parts || [];
     const info = result.info || {};
