@@ -165,10 +165,10 @@ async function forwardChatMessage(sessionId, content, onDelta, logFn, timeoutMs 
   log('DEBUG', `请求超时: ${timeoutMs}ms`);
   
   // 构建请求体，包含 system 和 model 参数
-  // model 字段是必需的，告诉 Gateway 使用哪个 AI 提供商和模型
+  // model 字段格式: "provider/model-id"，例如 "kimi-coding/kimi-k2.6"
   const requestBody = {
     system: SYSTEM_PROMPT,
-    model: { providerID: 'opencode', modelID: 'default' },
+    model: 'kimi-coding/kimi-k2.6',
     parts: [{ type: 'text', text: content }]
   };
   
