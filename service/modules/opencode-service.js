@@ -81,6 +81,8 @@ async function getOrCreateGatewaySession(fallbackSessionId) {
       if (response.status === 200) {
         console.log(`[CHAT-DEBUG] Fallback session exists: ${fallbackSessionId}`);
         return fallbackSessionId;
+      } else {
+        console.log(`[CHAT-DEBUG] Fallback session not found (status: ${response.status}): ${fallbackSessionId}`);
       }
     } catch (e) {
       console.log(`[CHAT-DEBUG] Fallback session check failed: ${e.message}`);
@@ -89,6 +91,7 @@ async function getOrCreateGatewaySession(fallbackSessionId) {
   
   // 如果 fallback 无效，创建新 session
   try {
+    console.log(`[CHAT-DEBUG] Creating new session...`);
     const response = await axios.post(
       `${GATEWAY_URL}/session`,
       { title: 'Chat session' },
@@ -101,14 +104,13 @@ async function getOrCreateGatewaySession(fallbackSessionId) {
     }
   } catch (e) {
     console.log(`[CHAT-DEBUG] Failed to create session: ${e.message}`);
+    if (e.response) {
+      console.log(`[CHAT-DEBUG] Create session response status: ${e.response.status}`);
+      console.log(`[CHAT-DEBUG] Create session response data: ${JSON.stringify(e.response.data)}`);
+    }
   }
   
-  // 最后尝试使用 fallback（即使验证失败）
-  if (fallbackSessionId) {
-    console.log(`[CHAT-DEBUG] Using fallback session (without validation): ${fallbackSessionId}`);
-    return fallbackSessionId;
-  }
-  
+  // 如果创建也失败，抛出错误
   throw new Error('无法获取或创建有效的 session ID');
 }
 
@@ -165,10 +167,10 @@ async function forwardChatMessage(sessionId, content, onDelta, logFn, timeoutMs 
   log('DEBUG', `请求超时: ${timeoutMs}ms`);
   
   // 构建请求体，包含 system 和 model 参数
-  // model 字段格式: "provider/model-id"，例如 "kimi-coding/kimi-k2.6"
+  // model 字段格式: { providerID: "provider-name", modelID: "model-id" }
   const requestBody = {
     system: SYSTEM_PROMPT,
-    model: 'kimi-coding/kimi-k2.6',
+    model: { providerID: 'kimi-coding', modelID: 'kimi-k2.6' },
     parts: [{ type: 'text', text: content }]
   };
   
