@@ -271,15 +271,36 @@ restart_docker() {
     
     log_info "正在启动 OpenClaw 服务..."
     
+    # 查找 openclaw 的完整路径
+    local openclaw_path=""
+    if command -v openclaw &>/dev/null; then
+        openclaw_path=$(which openclaw)
+        log_info "找到 openclaw: $openclaw_path"
+    else
+        # 尝试常见路径
+        for path in /usr/local/bin/openclaw /usr/bin/openclaw /opt/openclaw/bin/openclaw; do
+            if [ -x "$path" ]; then
+                openclaw_path="$path"
+                log_info "找到 openclaw: $openclaw_path"
+                break
+            fi
+        done
+    fi
+    
+    if [ -z "$openclaw_path" ]; then
+        log_error "无法找到 openclaw 命令，请确保已安装 OpenClaw"
+        exit 1
+    fi
+    
     # 使用 setsid 创建新会话，完全脱离父进程
     # 这样即使父进程（Node.js）退出，openclaw 也不会被终止
     log_info "使用 setsid 启动，确保进程脱离父进程..."
     if command -v setsid &>/dev/null; then
-        setsid bash -c "openclaw gateway run --port $PORT" > "$log_file" 2>&1 &
+        setsid bash -c "export PATH='$PATH'; $openclaw_path gateway run --port $PORT" > "$log_file" 2>&1 &
     else
         # 如果没有 setsid，使用 nohup 作为后备
         log_warn "setsid 不可用，使用 nohup 作为后备..."
-        nohup openclaw gateway run --port "$PORT" > "$log_file" 2>&1 &
+        nohup bash -c "export PATH='$PATH'; $openclaw_path gateway run --port $PORT" > "$log_file" 2>&1 &
     fi
     
     log_info "OpenClaw 服务启动命令已发送（PID: $!）"
