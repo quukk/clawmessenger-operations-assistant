@@ -176,7 +176,12 @@ async function forwardChatMessage(sessionId, content, onDelta, logFn, timeoutMs 
   
   try {
     log('DEBUG', `发送请求到: ${url}`);
-    log('DEBUG', `请求体: ${JSON.stringify(requestBody).substring(0, 500)}`);
+    // 只记录请求体结构，避免 system 提示词过长截断其他字段
+    const requestBodyForLog = {
+      ...requestBody,
+      system: `[${requestBody.system.length} 字符的系统提示词]`
+    };
+    log('DEBUG', `请求体结构: ${JSON.stringify(requestBodyForLog)}`);
     
     const response = await axios.post(url, requestBody, {
       headers: { 'Content-Type': 'application/json' },
