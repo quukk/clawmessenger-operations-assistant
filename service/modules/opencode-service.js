@@ -168,9 +168,9 @@ async function forwardChatMessage(sessionId, content, onDelta, logFn, timeoutMs 
   
   // 构建请求体，包含 system 和 model 参数
   // model 字段格式: { providerID: "provider-name", modelID: "model-id" }
+  // 如果 OpenCode 配置为空，尝试不使用 model 字段
   const requestBody = {
     system: SYSTEM_PROMPT,
-    model: { providerID: 'kimi-coding', modelID: 'kimi-k2.6' },
     parts: [{ type: 'text', text: content }]
   };
   
