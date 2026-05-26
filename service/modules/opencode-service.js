@@ -168,9 +168,10 @@ async function forwardChatMessage(sessionId, content, onDelta, logFn, timeoutMs 
   
   // 构建请求体，包含 system 和 model 参数
   // model 字段格式: { providerID: "provider-name", modelID: "model-id" }
-  // 如果 OpenCode 配置为空，尝试不使用 model 字段
+  // 使用 opencode/big-pickle 模型（从 TUI 模式确认）
   const requestBody = {
     system: SYSTEM_PROMPT,
+    model: { providerID: 'opencode', modelID: 'big-pickle' },
     parts: [{ type: 'text', text: content }]
   };
   
