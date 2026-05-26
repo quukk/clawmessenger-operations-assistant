@@ -224,8 +224,9 @@ class RongyunMessageHandler {
     // 使用解析后的 content（聊天内容），如果没有则使用原始 content
     const content = data.content || data._raw_content;
     const requestId = data.request_id;
+    const sourceId = data.source_im_id;
 
-    this.logInfo(`[RongyunMessageHandler] 收到聊天消息, roomId=${roomId}, sessionId=${sessionId}`);
+    this.logInfo(`[RongyunMessageHandler] 收到聊天消息, roomId=${roomId}, sessionId=${sessionId}, from=${sourceId}`);
 
     if (!roomId || !sessionId || !content) {
       await this.sendResponse(RongyunMessageTypeEnum.CHAT_MESSAGE, {
@@ -233,7 +234,7 @@ class RongyunMessageHandler {
         message: '缺少必要参数',
         content: '[错误] 缺少必要参数',
         metadata: {}
-      }, requestId);
+      }, requestId, sourceId);
       return;
     }
 
@@ -258,7 +259,7 @@ class RongyunMessageHandler {
         message: 'Response received',
         content: fullResponse,
         metadata: {}
-      }, requestId);
+      }, requestId, sourceId);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.logError(`聊天消息处理异常: ${msg}`);
@@ -267,15 +268,16 @@ class RongyunMessageHandler {
         message: msg,
         content: `[错误] 转发失败: ${msg}`,
         metadata: {}
-      }, requestId);
+      }, requestId, sourceId);
     }
   }
 
   async handleCreateSession(data) {
     const requestId = data.request_id;
     const title = data.title || '新会话';
+    const sourceId = data.source_im_id;
 
-    this.logInfo(`[RongyunMessageHandler] 创建会话, title=${title}`);
+    this.logInfo(`[RongyunMessageHandler] 创建会话, title=${title}, from=${sourceId}`);
 
     try {
       const session = await createOpencodeSession(title);
@@ -283,14 +285,14 @@ class RongyunMessageHandler {
       await this.sendResponse(RongyunMessageTypeEnum.OPENCODE_SESSION_CREATED, {
         status: 'success',
         opencode_session_id: session.id
-      }, requestId);
+      }, requestId, sourceId);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.logError(`创建会话失败: ${msg}`);
       await this.sendResponse(RongyunMessageTypeEnum.OPENCODE_SESSION_CREATED, {
         status: 'error',
         message: msg
-      }, requestId);
+      }, requestId, sourceId);
     }
   }
 
