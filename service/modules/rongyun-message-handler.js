@@ -10,7 +10,7 @@
 const { RongyunMessageTypeEnum } = require('./rongyun-message-types');
 const { OpenClawCommandEnum, getCommandName } = require('./openclaw-enum');
 const { executeCommand } = require('./openclaw-control');
-const { createOpencodeSession, deleteOpencodeSession, forwardChatMessage } = require('./opencode-service');
+const { createOpencodeSession, deleteOpencodeSession, forwardChatMessage, getOrCreateGatewaySession } = require('./opencode-service');
 const { ServiceManager } = require('./service-manager');
 const { collectDashboardData } = require('./dashboard-collector');
 const { getOpenClawStatus } = require('./port-checker');
@@ -18,6 +18,34 @@ const { getMacAddress } = require('./mac-address');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+
+// 客服会话存储（内存缓存，生产环境建议用 Redis）
+const serviceSessions = new Map();
+
+// 客服系统提示词
+const SERVICE_SYSTEM_PROMPT = `你是虾说App的智能客服助手，专门帮助用户解答使用问题。
+
+## 核心职责
+1. **解答产品使用问题**：帮助用户了解如何使用虾说App的各项功能
+2. **故障排查**：协助用户解决常见的技术问题
+3. **功能介绍**：介绍App的新功能和更新内容
+
+## 常用功能说明
+
+| 功能 | 说明 |
+|------|------|
+| 会话 | 与好友进行一对一或群聊 |
+| 通讯录 | 管理好友和群组 |
+| 聊天室 | 加入公开聊天室 |
+| 远程管理 | 管理远程设备 |
+| AI助手 | 使用AI辅助功能 |
+
+## 回答原则
+- 礼貌、专业、简洁
+- 如果不知道答案，建议用户联系人工客服
+- 不要透露系统内部信息
+- 使用中文回答
+`;
 
 class RongyunMessageHandler {
   constructor(rongcloudClient, config, log) {
@@ -98,6 +126,12 @@ class RongyunMessageHandler {
           break;
         case RongyunMessageTypeEnum.DEVICE_STATUS_REQUEST:
           await this.handleDeviceStatusRequest(data);
+          break;
+        case RongyunMessageTypeEnum.CREATE_SERVICE_SESSION:
+          await this.handleCreateServiceSession(data);
+          break;
+        case RongyunMessageTypeEnum.SERVICE_CHAT_MESSAGE:
+          await this.handleServiceChatMessage(data);
           break;
         default:
           this.logWarn(`未处理的消息类型: ${msgType}`);
@@ -458,6 +492,136 @@ class RongyunMessageHandler {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.logError(`发送设备状态报告失败: ${msg}`);
+    }
+  }
+
+  async handleCreateServiceSession(data) {
+    const requestId = data.request_id;
+    const userId = data.userId || data.source_im_id;
+    const sourceId = data.source_im_id;
+
+    this.logInfo(`[RongyunMessageHandler] 创建客服会话, userId=${userId}, from=${sourceId}`);
+
+    try {
+      // 创建 OpenCode session 用于客服对话
+      const session = await createOpencodeSession(`客服会话-${userId}`);
+      const sessionId = session.id || session.session_id;
+
+      // 存储会话映射关系
+      serviceSessions.set(userId, {
+        sessionId: sessionId,
+        userId: userId,
+        createdAt: Date.now(),
+      });
+
+      this.logInfo(`[RongyunMessageHandler] 客服会话创建成功: ${sessionId}`);
+
+      await this.sendResponse(
+        RongyunMessageTypeEnum.SERVICE_SESSION_CREATED,
+        {
+          status: 'success',
+          sessionId: sessionId,
+          userId: userId,
+        },
+        requestId,
+        sourceId
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.logError(`创建客服会话失败: ${msg}`);
+      await this.sendResponse(
+        RongyunMessageTypeEnum.SERVICE_SESSION_CREATED,
+        {
+          status: 'error',
+          message: msg,
+        },
+        requestId,
+        sourceId
+      );
+    }
+  }
+
+  async handleServiceChatMessage(data) {
+    const requestId = data.request_id;
+    const userId = data.userId || data.source_im_id;
+    const sourceId = data.source_im_id;
+    const content = data.content || data._raw_content;
+
+    this.logInfo(`[RongyunMessageHandler] 收到客服消息, userId=${userId}, content=${content?.substring(0, 50)}`);
+
+    if (!content) {
+      this.logWarn('客服消息内容为空');
+      return;
+    }
+
+    try {
+      // 获取或创建用户会话
+      let sessionInfo = serviceSessions.get(userId);
+      let sessionId;
+
+      if (!sessionInfo) {
+        // 如果没有会话，创建一个
+        this.logInfo(`[RongyunMessageHandler] 用户 ${userId} 没有现有会话，创建新会话`);
+        const session = await createOpencodeSession(`客服会话-${userId}`);
+        sessionId = session.id || session.session_id;
+        serviceSessions.set(userId, {
+          sessionId: sessionId,
+          userId: userId,
+          createdAt: Date.now(),
+        });
+      } else {
+        sessionId = sessionInfo.sessionId;
+      }
+
+      this.logInfo(`[RongyunMessageHandler] 使用会话: ${sessionId}`);
+
+      // 调用 OpenCode 服务获取回复
+      let fullResponse = '';
+      await forwardChatMessage(
+        sessionId,
+        content,
+        (delta) => {
+          fullResponse += delta;
+        },
+        (level, message) => {
+          if (level === 'ERROR') {
+            this.logError(`[SERVICE-CHAT] ${message}`);
+          } else {
+            this.logInfo(`[SERVICE-CHAT] ${message}`);
+          }
+        },
+        120000 // 2分钟超时
+      );
+
+      this.logInfo(`[RongyunMessageHandler] 客服回复生成完成, 长度: ${fullResponse.length}`);
+
+      // 发送客服回复给用户
+      await this.sendResponse(
+        RongyunMessageTypeEnum.SERVICE_CHAT_RESPONSE,
+        {
+          status: 'success',
+          content: fullResponse,
+          sessionId: sessionId,
+          userId: userId,
+        },
+        requestId,
+        sourceId
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.logError(`客服消息处理异常: ${msg}`);
+
+      // 发送错误回复
+      await this.sendResponse(
+        RongyunMessageTypeEnum.SERVICE_CHAT_RESPONSE,
+        {
+          status: 'error',
+          content: '抱歉，处理您的消息时出现问题，请稍后重试。',
+          userId: userId,
+        },
+        requestId,
+        sourceId
+      );
     }
   }
 
