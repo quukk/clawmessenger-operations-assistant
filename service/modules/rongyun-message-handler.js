@@ -23,10 +23,10 @@ const os = require('os');
 const serviceSessions = new Map();
 
 // 客服系统提示词
-const SERVICE_SYSTEM_PROMPT = `你是虾说App的智能客服助手，专门帮助用户解答使用问题。
+const SERVICE_SYSTEM_PROMPT = `你是虾说智能助手的客服助手，专门帮助用户解答使用问题。
 
 ## 核心职责
-1. **解答产品使用问题**：帮助用户了解如何使用虾说App的各项功能
+1. **解答产品使用问题**：帮助用户了解如何使用虾说智能助手的各项功能
 2. **故障排查**：协助用户解决常见的技术问题
 3. **功能介绍**：介绍App的新功能和更新内容
 
@@ -188,7 +188,7 @@ class RongyunMessageHandler {
       // 先发送响应，再执行命令（避免前端超时）
       // 启动/停止/重启命令是异步的，前端只需要知道命令已接收
       const isAsyncCommand = [OpenClawCommandEnum.START, OpenClawCommandEnum.STOP, OpenClawCommandEnum.RESTART].includes(command);
-      
+
       if (isAsyncCommand) {
         // 立即响应，告知前端命令已接收
         const actionName = force ? '强制' + getCommandName(command) : getCommandName(command);
@@ -199,7 +199,7 @@ class RongyunMessageHandler {
           message: `${actionName}命令已接收，正在执行...`
         }, requestId, sourceId);
       }
-      
+
       // 执行命令（在后台异步执行，不阻塞响应）
       // 使用 Promise 避免阻塞，让命令在后台执行
       executeCommand(command, null, async (response) => {
@@ -229,7 +229,7 @@ class RongyunMessageHandler {
           this.commandLockTimer = null;
         }
       });
-      
+
       // 异步命令立即返回，不等待执行完成
       if (isAsyncCommand) {
         return;
@@ -369,13 +369,13 @@ class RongyunMessageHandler {
           // 先发送响应，再停止服务
           result = { status: 'success', message: '设备服务已禁用' };
           await this.sendDeviceControlResult(targetId, requestId, command, result.status, result.message, result.data);
-          
+
           setTimeout(async () => {
             const svcMgr = new ServiceManager('claw-subagent-service', 'OpenClaw Guard CLI Client', process.argv[1], this.log);
-            try { await svcMgr.stop(); } catch (e) {}
-            try { await svcMgr.uninstall(); } catch (e) {}
+            try { await svcMgr.stop(); } catch (e) { }
+            try { await svcMgr.uninstall(); } catch (e) { }
           }, 2000);
-          
+
           return;
         }
         case 'enable': {
@@ -388,12 +388,12 @@ class RongyunMessageHandler {
           // 先发送响应，再停止服务（否则服务停止后无法发送响应）
           result = { status: 'success', message: '设备已删除，本地配置已清除' };
           await this.sendDeviceControlResult(targetId, requestId, command, result.status, result.message, result.data);
-          
+
           // 延迟执行实际的删除操作
           setTimeout(async () => {
             const svcMgr = new ServiceManager('claw-subagent-service', 'OpenClaw Guard CLI Client', process.argv[1], this.log);
-            try { await svcMgr.stop(); } catch (e) {}
-            try { await svcMgr.uninstall(); } catch (e) {}
+            try { await svcMgr.stop(); } catch (e) { }
+            try { await svcMgr.uninstall(); } catch (e) { }
             const homeDir = os.homedir();
             const configPaths = [
               path.join(homeDir, '.claw-bridge', 'config.json'),
@@ -405,7 +405,7 @@ class RongyunMessageHandler {
               }
             }
           }, 2000);
-          
+
           return; // 已经发送了响应，直接返回
         }
         case 'status': {
@@ -432,7 +432,7 @@ class RongyunMessageHandler {
     try {
       // 获取 OpenClaw 真实运行状态（检查端口 18789）
       const openClawStatus = await getOpenClawStatus();
-      
+
       // 获取真实的版本信息（如果可能）
       let version = 'unknown';
       try {
@@ -445,11 +445,11 @@ class RongyunMessageHandler {
       } catch (e) {
         // 忽略版本获取失败
       }
-      
+
       // 构建真实状态数据
       // openClawStatus: 1=端口监听正常(服务可用), 0=未运行(端口未监听)
       const statusMessage = openClawStatus === 1 ? '运行中' : '未运行';
-      
+
       const statusData = {
         open_claw_status: openClawStatus,  // 1=运行中, 0=未运行
         status_message: statusMessage,
@@ -457,7 +457,7 @@ class RongyunMessageHandler {
         version: version,
         timestamp: Date.now(),
       };
-      
+
       this.logInfo(`[RongyunMessageHandler] 设备真实状态: openClawStatus=${openClawStatus}, version=${version}`);
       await this.sendDeviceStatusReport(targetId, requestId, statusData);
     } catch (e) {

@@ -3,7 +3,7 @@ const axios = require('axios');
 const GATEWAY_URL = 'http://127.0.0.1:4096';
 
 // 系统提示词 - OpenClaw 运维助手智能体
-const SYSTEM_PROMPT = `你是 虾说app的 openclaw 运维助手智能体，职责有：保活、修配置、做备份 等运维工作。
+const SYSTEM_PROMPT = `你是 虾说智能助手的 openclaw 运维助手智能体，职责有：保活、修配置、做备份 等运维工作。
 
 ## 核心职责
 1. **保活**：openclaw 挂了自动拉起来
