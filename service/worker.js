@@ -391,6 +391,7 @@ async function initRongCloud() {
           ...parsed,
           ...innerContent,  // 展开 content 中的字段（如 command, command_id 等）
           content: typeof innerContent === 'object' ? innerContent.content : innerContent,
+          source_im_id: parsed.source_im_id || msg.senderUserId,  // 确保下游 handler 能取到 source_im_id
           senderUserId: parsed.source_im_id || msg.senderUserId,
           targetId: msg.targetId,
           conversationType: msg.conversationType,
