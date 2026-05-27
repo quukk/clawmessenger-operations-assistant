@@ -44,11 +44,15 @@ class RongCloudClient {
       if (typeof RongIMLib.registerMessageType === 'function') {
         this.SystemServiceMessage = RongIMLib.registerMessageType('command', false, false);
         this.log?.info('[RongCloudClient] command 自定义消息类型已注册');
+
+        // 注册 service_chat 自定义消息类型（客服消息）
+        this.ServiceChatMessage = RongIMLib.registerMessageType('service_chat', false, false);
+        this.log?.info('[RongCloudClient] service_chat 自定义消息类型已注册');
       } else {
         this.log?.warn('[RongCloudClient] SDK 不支持 registerMessageType');
       }
     } catch (err) {
-      this.log?.warn(`[RongCloudClient] 注册 command 消息类型失败: ${err.message}`);
+      this.log?.warn(`[RongCloudClient] 注册自定义消息类型失败: ${err.message}`);
     }
 
     this.log?.info(`[RongCloudClient] SDK Events: ${JSON.stringify(Object.keys(RongIMLib.Events || {}))}`);
@@ -286,8 +290,14 @@ class RongCloudClient {
       return false;
     }
 
-    if (!this.SystemServiceMessage) {
-      this.log?.error('[RongCloudClient] command 消息类型未注册');
+    // 根据消息类型选择对应的构造函数
+    let MessageCtor = this.SystemServiceMessage;
+    if (customType === 'service_chat') {
+      MessageCtor = this.ServiceChatMessage;
+    }
+
+    if (!MessageCtor) {
+      this.log?.error(`[RongCloudClient] ${customType} 消息类型未注册`);
       return false;
     }
 
@@ -297,7 +307,7 @@ class RongCloudClient {
         : (RongIMLib.ConversationType?.PRIVATE || ConversationType.PRIVATE);
 
       const messageContent = typeof content === 'string' ? JSON.parse(content) : content;
-      const customMsg = new this.SystemServiceMessage(messageContent);
+      const customMsg = new MessageCtor(messageContent);
 
       const result = await RongIMLib.sendMessage(
         { conversationType: convType, targetId },
