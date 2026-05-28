@@ -385,7 +385,7 @@ class RongyunMessageHandler {
 
     this.logInfo(`[RongyunMessageHandler] 收到设备控制命令: command=${command}, from=${targetId}`);
 
-    const validCommands = ['disable', 'enable', 'delete', 'status'];
+    const validCommands = ['disable', 'enable', 'delete', 'status', 'rename_device'];
     if (!validCommands.includes(command)) {
       await this.sendDeviceControlResult(targetId, requestId, command, 'error', `未知命令: ${command}`);
       return;
@@ -394,6 +394,42 @@ class RongyunMessageHandler {
     try {
       let result;
       switch (command) {
+        case 'rename_device': {
+          const newName = data.name || data.nickname;
+          if (!newName) {
+            result = { status: 'error', message: '缺少新名称参数' };
+            break;
+          }
+          
+          // 更新本地配置文件
+          try {
+            const homeDir = os.homedir();
+            const configPaths = [
+              path.join(homeDir, '.claw-bridge', 'config.json'),
+              path.join(__dirname, '..', '..', 'rongcloud-config.json')
+            ];
+            
+            for (const configPath of configPaths) {
+              if (fs.existsSync(configPath)) {
+                const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+                config.nodeName = newName;
+                fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+                this.logInfo(`[RongyunMessageHandler] 已更新本地配置名称: ${configPath} -> ${newName}`);
+              }
+            }
+            
+            // 更新内存中的配置
+            if (this.config) {
+              this.config.nodeName = newName;
+            }
+            
+            result = { status: 'success', message: `设备名称已更新为: ${newName}` };
+          } catch (err) {
+            this.logError(`[RongyunMessageHandler] 更新本地配置失败: ${err.message}`);
+            result = { status: 'error', message: `更新本地配置失败: ${err.message}` };
+          }
+          break;
+        }
         case 'disable': {
           // 先发送响应，再停止服务
           result = { status: 'success', message: '设备服务已禁用' };
