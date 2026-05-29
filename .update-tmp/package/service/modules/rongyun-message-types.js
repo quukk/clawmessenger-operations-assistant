@@ -26,7 +26,11 @@ const RongyunMessageTypeEnum = {
   DEVICE_CONTROL: "device_control",
   DEVICE_CONTROL_RESULT: "device_control_result",
   DEVICE_STATUS_REQUEST: "device_status_request",
-  DEVICE_STATUS_REPORT: "device_status_report"
+  DEVICE_STATUS_REPORT: "device_status_report",
+  SERVICE_CHAT_MESSAGE: "service_chat_message",
+  SERVICE_CHAT_RESPONSE: "service_chat_response",
+  CREATE_SERVICE_SESSION: "create_service_session",
+  SERVICE_SESSION_CREATED: "service_session_created"
 };
 
 module.exports = { RongyunMessageTypeEnum };

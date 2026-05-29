@@ -176,7 +176,22 @@ class RongyunMessageSender {
 
       // 优先使用自定义消息类型发送 P2P 消息
       let result;
-      if (this.rongcloudClient.SystemServiceMessage) {
+      if (this.rongcloudClient.ServiceChatMessage && msgType.includes('service')) {
+        // 客服相关消息使用 service_chat 自定义消息类型
+        // 对于客服消息，直接将业务内容放在顶层，方便前端解析
+        const serviceChatPayload = {
+          msg_type: msgType,
+          ...content,  // 展开业务内容（status, content, sessionId, userId 等）
+          request_id: requestId || '',
+          timestamp: Math.floor(Date.now() / 1000),
+        };
+        result = await this.rongcloudClient.sendCustomMessage(
+          targetId,
+          serviceChatPayload,
+          1, // PRIVATE
+          'service_chat'
+        );
+      } else if (this.rongcloudClient.SystemServiceMessage) {
         result = await this.rongcloudClient.sendCustomMessage(
           targetId,
           messagePayload,

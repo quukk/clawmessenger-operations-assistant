@@ -10,7 +10,7 @@
 const { RongyunMessageTypeEnum } = require('./rongyun-message-types');
 const { OpenClawCommandEnum, getCommandName } = require('./openclaw-enum');
 const { executeCommand } = require('./openclaw-control');
-const { createOpencodeSession, deleteOpencodeSession, forwardChatMessage } = require('./opencode-service');
+const { createOpencodeSession, deleteOpencodeSession, forwardChatMessage, getOrCreateGatewaySession } = require('./opencode-service');
 const { ServiceManager } = require('./service-manager');
 const { collectDashboardData } = require('./dashboard-collector');
 const { getOpenClawStatus } = require('./port-checker');
@@ -18,6 +18,57 @@ const { getMacAddress } = require('./mac-address');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+
+// 客服会话存储（内存缓存，生产环境建议用 Redis）
+const serviceSessions = new Map();
+
+// 客服系统提示词 - OpenClaw 运维助手智能体
+const SERVICE_SYSTEM_PROMPT = `你是 虾说智能助手的 openclaw 运维助手智能体，职责有：保活、修配置、做备份 等运维工作。
+
+## 核心职责
+1. **保活**：openclaw 挂了自动拉起来
+2. **修配置**：配置报错时自动修复，修不好就回滚备份
+3. **做备份**：改配置前自动备份到 config.json.bak.时间戳
+
+## 常用运维指令
+
+| 命令 | 功能 | 容器内可用 |
+|------|------|-----------|
+| \`openclaw doctor\` | 诊断并自动修复问题 | ✅ |
+| \`openclaw doctor --fix\` | 强制修复配置错误 | ✅ |
+| \`openclaw status\` | 查看整体运行状态 | ✅ |
+| \`openclaw models list\` | 查看可用模型 | ✅ |
+| \`openclaw channels status\` | 查看通讯平台连接状态 | ✅ |
+| \`openclaw logs --follow\` | 实时查看运行日志 | ✅ |
+| \`openclaw gateway\` | **前台启动 Gateway**（端口 18789） | ✅ 推荐 |
+| \`openclaw gateway --port 18789 --host 0.0.0.0 --verbose\` | 指定参数前台启动 | ✅ |
+| \`openclaw onboard\` | 首次配置向导（交互式） | ✅ |
+
+## Docker容器内不可用（需要 systemd）
+
+| 命令 | 容器内替代方案 |
+|------|---------|
+| \`openclaw gateway start\` | 改用 \`openclaw gateway\` 前台运行 |
+| \`openclaw gateway restart\` | 先 \`pkill -f "openclaw gateway"\` 再重新启动 |
+| \`openclaw onboard --install-daemon\` | 改用 \`nohup openclaw gateway &\` 后台运行 |
+| \`systemctl --user start openclaw-gateway.service\` | 容器无 systemd，用 \`nohup\` |
+
+## 后台运行方案（容器内）nohup 后台运行
+nohup openclaw gateway --port 18789 --host 0.0.0.0 --verbose > /var/log/openclaw.log 2>&1 &
+
+## 修不好的时候，查资料顺序
+1. \`openclaw --help\` 先看本地帮助
+2. https://docs.openclaw.ai 官方文档
+3. https://github.com/openclaw/openclaw/issues GitHub 搜报错关键词
+
+## 铁律
+- 改配置必须先备份
+- 执行命令后汇报结果，别沉默
+- 不知道就查资料，别瞎猜
+- 看到 \`systemctl\` 相关报错，立即切换为 \`nohup\` 方案, 因为docker容器内是没有systemctl的。
+- 超过6分钟 没有修复好就停下来，报告你遇到的问题，不要无限循环的进行修复。
+- 不要对外透漏你是什么模型，不要说你是opencode，对外你就说你是 虾说智能助手；
+`;
 
 class RongyunMessageHandler {
   constructor(rongcloudClient, config, log) {
@@ -67,13 +118,19 @@ class RongyunMessageHandler {
       // 解析 content 字段（前端将业务数据放在 content 内）
       let data = parsed;
       if (parsed.content && typeof parsed.content === 'string') {
-        try {
-          const contentData = JSON.parse(parsed.content);
-          // 将 content 内的数据合并到顶层，方便处理器直接访问
-          // 保留原始 content 字段（用于聊天消息等场景）
-          data = { ...parsed, ...contentData, _raw_content: parsed.content };
-        } catch (e) {
-          this.logWarn(`解析 content 失败: ${e.message}`);
+        // 聊天消息的内容是纯文本，不需要解析为 JSON
+        const isChatMessage = parsed.msg_type === RongyunMessageTypeEnum.CHAT_MESSAGE ||
+                              parsed.msg_type === RongyunMessageTypeEnum.SERVICE_CHAT_MESSAGE;
+        
+        if (!isChatMessage) {
+          try {
+            const contentData = JSON.parse(parsed.content);
+            // 将 content 内的数据合并到顶层，方便处理器直接访问
+            // 保留原始 content 字段（用于聊天消息等场景）
+            data = { ...parsed, ...contentData, _raw_content: parsed.content };
+          } catch (e) {
+            this.logWarn(`解析 content 失败: ${e.message}`);
+          }
         }
       }
 
@@ -98,6 +155,12 @@ class RongyunMessageHandler {
           break;
         case RongyunMessageTypeEnum.DEVICE_STATUS_REQUEST:
           await this.handleDeviceStatusRequest(data);
+          break;
+        case RongyunMessageTypeEnum.CREATE_SERVICE_SESSION:
+          await this.handleCreateServiceSession(data);
+          break;
+        case RongyunMessageTypeEnum.SERVICE_CHAT_MESSAGE:
+          await this.handleServiceChatMessage(data);
           break;
         default:
           this.logWarn(`未处理的消息类型: ${msgType}`);
@@ -154,7 +217,7 @@ class RongyunMessageHandler {
       // 先发送响应，再执行命令（避免前端超时）
       // 启动/停止/重启命令是异步的，前端只需要知道命令已接收
       const isAsyncCommand = [OpenClawCommandEnum.START, OpenClawCommandEnum.STOP, OpenClawCommandEnum.RESTART].includes(command);
-      
+
       if (isAsyncCommand) {
         // 立即响应，告知前端命令已接收
         const actionName = force ? '强制' + getCommandName(command) : getCommandName(command);
@@ -165,7 +228,7 @@ class RongyunMessageHandler {
           message: `${actionName}命令已接收，正在执行...`
         }, requestId, sourceId);
       }
-      
+
       // 执行命令（在后台异步执行，不阻塞响应）
       // 使用 Promise 避免阻塞，让命令在后台执行
       executeCommand(command, null, async (response) => {
@@ -195,7 +258,7 @@ class RongyunMessageHandler {
           this.commandLockTimer = null;
         }
       });
-      
+
       // 异步命令立即返回，不等待执行完成
       if (isAsyncCommand) {
         return;
@@ -322,7 +385,7 @@ class RongyunMessageHandler {
 
     this.logInfo(`[RongyunMessageHandler] 收到设备控制命令: command=${command}, from=${targetId}`);
 
-    const validCommands = ['disable', 'enable', 'delete', 'status'];
+    const validCommands = ['disable', 'enable', 'delete', 'status', 'rename_device'];
     if (!validCommands.includes(command)) {
       await this.sendDeviceControlResult(targetId, requestId, command, 'error', `未知命令: ${command}`);
       return;
@@ -331,17 +394,53 @@ class RongyunMessageHandler {
     try {
       let result;
       switch (command) {
+        case 'rename_device': {
+          const newName = data.name || data.nickname;
+          if (!newName) {
+            result = { status: 'error', message: '缺少新名称参数' };
+            break;
+          }
+          
+          // 更新本地配置文件
+          try {
+            const homeDir = os.homedir();
+            const configPaths = [
+              path.join(homeDir, '.claw-bridge', 'config.json'),
+              path.join(__dirname, '..', '..', 'rongcloud-config.json')
+            ];
+            
+            for (const configPath of configPaths) {
+              if (fs.existsSync(configPath)) {
+                const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+                config.nodeName = newName;
+                fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+                this.logInfo(`[RongyunMessageHandler] 已更新本地配置名称: ${configPath} -> ${newName}`);
+              }
+            }
+            
+            // 更新内存中的配置
+            if (this.config) {
+              this.config.nodeName = newName;
+            }
+            
+            result = { status: 'success', message: `设备名称已更新为: ${newName}` };
+          } catch (err) {
+            this.logError(`[RongyunMessageHandler] 更新本地配置失败: ${err.message}`);
+            result = { status: 'error', message: `更新本地配置失败: ${err.message}` };
+          }
+          break;
+        }
         case 'disable': {
           // 先发送响应，再停止服务
           result = { status: 'success', message: '设备服务已禁用' };
           await this.sendDeviceControlResult(targetId, requestId, command, result.status, result.message, result.data);
-          
+
           setTimeout(async () => {
             const svcMgr = new ServiceManager('claw-subagent-service', 'OpenClaw Guard CLI Client', process.argv[1], this.log);
-            try { await svcMgr.stop(); } catch (e) {}
-            try { await svcMgr.uninstall(); } catch (e) {}
+            try { await svcMgr.stop(); } catch (e) { }
+            try { await svcMgr.uninstall(); } catch (e) { }
           }, 2000);
-          
+
           return;
         }
         case 'enable': {
@@ -354,12 +453,12 @@ class RongyunMessageHandler {
           // 先发送响应，再停止服务（否则服务停止后无法发送响应）
           result = { status: 'success', message: '设备已删除，本地配置已清除' };
           await this.sendDeviceControlResult(targetId, requestId, command, result.status, result.message, result.data);
-          
+
           // 延迟执行实际的删除操作
           setTimeout(async () => {
             const svcMgr = new ServiceManager('claw-subagent-service', 'OpenClaw Guard CLI Client', process.argv[1], this.log);
-            try { await svcMgr.stop(); } catch (e) {}
-            try { await svcMgr.uninstall(); } catch (e) {}
+            try { await svcMgr.stop(); } catch (e) { }
+            try { await svcMgr.uninstall(); } catch (e) { }
             const homeDir = os.homedir();
             const configPaths = [
               path.join(homeDir, '.claw-bridge', 'config.json'),
@@ -371,7 +470,7 @@ class RongyunMessageHandler {
               }
             }
           }, 2000);
-          
+
           return; // 已经发送了响应，直接返回
         }
         case 'status': {
@@ -398,7 +497,7 @@ class RongyunMessageHandler {
     try {
       // 获取 OpenClaw 真实运行状态（检查端口 18789）
       const openClawStatus = await getOpenClawStatus();
-      
+
       // 获取真实的版本信息（如果可能）
       let version = 'unknown';
       try {
@@ -411,11 +510,11 @@ class RongyunMessageHandler {
       } catch (e) {
         // 忽略版本获取失败
       }
-      
+
       // 构建真实状态数据
       // openClawStatus: 1=端口监听正常(服务可用), 0=未运行(端口未监听)
       const statusMessage = openClawStatus === 1 ? '运行中' : '未运行';
-      
+
       const statusData = {
         open_claw_status: openClawStatus,  // 1=运行中, 0=未运行
         status_message: statusMessage,
@@ -423,7 +522,7 @@ class RongyunMessageHandler {
         version: version,
         timestamp: Date.now(),
       };
-      
+
       this.logInfo(`[RongyunMessageHandler] 设备真实状态: openClawStatus=${openClawStatus}, version=${version}`);
       await this.sendDeviceStatusReport(targetId, requestId, statusData);
     } catch (e) {
@@ -458,6 +557,137 @@ class RongyunMessageHandler {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.logError(`发送设备状态报告失败: ${msg}`);
+    }
+  }
+
+  async handleCreateServiceSession(data) {
+    const requestId = data.request_id;
+    const userId = data.userId || data.source_im_id;
+    const sourceId = data.source_im_id;
+
+    this.logInfo(`[RongyunMessageHandler] 创建客服会话, userId=${userId}, from=${sourceId}`);
+
+    try {
+      // 创建 OpenCode session 用于客服对话
+      const session = await createOpencodeSession(`客服会话-${userId}`);
+      const sessionId = session.id || session.session_id;
+
+      // 存储会话映射关系
+      serviceSessions.set(userId, {
+        sessionId: sessionId,
+        userId: userId,
+        createdAt: Date.now(),
+      });
+
+      this.logInfo(`[RongyunMessageHandler] 客服会话创建成功: ${sessionId}`);
+
+      await this.sendResponse(
+        RongyunMessageTypeEnum.SERVICE_SESSION_CREATED,
+        {
+          status: 'success',
+          sessionId: sessionId,
+          userId: userId,
+        },
+        requestId,
+        sourceId
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.logError(`创建客服会话失败: ${msg}`);
+      await this.sendResponse(
+        RongyunMessageTypeEnum.SERVICE_SESSION_CREATED,
+        {
+          status: 'error',
+          message: msg,
+        },
+        requestId,
+        sourceId
+      );
+    }
+  }
+
+  async handleServiceChatMessage(data) {
+    const requestId = data.request_id;
+    const userId = data.userId || data.source_im_id;
+    const sourceId = data.source_im_id;
+    const content = data.content || data._raw_content;
+
+    this.logInfo(`[RongyunMessageHandler] 收到客服消息, userId=${userId}, content=${content?.substring(0, 50)}`);
+
+    if (!content) {
+      this.logWarn('客服消息内容为空');
+      return;
+    }
+
+    try {
+      // 获取或创建用户会话
+      let sessionInfo = serviceSessions.get(userId);
+      let sessionId;
+
+      if (!sessionInfo) {
+        // 如果没有会话，创建一个
+        this.logInfo(`[RongyunMessageHandler] 用户 ${userId} 没有现有会话，创建新会话`);
+        const session = await createOpencodeSession(`客服会话-${userId}`);
+        sessionId = session.id || session.session_id;
+        serviceSessions.set(userId, {
+          sessionId: sessionId,
+          userId: userId,
+          createdAt: Date.now(),
+        });
+      } else {
+        sessionId = sessionInfo.sessionId;
+      }
+
+      this.logInfo(`[RongyunMessageHandler] 使用会话: ${sessionId}`);
+
+      // 调用 OpenCode 服务获取回复，使用运维助手提示词
+      let fullResponse = '';
+      await forwardChatMessage(
+        sessionId,
+        content,
+        (delta) => {
+          fullResponse += delta;
+        },
+        (level, message) => {
+          if (level === 'ERROR') {
+            this.logError(`[SERVICE-CHAT] ${message}`);
+          } else {
+            this.logInfo(`[SERVICE-CHAT] ${message}`);
+          }
+        },
+        120000, // 2分钟超时
+        SERVICE_SYSTEM_PROMPT // 使用运维助手提示词
+      );
+
+      this.logInfo(`[RongyunMessageHandler] 客服回复生成完成, 长度: ${fullResponse.length}`);
+
+      // 发送客服回复给用户
+      await this.sendResponse(
+        RongyunMessageTypeEnum.SERVICE_CHAT_RESPONSE,
+        {
+          status: 'success',
+          content: fullResponse,
+          sessionId: sessionId,
+          userId: userId,
+        },
+        requestId,
+        sourceId
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.logError(`客服消息处理异常: ${msg}`);
+
+      // 发送错误回复
+      await this.sendResponse(
+        RongyunMessageTypeEnum.SERVICE_CHAT_RESPONSE,
+        {
+          status: 'error',
+          content: '抱歉，处理您的消息时出现问题，请稍后重试。',
+          userId: userId,
+        },
+        requestId,
+        sourceId
+      );
     }
   }
 
