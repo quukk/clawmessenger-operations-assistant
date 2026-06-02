@@ -303,108 +303,16 @@ async function refreshRongCloudToken() {
 
 /**
  * 从后端系统配置同步客服账号ID
- * 如果数据库配置的 customer_service_account_id 与当前 accountId 不一致，
- * 则获取新账号的融云 token 并更新本地配置，使前端消息能正确送达
- *
- * 设计原理：
- * - 客服账号由管理员在系统配置表（im_system_config）中管理，支持频繁更新
- * - silent-service 本地 config.json 的 nodeId 由 clawmessenger 注册时决定
- * - 两者可能不一致，导致前端将消息发给 ID-A，但 silent-service 在 ID-B 上监听
- * - 此函数在启动时拉取数据库配置，自动对齐
+ * 
+ * 重要：节点服务保持独立，不强制切换为客服账号
+ * 客服账号仅用于专门的客服服务实例，不应影响普通节点服务
  *
  * @returns {Promise<boolean>} 配置是否已更新
  */
 async function syncCustomerServiceAccountId() {
-  if (!rongcloudConfig?.apiBaseUrl) {
-    log.warn('[WORKER] 无法同步客服账号: 缺少 apiBaseUrl');
-    return false;
-  }
-
-  try {
-    const resp = await axios.get(
-      `${rongcloudConfig.apiBaseUrl}/im/api/system/config/customer_service_account_id`,
-      { timeout: 10000 }
-    );
-
-    if (resp.data?.code === 200 && resp.data?.data?.value) {
-      const csAccountId = resp.data.data.value;
-      const currentAccountId = rongcloudConfig.accountId;
-
-      if (csAccountId === currentAccountId) {
-        log.info(`[WORKER] 客服账号一致: ${csAccountId}，无需变更`);
-        return false;
-      }
-
-      log.info(`[WORKER] 客服账号不一致: 当前=${currentAccountId}, 数据库配置=${csAccountId}，正在同步...`);
-
-      // 获取新账号的融云 token（节点必须已注册）
-      // 用独立 try-catch 包裹，与外部"配置不存在"的区分开
-      try {
-        const serverUrl = process.env.DM_SERVER_URL || 'https://newsradar.dreamdt.cn/im';
-        const tokenResp = await axios.get(
-          `${serverUrl}/api/claw/token/${csAccountId}`,
-          { timeout: 15000 }
-        );
-
-        if (tokenResp.data?.code === 200) {
-          const newToken = tokenResp.data.data?.token || tokenResp.data.token || '';
-          const newAppKey = tokenResp.data.data?.app_key || tokenResp.data.app_key || '';
-          if (newToken) {
-            log.info(`[WORKER] 获取客服账号 token 成功: ${csAccountId}`);
-
-            // 更新内存配置（影响后续融云连接）
-            rongcloudConfig.accountId = csAccountId;
-            rongcloudConfig.token = newToken;
-            if (newAppKey) {
-              rongcloudConfig.appKey = newAppKey;
-              log.info(`[WORKER] 客服账号 appKey 已更新: ${newAppKey}`);
-            }
-
-            // 持久化到本地 config.json（确保重启后仍使用新配置）
-            try {
-              if (fs.existsSync(clawBridgeConfigPath)) {
-                const clawConfig = JSON.parse(fs.readFileSync(clawBridgeConfigPath, 'utf8'));
-                clawConfig.nodeId = csAccountId;
-                clawConfig.token = newToken;
-                if (newAppKey) {
-                  clawConfig.appKey = newAppKey;
-                }
-                clawConfig.expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7天
-                fs.writeFileSync(clawBridgeConfigPath, JSON.stringify(clawConfig, null, 2));
-                log.info(`[WORKER] 客服账号已持久化到 config.json: ${csAccountId}`);
-              }
-            } catch (err) {
-              log.error(`[WORKER] 持久化客服账号到 config.json 失败: ${err.message}`);
-            }
-
-            return true;
-          }
-        }
-      } catch (tokenErr) {
-        if (tokenErr.response?.status === 404) {
-          log.warn(`[WORKER] 客服账号 ${csAccountId} 未注册为 claw 节点，无法获取 token。请先使用 clawmessenger 注册该账号`);
-        } else {
-          log.warn(`[WORKER] 获取客服账号 token 失败: ${tokenErr.message}`);
-        }
-      }
-
-      log.warn(`[WORKER] 保持当前配置: ${currentAccountId}`);
-      return false;
-    }
-
-    // API 返回了非 200（如配置不存在时 404），静默忽略
-    return false;
-  } catch (err) {
-    // 网络错误在后端未就绪时常见，静默失败不影响启动
-    if (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT' || err.code === 'ENOTFOUND') {
-      log.warn(`[WORKER] 无法连接后端同步客服账号: ${err.message}，保持当前配置`);
-    } else if (err.response?.status === 404) {
-      log.info('[WORKER] 客服账号未在系统配置中设置，使用当前配置');
-    } else {
-      log.error(`[WORKER] 同步客服账号异常: ${err.message}`);
-    }
-    return false;
-  }
+  // 节点服务保持独立，不切换客服账号
+  log.info(`[WORKER] 节点服务保持独立账号: ${rongcloudConfig?.accountId || 'unknown'}，不切换客服账号`);
+  return false;
 }
 
 async function initRongCloud() {
