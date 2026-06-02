@@ -617,21 +617,31 @@ class RongyunMessageHandler {
     this.logInfo(`[RongyunMessageHandler] 收到客服消息, userId=${userId}, content=${content?.substring(0, 50)}, voiceUrl=${voiceUrl ? '有' : '无'}`);
 
     // 处理语音消息：如果有语音URL，先进行语音识别
-    if (voiceUrl && (!content || content === '[语音]')) {
+    let voiceContentHint = '';
+    if (voiceUrl) {
+      voiceContentHint = `\n[用户发送了一条${voiceDuration || 0}秒的语音消息${voiceUrl ? '，语音文件: ' + voiceUrl : ''}]`;
       try {
         this.logInfo(`[RongyunMessageHandler] 检测到语音消息，开始语音识别: ${voiceUrl}`);
         const recognizedText = await this.recognizeVoice(voiceUrl);
         if (recognizedText) {
-          content = recognizedText;
+          content = (content && content !== '[语音]' ? content : '') || recognizedText;
+          voiceContentHint = `\n[语音识别结果: ${recognizedText}]\n[语音文件: ${voiceUrl}]`;
           this.logInfo(`[RongyunMessageHandler] 语音识别成功: ${content.substring(0, 50)}`);
         } else {
-          content = '[语音消息识别失败]';
-          this.logWarn(`[RongyunMessageHandler] 语音识别失败，使用占位文本`);
+          // 识别失败时仍然透传语音URL，让 openclaw 知道有语音消息
+          content = content && content !== '[语音]' ? content : `[语音消息，时长${voiceDuration || 0}秒]`;
+          this.logWarn(`[RongyunMessageHandler] 语音识别失败，透传语音URL到openclaw`);
         }
       } catch (e) {
         this.logError(`[RongyunMessageHandler] 语音识别异常: ${e.message}`);
-        content = '[语音消息识别失败]';
+        // 异常时也保持内容可读，并附加语音URL
+        content = content && content !== '[语音]' ? content : `[语音消息，时长${voiceDuration || 0}秒]`;
       }
+    }
+
+    // 将语音URL信息附加到content末尾，让openclaw能感知
+    if (voiceUrl && voiceContentHint) {
+      content = (content || '') + voiceContentHint;
     }
 
     if (!content) {
