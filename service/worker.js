@@ -135,7 +135,7 @@ try {
   process.cwd();
 } catch (e) {
   if (e.code === 'ENOENT') {
-    try { process.chdir(os.tmpdir()); } catch {}
+    try { process.chdir(os.tmpdir()); } catch { }
   }
 }
 
@@ -224,7 +224,6 @@ function loadRongCloudConfig() {
 
   if (!config.appKey) {
     config.appKey = process.env.DM_APP_KEY || 'bmdehs6pbyyks';
-    log.info(`[WORKER] 使用默认 appKey: ${config.appKey}`);
   }
 
   // 设置默认心跳间隔为20秒
@@ -232,7 +231,7 @@ function loadRongCloudConfig() {
     config.heartbeatInterval = 20;
   }
 
-  log.info(`[WORKER] 最终 apiBaseUrl: ${config.apiBaseUrl}`);
+  // log.info(`[WORKER] 最终 apiBaseUrl: ${config.apiBaseUrl}`);
 
   if (config.token && config.accountId) {
     return config;
@@ -263,6 +262,7 @@ async function refreshRongCloudToken() {
     const resp = await axios.get(`${serverUrl}/api/claw/token/${nodeId}`, { timeout: 15000 });
     if (resp.data?.code === 200) {
       const newToken = resp.data.data?.token || resp.data.token || '';
+      const newAppKey = resp.data.data?.app_key || resp.data.app_key || '';
       if (!newToken) {
         log.error('[WORKER] 服务端返回了空 token');
         return false;
@@ -271,12 +271,19 @@ async function refreshRongCloudToken() {
 
       // 更新内存配置
       rongcloudConfig.token = newToken;
+      if (newAppKey) {
+        rongcloudConfig.appKey = newAppKey;
+        log.info(`[WORKER] appKey 已更新: ${newAppKey}`);
+      }
 
       // 保存到 config.json
       try {
         if (fs.existsSync(clawBridgeConfigPath)) {
           const clawConfig = JSON.parse(fs.readFileSync(clawBridgeConfigPath, 'utf8'));
           clawConfig.token = newToken;
+          if (newAppKey) {
+            clawConfig.appKey = newAppKey;
+          }
           clawConfig.expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7天
           fs.writeFileSync(clawBridgeConfigPath, JSON.stringify(clawConfig, null, 2));
           log.info('[WORKER] 新 token 已保存到 config.json');
@@ -289,7 +296,7 @@ async function refreshRongCloudToken() {
     log.error(`[WORKER] 刷新 token 失败: ${resp.data?.message || '未知错误'}`);
     return false;
   } catch (err) {
-      log.error(`[WORKER] 刷新 token 异常: ${err.message}`);
+    log.error(`[WORKER] 刷新 token 异常: ${err.message}`);
     return false;
   }
 }
@@ -341,12 +348,17 @@ async function syncCustomerServiceAccountId() {
 
         if (tokenResp.data?.code === 200) {
           const newToken = tokenResp.data.data?.token || tokenResp.data.token || '';
+          const newAppKey = tokenResp.data.data?.app_key || tokenResp.data.app_key || '';
           if (newToken) {
             log.info(`[WORKER] 获取客服账号 token 成功: ${csAccountId}`);
 
             // 更新内存配置（影响后续融云连接）
             rongcloudConfig.accountId = csAccountId;
             rongcloudConfig.token = newToken;
+            if (newAppKey) {
+              rongcloudConfig.appKey = newAppKey;
+              log.info(`[WORKER] 客服账号 appKey 已更新: ${newAppKey}`);
+            }
 
             // 持久化到本地 config.json（确保重启后仍使用新配置）
             try {
@@ -354,6 +366,9 @@ async function syncCustomerServiceAccountId() {
                 const clawConfig = JSON.parse(fs.readFileSync(clawBridgeConfigPath, 'utf8'));
                 clawConfig.nodeId = csAccountId;
                 clawConfig.token = newToken;
+                if (newAppKey) {
+                  clawConfig.appKey = newAppKey;
+                }
                 clawConfig.expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7天
                 fs.writeFileSync(clawBridgeConfigPath, JSON.stringify(clawConfig, null, 2));
                 log.info(`[WORKER] 客服账号已持久化到 config.json: ${csAccountId}`);
@@ -443,7 +458,7 @@ async function initRongCloud() {
     // 融云 SDK 对自定义消息可能直接返回对象而非 JSON 字符串
     if (msg.content) {
       let parsed = null;
-      
+
       if (typeof msg.content === 'string') {
         // 字符串类型：尝试 JSON 解析
         try {
@@ -568,7 +583,7 @@ async function shutdownRongCloud() {
   if (global.dashboardReporter) {
     global.dashboardReporter.stop();
   }
-  
+
   if (rongcloudClient) {
     // 发送 CLIENT_DISCONNECTED
     try {
@@ -578,11 +593,11 @@ async function shutdownRongCloud() {
     } catch (err) {
       log.error(`[WORKER] 发送 CLIENT_DISCONNECTED 失败: ${err.message}`);
     }
-    
+
     await rongcloudClient.disconnect();
     log.info('[WORKER] 融云已断开');
   }
-  
+
   // 停止 opencode 服务
   stopOpencodeService(log);
 }
@@ -644,7 +659,7 @@ server.on('error', (err) => {
     // 延迟 3 秒后重试，给进程退出和端口释放留出足够时间
     setTimeout(() => {
       log.info(`[WORKER] 重新尝试监听端口 ${PORT}...`);
-      server.close(() => {});
+      server.close(() => { });
       server.listen(PORT, HOST);
     }, 3000);
     return;
@@ -681,20 +696,20 @@ async function gracefulShutdown(signal) {
     return;
   }
   isShuttingDown = true;
-  
+
   log.info(`[WORKER] 收到 ${signal} 信号，开始优雅退出...`);
-  
+
   try {
     await shutdownRongCloud();
   } catch (err) {
     log.error(`[WORKER] 关闭融云异常: ${err.message}`);
   }
-  
+
   // 关闭 HTTP 服务
   server.close(() => {
     log.info('[WORKER] HTTP 服务已关闭');
   });
-  
+
   // 给 3 秒时间完成关闭操作
   setTimeout(() => {
     log.info('[WORKER] 退出进程');
@@ -739,7 +754,7 @@ process.on('unhandledRejection', async (reason) => {
 
 // 拦截 process.exit 以定位调用来源
 const originalExit = process.exit;
-process.exit = function(code) {
+process.exit = function (code) {
   const stack = new Error('process.exit called from:').stack;
   log.error(`[WORKER] process.exit(${code}) 被调用:\n${stack}`);
   originalExit.call(process, code);
@@ -752,7 +767,7 @@ process.on('exit', (code) => {
     // 同步发送，因为 exit 事件不支持异步
     try {
       const messageSender = new RongyunMessageSender(rongcloudClient, rongcloudConfig, log);
-      messageSender.sendClientDisconnected().catch(() => {});
+      messageSender.sendClientDisconnected().catch(() => { });
     } catch (e) {
       // 忽略错误
     }
