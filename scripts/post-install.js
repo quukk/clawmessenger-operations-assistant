@@ -130,25 +130,40 @@ function installAndStartService() {
     svc.on('install', () => {
       console.log('[postinstall] 服务注册成功，正在启动...');
 
-      // 延迟 2 秒确保服务注册到 SCM，再设置开机自启 + 崩溃恢复
+      // 延迟 3 秒确保服务注册到 SCM，再设置开机自启 + 崩溃恢复
       setTimeout(() => {
-        const cmdFailure = `sc.exe failure "${SERVICE_NAME}" reset= 0 actions= restart/0/restart/0/restart/0`;
-        exec(cmdFailure, (err) => {
-          if (err) console.error(`[postinstall] 设置恢复策略失败: ${err.message}`);
-          else console.log('[postinstall] 恢复策略已设置：崩溃后自动重启');
-        });
+        // 使用 execSync 确保配置在启动前生效
+        try {
+          execSync(`sc.exe failure "${SERVICE_NAME}" reset= 0 actions= restart/0/restart/0/restart/0`, { stdio: 'ignore', timeout: 10000 });
+          console.log('[postinstall] 恢复策略已设置：崩溃后自动重启');
+        } catch (err) {
+          console.error(`[postinstall] 设置恢复策略失败: ${err.message}`);
+        }
 
-        exec(`sc.exe config "${SERVICE_NAME}" start= auto`, (err) => {
-          if (err) console.error(`[postinstall] 设置自动启动失败: ${err.message}`);
-          else console.log('[postinstall] 启动类型已设为：自动');
-        });
-      }, 2000);
+        try {
+          execSync(`sc.exe config "${SERVICE_NAME}" start= auto`, { stdio: 'ignore', timeout: 10000 });
+          console.log('[postinstall] 启动类型已设为：自动');
+        } catch (err) {
+          console.error(`[postinstall] 设置自动启动失败: ${err.message}`);
+        }
 
-      svc.start();
+        // 配置完成后启动服务
+        svc.start();
+      }, 3000);
     });
 
     svc.on('start', () => {
       console.log('[postinstall] 服务已启动');
+      // 启动后验证服务状态
+      setTimeout(() => {
+        try {
+          const status = execSync(`sc.exe query "${SERVICE_NAME}"`, { encoding: 'utf8', timeout: 5000 });
+          console.log('[postinstall] 服务状态验证:');
+          console.log(status);
+        } catch (err) {
+          console.warn(`[postinstall] 服务状态验证失败: ${err.message}`);
+        }
+      }, 2000);
     });
 
     svc.on('error', (err) => {

@@ -610,9 +610,29 @@ class RongyunMessageHandler {
     const requestId = data.request_id;
     const userId = data.userId || data.source_im_id;
     const sourceId = data.source_im_id;
-    const content = data.content || data._raw_content;
+    let content = data.content || data._raw_content;
+    const voiceUrl = data.voiceUrl;
+    const voiceDuration = data.voiceDuration;
 
-    this.logInfo(`[RongyunMessageHandler] 收到客服消息, userId=${userId}, content=${content?.substring(0, 50)}`);
+    this.logInfo(`[RongyunMessageHandler] 收到客服消息, userId=${userId}, content=${content?.substring(0, 50)}, voiceUrl=${voiceUrl ? '有' : '无'}`);
+
+    // 处理语音消息：如果有语音URL，先进行语音识别
+    if (voiceUrl && (!content || content === '[语音]')) {
+      try {
+        this.logInfo(`[RongyunMessageHandler] 检测到语音消息，开始语音识别: ${voiceUrl}`);
+        const recognizedText = await this.recognizeVoice(voiceUrl);
+        if (recognizedText) {
+          content = recognizedText;
+          this.logInfo(`[RongyunMessageHandler] 语音识别成功: ${content.substring(0, 50)}`);
+        } else {
+          content = '[语音消息识别失败]';
+          this.logWarn(`[RongyunMessageHandler] 语音识别失败，使用占位文本`);
+        }
+      } catch (e) {
+        this.logError(`[RongyunMessageHandler] 语音识别异常: ${e.message}`);
+        content = '[语音消息识别失败]';
+      }
+    }
 
     if (!content) {
       this.logWarn('客服消息内容为空');
@@ -688,6 +708,42 @@ class RongyunMessageHandler {
         requestId,
         sourceId
       );
+    }
+  }
+
+  /**
+   * 语音识别 - 调用后端 Python 服务
+   * @param {string} voiceUrl - 语音文件 URL
+   * @returns {Promise<string>} 识别文本
+   */
+  async recognizeVoice(voiceUrl) {
+    try {
+      const axios = require('axios');
+      
+      // 从配置中获取后端 API 地址
+      const apiBaseUrl = this.config.apiBaseUrl || process.env.API_BASE_URL || 'http://localhost:5000';
+      const recognizeUrl = `${apiBaseUrl}/im/api/voice/recognize`;
+      
+      this.logInfo(`[RongyunMessageHandler] 调用语音识别 API: ${recognizeUrl}`);
+      
+      const response = await axios.post(recognizeUrl, {
+        audioUrl: voiceUrl,
+        format: 'mp3',
+        sampleRate: 16000
+      }, {
+        timeout: 30000,
+        headers: { 'Content-Type': 'application/json' }
+      });
+      
+      if (response.data && response.data.code === 200) {
+        return response.data.data.text;
+      } else {
+        this.logError(`[RongyunMessageHandler] 语音识别 API 返回错误: ${JSON.stringify(response.data)}`);
+        return null;
+      }
+    } catch (e) {
+      this.logError(`[RongyunMessageHandler] 语音识别请求失败: ${e.message}`);
+      return null;
     }
   }
 

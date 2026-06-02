@@ -24,6 +24,17 @@ const SERVICE_NAME = 'claw-subagent-service';
 const args = process.argv.slice(2);
 const command = args[0] || '--run';
 
+// --version 支持：直接显示版本并退出，不启动 daemon
+if (command === '--version' || command === '-v') {
+  try {
+    const version = require('./package.json').version;
+    console.log(version);
+  } catch {
+    console.log('unknown');
+  }
+  process.exit(0);
+}
+
 function runDaemon() {
   console.log('[CLI] 启动 Daemon...');
   console.log(`[CLI] CLI 路径: ${__filename}`);
@@ -254,15 +265,38 @@ function controlService(action) {
 function checkStatus() {
   const platform = process.platform;
   let cmd;
-  
+
   if (platform === 'win32') {
-    cmd = `sc.exe query ${SERVICE_NAME}`;
+    // Windows: 先尝试 sc.exe query，若服务未安装则回退到进程检查
+    cmd = `sc.exe query "${SERVICE_NAME}"`;
+    exec(cmd, (err, stdout, stderr) => {
+      if (err) {
+        // 1060 = 服务未安装，给出更友好的提示
+        if (stderr && stderr.includes('1060')) {
+          console.log(`[CLI] 服务 "${SERVICE_NAME}" 未安装`);
+          console.log(`[CLI] 请运行: claw-subagent-service --install`);
+        } else {
+          console.error(`[CLI] 查询状态失败: ${err.message}`);
+        }
+        // 回退：检查 daemon 进程是否在前台运行
+        try {
+          const list = execSync('tasklist /FI "IMAGENAME eq node.exe" /FO CSV /NH', { encoding: 'utf8', windowsHide: true });
+          const hasDaemon = list.includes('daemon.js');
+          if (hasDaemon) {
+            console.log('[CLI] 检测到 Daemon 进程正在前台运行');
+          }
+        } catch { /* 忽略 */ }
+        return;
+      }
+      console.log(stdout);
+    });
+    return;
   } else if (platform === 'linux') {
     cmd = `systemctl status ${SERVICE_NAME}`;
   } else if (platform === 'darwin') {
     cmd = `launchctl list | grep ${SERVICE_NAME}`;
   }
-  
+
   exec(cmd, (err, stdout) => {
     if (err) {
       console.error(`[CLI] 查询状态失败: ${err.message}`);
