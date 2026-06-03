@@ -285,7 +285,7 @@ class RongyunMessageHandler {
     const roomId = data.room_id;
     const sessionId = data.gateway_session_id || data.session_id;
     // 使用解析后的 content（聊天内容），如果没有则使用原始 content
-    const content = data.content || data._raw_content;
+    let content = data.content || data._raw_content;
     const requestId = data.request_id;
     const sourceId = data.source_im_id;
 
@@ -299,6 +299,16 @@ class RongyunMessageHandler {
         metadata: {}
       }, requestId, sourceId);
       return;
+    }
+
+    // 语音消息：先进行语音识别
+    if (data.voiceUrl) {
+      const voiceText = await this._recognizeVoice(data.voiceUrl, data.voiceDuration);
+      if (voiceText !== null) {
+        content = `[语音转文字] ${voiceText}`;
+      } else {
+        content = `[语音消息，转文字失败] ${content}`;
+      }
     }
 
     let fullResponse = '';
@@ -764,6 +774,53 @@ class RongyunMessageHandler {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.logError(`发送响应失败: ${msg}`);
+    }
+  }
+
+  /**
+   * 语音识别：调用后端百度语音 API 将语音转为文字
+   */
+  async _recognizeVoice(voiceUrl, voiceDuration) {
+    try {
+      if (!voiceUrl) {
+        this.logWarn('[_recognizeVoice] 语音 URL 为空，跳过识别');
+        return null;
+      }
+
+      // 从 URL 提取扩展名并映射为百度支持的格式
+      const urlPath = voiceUrl.split('?')[0];
+      const ext = urlPath.split('.').pop()?.toLowerCase() || '';
+      const fmtMap = { aac: 'm4a', ogg: 'mp3', oga: 'mp3', opus: 'mp3' };
+      let format = fmtMap[ext] || ext;
+      if (!['pcm', 'wav', 'amr', 'm4a', 'mp3'].includes(format)) {
+        format = 'mp3';
+      }
+
+      // 采样率修正：amr 强制 8000，其余兜底 16000
+      let sampleRate = 16000;
+      if (format === 'amr') sampleRate = 8000;
+
+      const axios = require('axios');
+      const apiUrl = `${this.config.apiBaseUrl}/im/api/voice/recognize`;
+      this.logInfo(`[_recognizeVoice] 调用语音识别 API: ${apiUrl}, format=${format}, sampleRate=${sampleRate}`);
+
+      const response = await axios.post(apiUrl, {
+        audioUrl: voiceUrl,
+        format,
+        sampleRate,
+      }, { timeout: 30000 });
+
+      if (response.data?.code === 200 && response.data?.data?.text !== undefined) {
+        const text = response.data.data.text;
+        this.logInfo(`[_recognizeVoice] 语音识别成功: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
+        return text;
+      } else {
+        this.logWarn(`[_recognizeVoice] 语音识别失败: ${JSON.stringify(response.data)}`);
+        return null;
+      }
+    } catch (err) {
+      this.logError(`[_recognizeVoice] 语音识别异常: ${err.message}`);
+      return null;
     }
   }
 }
