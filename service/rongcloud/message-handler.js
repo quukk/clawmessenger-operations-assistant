@@ -720,14 +720,30 @@ class MessageHandler {
       let remoteUrl = '';
       let duration = 0;
       
-      if (typeof content === 'object' && content !== null) {
-        remoteUrl = content.remoteUrl || content.url || '';
-        duration = content.duration || 0;
-      } else {
-        remoteUrl = msg.remoteUrl || msg.url || msg.localPath || '';
+      // 先尝试解析 content（可能是 JSON 字符串）
+      let parsedContent = content;
+      if (typeof content === 'string' && content.startsWith('{')) {
+        try {
+          parsedContent = JSON.parse(content);
+        } catch (e) {
+          // 解析失败，保持原样
+        }
       }
       
-      this.log?.info(`[_extractMessageContent] 语音消息: remoteUrl=${remoteUrl}`);
+      if (typeof parsedContent === 'object' && parsedContent !== null) {
+        remoteUrl = parsedContent.remoteUrl || parsedContent.url || '';
+        duration = parsedContent.duration || 0;
+      }
+      
+      // 兜底：从 msg 根对象查找
+      if (!remoteUrl) {
+        remoteUrl = msg.remoteUrl || msg.url || msg.localPath || '';
+      }
+      if (!duration) {
+        duration = msg.duration || 0;
+      }
+      
+      this.log?.info(`[_extractMessageContent] 语音消息: remoteUrl=${remoteUrl}, duration=${duration}`);
       return `[语音] ${remoteUrl} ${duration}秒`;
     }
 
