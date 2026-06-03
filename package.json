@@ -15,6 +15,10 @@
     "publish:patch": "npm version patch && npm publish",
     "publish:minor": "npm version minor && npm publish",
     "publish:major": "npm version major && npm publish",
+    "unpublish:last": "node scripts/unpublish.js",
+    "unpublish:version": "node scripts/unpublish.js",
+    "deprecate:last": "npm deprecate $(node -p \"require('./package.json').name\")@$(node -p \"require('./package.json').version\") \"This version is deprecated. Please upgrade.\"",
+    "deprecate:version": "npm deprecate",
     "sync": "node scripts/sync-local.js"
   },
   "files": [
