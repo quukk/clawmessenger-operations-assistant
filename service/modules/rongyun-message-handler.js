@@ -78,10 +78,70 @@ class RongyunMessageHandler {
     this.commandLock = false;
     this.commandLockTimer = null;
     this.messageSender = null;
+    this.serverAPI = null;
+    // 流式消息队列：确保片段串行发送
+    this._streamQueue = Promise.resolve();
+    // 存储流式消息的 RongCloud messageUID：streamId -> messageUID
+    this._streamMessageUIDs = new Map();
   }
 
   setMessageSender(messageSender) {
     this.messageSender = messageSender;
+  }
+
+  setServerAPI(serverAPI) {
+    this.serverAPI = serverAPI;
+  }
+
+  /**
+   * 发送流式消息片段（直接调用融云 API）
+   * @param {string} fromUserId - 发送者ID
+   * @param {string} targetId - 目标用户ID
+   * @param {string} content - 消息内容
+   * @param {string} streamId - 流式消息ID
+   * @param {boolean} isFirstChunk - 是否首流
+   * @param {boolean} isLastChunk - 是否尾流
+   * @param {number} seq - 片段序号
+   */
+  async _sendStreamChunk(fromUserId, targetId, content, streamId, isFirstChunk, isLastChunk, seq = 1) {
+    const contentPreview = typeof content === 'string' ? content.substring(0, 100) : JSON.stringify(content).substring(0, 100);
+    this.logInfo(`[RongyunMessageHandler] _sendStreamChunk: target=${targetId}, streamId=${streamId}, seq=${seq}, first=${isFirstChunk}, last=${isLastChunk}, content_len=${content?.length || 0}`);
+    
+    if (!this.serverAPI) {
+      this.logWarn('[RongyunMessageHandler] _sendStreamChunk skipped: serverAPI not configured');
+      return;
+    }
+    
+    // 使用队列确保流式消息片段串行发送，避免并发导致后端处理错乱
+    this._streamQueue = this._streamQueue.then(async () => {
+      try {
+        // 获取已存储的 RongCloud messageUID（首流响应返回的）
+        const messageUID = this._streamMessageUIDs.get(streamId);
+        
+        const result = await this.serverAPI.sendStreamPrivate({
+          fromUserId,
+          toUserId: targetId,
+          content,
+          streamId,
+          isFirstChunk,
+          isLastChunk,
+          seq,
+          messageUID
+        });
+        
+        // 首流时存储 RongCloud 返回的 messageUID
+        if (isFirstChunk && result?.messageUID) {
+          this._streamMessageUIDs.set(streamId, result.messageUID);
+          this.logInfo(`[RongyunMessageHandler] 首流 messageUID 已存储: ${result.messageUID}, streamId=${streamId}`);
+        }
+        
+        this.logInfo(`[RongyunMessageHandler] _sendStreamChunk 成功: seq=${seq}`);
+      } catch (err) {
+        this.logWarn(`[RongyunMessageHandler] 发送流式消息失败: ${err.message}, seq=${seq}`);
+      }
+    });
+    
+    await this._streamQueue;
   }
 
   logInfo(message) {
@@ -312,11 +372,32 @@ class RongyunMessageHandler {
     }
 
     let fullResponse = '';
+    let buffer = ''; // 用于流式发送的缓冲区
     const chatTimeoutMs = (this.config.chatTimeout || 600) * 1000;
+    
+    // 生成流式消息唯一ID
+    const streamId = `stream-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    let seq = 0;
+    let hasSentChunk = false;
+    const fromUserId = this.config.accountId || '';
 
     try {
       await forwardChatMessage(sessionId, content, async (delta) => {
         fullResponse += delta;
+        buffer += delta;
+        
+        // 当缓冲区达到一定大小或包含标点时，发送流式片段
+        // 使用 50 字符作为触发阈值（与 message-handler.js 保持一致）
+        if (buffer.length >= 50) {
+          seq += 1;
+          const chunkToSend = buffer;
+          buffer = ''; // 清空缓冲区
+          
+          // 首流时发送首流标记
+          const isFirstChunk = seq === 1;
+          await this._sendStreamChunk(fromUserId, sourceId, chunkToSend, streamId, isFirstChunk, false, seq);
+          hasSentChunk = true;
+        }
       }, (level, message) => {
         if (level === 'ERROR') {
           this.logError(`[CHAT-API] ${message}`);
@@ -327,21 +408,50 @@ class RongyunMessageHandler {
         }
       }, chatTimeoutMs);
 
+      // 发送剩余缓冲区内容
+      if (buffer.length > 0) {
+        seq += 1;
+        const isFirstChunk = seq === 1;
+        await this._sendStreamChunk(fromUserId, sourceId, buffer, streamId, isFirstChunk, false, seq);
+        hasSentChunk = true;
+        buffer = '';
+      }
+
+      // 发送尾流标记
+      if (hasSentChunk) {
+        seq += 1;
+        await this._sendStreamChunk(fromUserId, sourceId, '', streamId, false, true, seq);
+      }
+
+      // 同时发送完整的 command 消息作为历史记录（兼容旧前端）
       await this.sendResponse(RongyunMessageTypeEnum.CHAT_MESSAGE, {
         status: 'success',
         message: 'Response received',
         content: fullResponse,
         metadata: {}
       }, requestId, sourceId);
+      
+      // 清理已存储的 messageUID
+      this._streamMessageUIDs.delete(streamId);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.logError(`聊天消息处理异常: ${msg}`);
+      
+      // 如果已经开始流式发送，发送错误标记
+      if (hasSentChunk) {
+        seq += 1;
+        await this._sendStreamChunk(fromUserId, sourceId, `[错误] 转发失败: ${msg}`, streamId, false, true, seq);
+      }
+      
       await this.sendResponse(RongyunMessageTypeEnum.CHAT_MESSAGE, {
         status: 'error',
         message: msg,
         content: `[错误] 转发失败: ${msg}`,
         metadata: {}
       }, requestId, sourceId);
+      
+      // 清理已存储的 messageUID
+      this._streamMessageUIDs.delete(streamId);
     }
   }
 

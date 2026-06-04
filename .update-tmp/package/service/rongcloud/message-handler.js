@@ -400,7 +400,18 @@ class MessageHandler {
 
     try {
       // 确保传入的内容是字符串（claw 类型消息 content 可能是对象）
-      const chatContent = this._extractMessageContent(msg);
+      let chatContent = this._extractMessageContent(msg);
+
+      // 语音消息：先进行语音识别，把识别结果传给 AI
+      if (msg.messageType === 'RC:HQVCMsg') {
+        const voiceText = await this._recognizeVoice(msg);
+        if (voiceText !== null) {
+          chatContent = `[语音转文字] ${voiceText}`;
+        } else {
+          chatContent = `[语音消息，转文字失败] ${chatContent}`;
+        }
+      }
+
       this.log?.info(`[MessageHandler] 调用 chatStream, content_type=${typeof msg.content}, chatContent=${chatContent.substring(0, 50)}`);
       await this.openclawClient.chatStream(
         chatContent,
@@ -720,19 +731,91 @@ class MessageHandler {
       let remoteUrl = '';
       let duration = 0;
       
-      if (typeof content === 'object' && content !== null) {
-        remoteUrl = content.remoteUrl || content.url || '';
-        duration = content.duration || 0;
-      } else {
-        remoteUrl = msg.remoteUrl || msg.url || msg.localPath || '';
+      // 先尝试解析 content（可能是 JSON 字符串）
+      let parsedContent = content;
+      if (typeof content === 'string' && content.startsWith('{')) {
+        try {
+          parsedContent = JSON.parse(content);
+        } catch (e) {
+          // 解析失败，保持原样
+        }
       }
       
-      this.log?.info(`[_extractMessageContent] 语音消息: remoteUrl=${remoteUrl}`);
+      if (typeof parsedContent === 'object' && parsedContent !== null) {
+        remoteUrl = parsedContent.remoteUrl || parsedContent.url || '';
+        duration = parsedContent.duration || 0;
+      }
+      
+      // 兜底：从 msg 根对象查找
+      if (!remoteUrl) {
+        remoteUrl = msg.remoteUrl || msg.url || msg.localPath || '';
+      }
+      if (!duration) {
+        duration = msg.duration || 0;
+      }
+      
+      this.log?.info(`[_extractMessageContent] 语音消息: remoteUrl=${remoteUrl}, duration=${duration}`);
       return `[语音] ${remoteUrl} ${duration}秒`;
     }
 
     // 兜底
     return typeof content === 'string' ? content : JSON.stringify(content);
+  }
+
+  /**
+   * 语音识别：调用后端百度语音 API 将语音转为文字
+   */
+  async _recognizeVoice(msg) {
+    try {
+      let content = msg.content;
+      if (typeof content === 'string' && content.startsWith('{')) {
+        try {
+          content = JSON.parse(content);
+        } catch (e) {
+          // 解析失败，保持原样
+        }
+      }
+
+      const remoteUrl = content?.remoteUrl || content?.url || msg.remoteUrl || msg.url;
+      if (!remoteUrl) {
+        this.log?.warn('[_recognizeVoice] 语音消息缺少 remoteUrl，跳过识别');
+        return null;
+      }
+
+      // 从 URL 提取扩展名并映射为百度支持的格式
+      const urlPath = remoteUrl.split('?')[0];
+      const ext = urlPath.split('.').pop()?.toLowerCase() || '';
+      const fmtMap = { aac: 'm4a', ogg: 'mp3', oga: 'mp3', opus: 'mp3' };
+      let format = fmtMap[ext] || ext;
+      if (!['pcm', 'wav', 'amr', 'm4a', 'mp3'].includes(format)) {
+        format = 'mp3';
+      }
+
+      // 采样率修正：amr 强制 8000，其余使用消息自带值兜底 16000
+      let sampleRate = content?.sampleRate || msg.sampleRate || 16000;
+      if (format === 'amr') sampleRate = 8000;
+
+      const apiUrl = `${this.config.apiBaseUrl}/im/api/voice/recognize`;
+      this.log?.info(`[_recognizeVoice] 调用语音识别 API: ${apiUrl}, format=${format}, sampleRate=${sampleRate}`);
+
+      const response = await axios.post(apiUrl, {
+        audioUrl: remoteUrl,
+        format,
+        sampleRate,
+      }, { timeout: 30000 });
+
+      if (response.data?.code === 200 && response.data?.data?.text !== undefined) {
+        const text = response.data.data.text;
+        this.log?.info(`[_recognizeVoice] 语音识别成功: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
+        return text;
+      } else {
+        this.log?.warn(`[_recognizeVoice] 语音识别失败: ${JSON.stringify(response.data)}`);
+        return null;
+      }
+    } catch (err) {
+      this.log?.error(`[_recognizeVoice] 语音识别异常: ${err.message}`);
+      return null;
+    }
   }
 
   parseCommand(raw, senderId) {

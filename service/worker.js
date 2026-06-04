@@ -8,6 +8,8 @@ const { createLogger } = require('./logger');
 const { RongCloudClient, MessageHandler, ensurePluginsAllow } = require('./rongcloud');
 const { RongyunMessageHandler } = require('./modules/rongyun-message-handler');
 const { RongyunMessageSender } = require('./modules/rongyun-message-sender');
+const { RongCloudServerAPI } = require('./rongcloud/rongcloud-server-api');
+const { SystemConfigManager } = require('./modules/system-config');
 const { HeartbeatManager, DashboardReporter } = require('./modules/heartbeat-dashboard');
 const { getOpenClawStatus } = require('./modules/port-checker');
 const { getMacAddress } = require('./modules/mac-address');
@@ -340,12 +342,20 @@ async function initRongCloud() {
 
   rongcloudClient = new RongCloudClient(rongcloudConfig, log);
 
+  // 创建系统配置管理器（用于融云服务端API）
+  const configManager = new SystemConfigManager(rongcloudConfig, log);
+  
+  // 创建融云服务端API客户端（用于发送流式消息）
+  const serverAPI = new RongCloudServerAPI(configManager, log);
+
   // 创建消息发送器
   const messageSender = new RongyunMessageSender(rongcloudClient, rongcloudConfig, log);
+  messageSender.setServerAPI(serverAPI); // 注入 serverAPI，支持发送流式消息
 
   // 创建新的融云消息处理器（与桌面客户端对齐）
   const rongyunMessageHandler = new RongyunMessageHandler(rongcloudClient, rongcloudConfig, log);
   rongyunMessageHandler.setMessageSender(messageSender);
+  rongyunMessageHandler.setServerAPI(serverAPI); // 注入 serverAPI
 
   messageHandler = new MessageHandler(
     rongcloudConfig,

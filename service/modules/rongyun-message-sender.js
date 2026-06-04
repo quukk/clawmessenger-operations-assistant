@@ -176,9 +176,9 @@ class RongyunMessageSender {
 
       // 优先使用自定义消息类型发送 P2P 消息
       let result;
-      if (this.rongcloudClient.ServiceChatMessage && msgType.includes('service')) {
-        // 客服相关消息使用 service_chat 自定义消息类型
-        // 对于客服消息，直接将业务内容放在顶层，方便前端解析
+      // 客服消息和聊天消息都将业务内容放在顶层，方便前端解析
+      if (this.rongcloudClient.ServiceChatMessage && (msgType.includes('service') || msgType === 'chat_message')) {
+        // 对于客服/聊天消息，直接将业务内容放在顶层，方便前端解析
         const serviceChatPayload = {
           msg_type: msgType,
           ...content,  // 展开业务内容（status, content, sessionId, userId 等）
@@ -244,6 +244,65 @@ class RongyunMessageSender {
       },
       requestId
     );
+  }
+
+  /**
+   * 发送流式消息片段（P2P）
+   * 使用融云服务端API发送 RC:StreamMsg
+   * @param {Object} options - 流式消息选项
+   * @param {string} options.targetId - 目标用户ID
+   * @param {string} options.content - 消息片段内容
+   * @param {string} options.streamId - 流式消息ID
+   * @param {number} options.seq - 片段序号
+   * @param {boolean} options.isFirstChunk - 是否首流
+   * @param {boolean} options.isLastChunk - 是否尾流
+   * @param {string} options.messageUID - 首流返回的messageUID（后续流使用）
+   * @returns {Promise<Object>} 发送结果
+   */
+  async sendStreamToTarget({
+    targetId,
+    content,
+    streamId,
+    seq = 1,
+    isFirstChunk = false,
+    isLastChunk = false,
+    messageUID = null
+  }) {
+    // 需要 serverAPI 支持
+    if (!this.serverAPI) {
+      this.log?.error('[RongyunMessageSender] serverAPI 未设置，无法发送流式消息');
+      return false;
+    }
+
+    try {
+      const fromUserId = this.config.accountId || '';
+      
+      const result = await this.serverAPI.sendStreamPrivate({
+        fromUserId,
+        toUserId: targetId,
+        content,
+        streamId,
+        isFirstChunk,
+        isLastChunk,
+        seq,
+        streamType: 'text',
+        messageUID
+      });
+
+      this.log?.info(`[RongyunMessageSender] 流式消息已发送: seq=${seq}, first=${isFirstChunk}, last=${isLastChunk}`);
+      return result;
+    } catch (err) {
+      this.log?.error(`[RongyunMessageSender] 发送流式消息失败: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * 设置 serverAPI（用于发送流式消息）
+   * @param {RongCloudServerAPI} serverAPI 
+   */
+  setServerAPI(serverAPI) {
+    this.serverAPI = serverAPI;
   }
 }
 
