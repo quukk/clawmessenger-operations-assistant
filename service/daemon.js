@@ -4,7 +4,6 @@ const fs = require('fs');
 const os = require('os');
 const { createLogger } = require('./logger');
 const { Updater } = require('./updater');
-const { checkPortListening } = require('./modules/port-checker');
 
 const log = createLogger('daemon');
 const WORKER_PATH = path.join(__dirname, 'worker.js');

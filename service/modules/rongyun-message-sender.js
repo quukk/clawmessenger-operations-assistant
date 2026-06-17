@@ -96,31 +96,14 @@ class RongyunMessageSender {
   /**
    * 发送心跳
    */
-  async sendHeartbeat(openClawStatus) {
+  async sendHeartbeat() {
     return await this.sendProtocolMessage(
       RongyunMessageTypeEnum.HEARTBEAT,
       {
         mac_address: getMacAddress(),
         nickname: this.config.nodeName || 'CLI客户端',
-        open_claw_status: openClawStatus,
         client_status: 1,
       }
-    );
-  }
-
-  /**
-   * 发送命令结果
-   */
-  async sendCommandResult(command, commandId, status, message, requestId) {
-    return await this.sendProtocolMessage(
-      RongyunMessageTypeEnum.COMMAND_RESULT,
-      {
-        command,
-        command_id: commandId,
-        status,
-        message,
-      },
-      requestId
     );
   }
 
@@ -138,17 +121,6 @@ class RongyunMessageSender {
       },
       requestId
     );
-  }
-
-  /**
-   * 发送仪表盘数据
-   */
-  async sendDashboardData(msgType, data) {
-    return await this.sendProtocolMessage(msgType, {
-      mac_address: getMacAddress(),
-      timestamp: new Date().toISOString(),
-      ...data,
-    });
   }
 
   /**
@@ -211,23 +183,6 @@ class RongyunMessageSender {
       this.log?.error(`[RongyunMessageSender] P2P发送异常: ${err.message}`);
       return false;
     }
-  }
-
-  /**
-   * 发送设备控制结果（P2P）
-   */
-  async sendDeviceControlResult(targetId, requestId, command, status, message, data) {
-    return await this.sendToTarget(
-      targetId,
-      RongyunMessageTypeEnum.DEVICE_CONTROL_RESULT,
-      {
-        command,
-        status,
-        message,
-        data
-      },
-      requestId
-    );
   }
 
   /**

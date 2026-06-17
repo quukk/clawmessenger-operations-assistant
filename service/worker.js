@@ -10,8 +10,7 @@ const { RongyunMessageHandler } = require('./modules/rongyun-message-handler');
 const { RongyunMessageSender } = require('./modules/rongyun-message-sender');
 const { RongCloudServerAPI } = require('./rongcloud/rongcloud-server-api');
 const { SystemConfigManager } = require('./modules/system-config');
-const { HeartbeatManager, DashboardReporter } = require('./modules/heartbeat-dashboard');
-const { getOpenClawStatus } = require('./modules/port-checker');
+const { HeartbeatManager } = require('./modules/heartbeat-dashboard');
 const { getMacAddress } = require('./modules/mac-address');
 const { startOpencodeService, stopOpencodeService } = require('./modules/opencode-starter');
 
@@ -478,15 +477,10 @@ async function initRongCloud() {
 
     // 启动心跳管理器
     const heartbeatManager = new HeartbeatManager(rongcloudClient, rongcloudConfig, log);
-    heartbeatManager.start(getMacAddress, getOpenClawStatus);
-
-    // 启动仪表盘上报
-    const dashboardReporter = new DashboardReporter(rongcloudClient, rongcloudConfig, log);
-    dashboardReporter.start(getMacAddress);
+    heartbeatManager.start(getMacAddress);
 
     // 保存引用以便关闭时停止
     global.heartbeatManager = heartbeatManager;
-    global.dashboardReporter = dashboardReporter;
 
   } else {
     log.error('[WORKER] 融云连接失败，token 刷新后仍无法连接');
@@ -494,12 +488,9 @@ async function initRongCloud() {
 }
 
 async function shutdownRongCloud() {
-  // 停止心跳和仪表盘上报
+  // 停止心跳
   if (global.heartbeatManager) {
     global.heartbeatManager.stop();
-  }
-  if (global.dashboardReporter) {
-    global.dashboardReporter.stop();
   }
 
   if (rongcloudClient) {

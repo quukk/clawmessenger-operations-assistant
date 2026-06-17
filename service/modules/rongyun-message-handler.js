@@ -1,23 +1,14 @@
 /**
  * 融云消息处理器 - 与桌面客户端对齐
- * 
+ *
  * 处理服务端发送的所有结构化消息类型：
- * - COMMAND: 执行 start/stop/restart/status 命令
  * - CHAT_MESSAGE: 转发消息到 OpenClaw AI 服务
  * - CREATE_OPENCODE_SESSION: 创建新会话
  * - DELETE_OPENCODE_SESSION: 删除会话
  */
 const { RongyunMessageTypeEnum } = require('./rongyun-message-types');
-const { OpenClawCommandEnum, getCommandName } = require('./openclaw-enum');
-const { executeCommand } = require('./openclaw-control');
 const { createOpencodeSession, deleteOpencodeSession, forwardChatMessage, getOrCreateGatewaySession } = require('./opencode-service');
-const { ServiceManager } = require('./service-manager');
-const { collectDashboardData } = require('./dashboard-collector');
-const { getOpenClawStatus } = require('./port-checker');
 const { getMacAddress } = require('./mac-address');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
 
 // 客服会话存储（内存缓存，生产环境建议用 Redis）
 const serviceSessions = new Map();
@@ -75,8 +66,6 @@ class RongyunMessageHandler {
     this.rongcloudClient = rongcloudClient;
     this.config = config;
     this.log = log;
-    this.commandLock = false;
-    this.commandLockTimer = null;
     this.messageSender = null;
     this.serverAPI = null;
     // 流式消息队列：确保片段串行发送
@@ -198,9 +187,6 @@ class RongyunMessageHandler {
       this.logInfo(`[RongyunMessageHandler] 处理消息类型: ${msgType}`);
 
       switch (msgType) {
-        case RongyunMessageTypeEnum.COMMAND:
-          await this.handleCommand(data);
-          break;
         case RongyunMessageTypeEnum.CHAT_MESSAGE:
           await this.handleChatMessage(data);
           break;
@@ -209,9 +195,6 @@ class RongyunMessageHandler {
           break;
         case RongyunMessageTypeEnum.DELETE_OPENCODE_SESSION:
           await this.handleDeleteSession(data);
-          break;
-        case RongyunMessageTypeEnum.DEVICE_CONTROL:
-          await this.handleDeviceControl(data);
           break;
         case RongyunMessageTypeEnum.DEVICE_STATUS_REQUEST:
           await this.handleDeviceStatusRequest(data);
@@ -228,116 +211,6 @@ class RongyunMessageHandler {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.logError(`消息处理异常: ${msg}`);
-    }
-  }
-
-  async handleCommand(data) {
-    const command = Number(data.command);  // 确保是数字类型
-    const commandId = data.command_id;
-    const requestId = data.request_id;
-    const sourceId = data.source_im_id;
-    const force = data.force === true;  // 是否强制停止
-
-    this.logInfo(`[RongyunMessageHandler] 收到命令: command=${command}, command_id=${commandId}, force=${force}, from=${sourceId || 'guardserver'}`);
-
-    // 验证命令是否有效
-    const validCommands = Object.values(OpenClawCommandEnum);
-    if (!validCommands.includes(command)) {
-      this.logError(`[RongyunMessageHandler] 未知命令: ${command}, 有效命令: ${validCommands.join(', ')}`);
-      await this.sendResponse(RongyunMessageTypeEnum.COMMAND_RESULT, {
-        command,
-        command_id: commandId,
-        status: 'error',
-        message: `未知命令: ${command}`
-      }, requestId, sourceId);
-      return;
-    }
-
-    // 检查命令锁
-    if (this.commandLock) {
-      await this.sendResponse(RongyunMessageTypeEnum.COMMAND_RESULT, {
-        command,
-        command_id: commandId,
-        status: 'busy',
-        message: '正在执行上一个指令，请稍后再试'
-      }, requestId, sourceId);
-      return;
-    }
-
-    this.commandLock = true;
-    // 设置 120 秒超时保护，防止命令永久卡住导致锁无法释放
-    // 启动命令可能需要较长时间（等待服务启动）
-    this.commandLockTimer = setTimeout(() => {
-      this.logWarn('[RongyunMessageHandler] 命令锁超时（120秒），自动释放');
-      this.commandLock = false;
-      this.commandLockTimer = null;
-    }, 120000);
-
-    try {
-      // 先发送响应，再执行命令（避免前端超时）
-      // 启动/停止/重启命令是异步的，前端只需要知道命令已接收
-      const isAsyncCommand = [OpenClawCommandEnum.START, OpenClawCommandEnum.STOP, OpenClawCommandEnum.RESTART].includes(command);
-
-      if (isAsyncCommand) {
-        // 立即响应，告知前端命令已接收
-        const actionName = force ? '强制' + getCommandName(command) : getCommandName(command);
-        await this.sendResponse(RongyunMessageTypeEnum.COMMAND_RESULT, {
-          command,
-          command_id: commandId,
-          status: 'success',
-          message: `${actionName}命令已接收，正在执行...`
-        }, requestId, sourceId);
-      }
-
-      // 执行命令（在后台异步执行，不阻塞响应）
-      // 使用 Promise 避免阻塞，让命令在后台执行
-      executeCommand(command, null, async (response) => {
-        if (!isAsyncCommand) {
-          // 同步命令立即响应
-          await this.sendResponse(RongyunMessageTypeEnum.COMMAND_RESULT, {
-            ...response,
-            command_id: commandId
-          }, requestId, sourceId);
-        }
-        // 异步命令不在这里响应，因为已经提前响应了
-        // 但我们可以在这里记录执行结果
-        this.logInfo(`[RongyunMessageHandler] 命令执行完成: command=${command}, force=${force}, status=${response.status}, message=${response.message}`);
-      }, force).then(() => {
-        // 命令执行完成后，立即释放锁
-        this.commandLock = false;
-        if (this.commandLockTimer) {
-          clearTimeout(this.commandLockTimer);
-          this.commandLockTimer = null;
-        }
-      }).catch(err => {
-        this.logError(`[RongyunMessageHandler] 命令执行失败: ${err.message}`);
-        // 执行失败后也要释放锁
-        this.commandLock = false;
-        if (this.commandLockTimer) {
-          clearTimeout(this.commandLockTimer);
-          this.commandLockTimer = null;
-        }
-      });
-
-      // 异步命令立即返回，不等待执行完成
-      if (isAsyncCommand) {
-        return;
-      }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      this.logError(`命令执行异常: ${msg}`);
-      await this.sendResponse(RongyunMessageTypeEnum.COMMAND_RESULT, {
-        command,
-        command_id: commandId,
-        status: 'error',
-        message: msg
-      }, requestId, sourceId);
-      // 同步命令执行异常时释放锁
-      this.commandLock = false;
-      if (this.commandLockTimer) {
-        clearTimeout(this.commandLockTimer);
-        this.commandLockTimer = null;
-      }
     }
   }
 
@@ -498,116 +371,6 @@ class RongyunMessageHandler {
     }
   }
 
-  async handleDeviceControl(data) {
-    const command = data.command;
-    const requestId = data.request_id;
-    const targetId = data.source_im_id;
-
-    this.logInfo(`[RongyunMessageHandler] 收到设备控制命令: command=${command}, from=${targetId}`);
-
-    const validCommands = ['disable', 'enable', 'delete', 'status', 'rename_device'];
-    if (!validCommands.includes(command)) {
-      await this.sendDeviceControlResult(targetId, requestId, command, 'error', `未知命令: ${command}`);
-      return;
-    }
-
-    try {
-      let result;
-      switch (command) {
-        case 'rename_device': {
-          const newName = data.name || data.nickname;
-          if (!newName) {
-            result = { status: 'error', message: '缺少新名称参数' };
-            break;
-          }
-          
-          // 更新本地配置文件
-          try {
-            const homeDir = os.homedir();
-            const configPaths = [
-              path.join(homeDir, '.claw-bridge', 'config.json'),
-              path.join(__dirname, '..', '..', 'rongcloud-config.json')
-            ];
-            
-            for (const configPath of configPaths) {
-              if (fs.existsSync(configPath)) {
-                const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-                config.nodeName = newName;
-                fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
-                this.logInfo(`[RongyunMessageHandler] 已更新本地配置名称: ${configPath} -> ${newName}`);
-              }
-            }
-            
-            // 更新内存中的配置
-            if (this.config) {
-              this.config.nodeName = newName;
-            }
-            
-            result = { status: 'success', message: `设备名称已更新为: ${newName}` };
-          } catch (err) {
-            this.logError(`[RongyunMessageHandler] 更新本地配置失败: ${err.message}`);
-            result = { status: 'error', message: `更新本地配置失败: ${err.message}` };
-          }
-          break;
-        }
-        case 'disable': {
-          // 先发送响应，再停止服务
-          result = { status: 'success', message: '设备服务已禁用' };
-          await this.sendDeviceControlResult(targetId, requestId, command, result.status, result.message, result.data);
-
-          setTimeout(async () => {
-            const svcMgr = new ServiceManager('claw-subagent-service', 'OpenClaw Guard CLI Client', process.argv[1], this.log);
-            try { await svcMgr.stop(); } catch (e) { }
-            try { await svcMgr.uninstall(); } catch (e) { }
-          }, 2000);
-
-          return;
-        }
-        case 'enable': {
-          const svcMgr = new ServiceManager('claw-subagent-service', 'OpenClaw Guard CLI Client', process.argv[1], this.log);
-          await svcMgr.install();
-          result = { status: 'success', message: '设备服务已启用' };
-          break;
-        }
-        case 'delete': {
-          // 先发送响应，再停止服务（否则服务停止后无法发送响应）
-          result = { status: 'success', message: '设备已删除，本地配置已清除' };
-          await this.sendDeviceControlResult(targetId, requestId, command, result.status, result.message, result.data);
-
-          // 延迟执行实际的删除操作
-          setTimeout(async () => {
-            const svcMgr = new ServiceManager('claw-subagent-service', 'OpenClaw Guard CLI Client', process.argv[1], this.log);
-            try { await svcMgr.stop(); } catch (e) { }
-            try { await svcMgr.uninstall(); } catch (e) { }
-            const homeDir = os.homedir();
-            const configPaths = [
-              path.join(homeDir, '.claw-bridge', 'config.json'),
-              path.join(__dirname, '..', '..', 'rongcloud-config.json')
-            ];
-            for (const p of configPaths) {
-              if (fs.existsSync(p)) {
-                fs.unlinkSync(p);
-              }
-            }
-          }, 2000);
-
-          return; // 已经发送了响应，直接返回
-        }
-        case 'status': {
-          const dashboard = await collectDashboardData();
-          result = { status: 'success', message: '状态查询成功', data: dashboard };
-          break;
-        }
-      }
-
-      await this.sendDeviceControlResult(targetId, requestId, command, result.status, result.message, result.data);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      this.logError(`设备控制命令执行异常: ${msg}`);
-      await this.sendDeviceControlResult(targetId, requestId, command, 'error', msg);
-    }
-  }
-
   async handleDeviceStatusRequest(data) {
     const requestId = data.request_id;
     const targetId = data.source_im_id;
@@ -615,54 +378,19 @@ class RongyunMessageHandler {
     this.logInfo(`[RongyunMessageHandler] 收到设备状态请求, from=${targetId}, requestId=${requestId}`);
 
     try {
-      // 获取 OpenClaw 真实运行状态（检查端口 18789）
-      const openClawStatus = await getOpenClawStatus();
-
-      // 获取真实的版本信息（如果可能）
-      let version = 'unknown';
-      try {
-        const { execSync } = require('child_process');
-        const versionOutput = execSync('openclaw --version', { encoding: 'utf8', timeout: 5000 }).trim();
-        const match = versionOutput.match(/(\d+\.\d+\.\d+)/);
-        if (match) {
-          version = match[1];
-        }
-      } catch (e) {
-        // 忽略版本获取失败
-      }
-
-      // 构建真实状态数据
-      // openClawStatus: 1=端口监听正常(服务可用), 0=未运行(端口未监听)
-      const statusMessage = openClawStatus === 1 ? '运行中' : '未运行';
-
+      // 新架构下仅保留 opencode 对话能力，返回基础在线状态和能力标识
       const statusData = {
-        open_claw_status: openClawStatus,  // 1=运行中, 0=未运行
-        status_message: statusMessage,
+        has_om_capability: 1,  // 支持 opencode 对话式运维
+        status_message: '运行中',
         mac_address: getMacAddress(),
-        version: version,
         timestamp: Date.now(),
       };
 
-      this.logInfo(`[RongyunMessageHandler] 设备真实状态: openClawStatus=${openClawStatus}, version=${version}`);
       await this.sendDeviceStatusReport(targetId, requestId, statusData);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.logError(`设备状态查询异常: ${msg}`);
       await this.sendDeviceStatusReport(targetId, requestId, null, msg);
-    }
-  }
-
-  async sendDeviceControlResult(targetId, requestId, command, status, message, data) {
-    if (!this.messageSender) {
-      this.logError('MessageSender 未设置，无法发送响应');
-      return;
-    }
-    try {
-      await this.messageSender.sendDeviceControlResult(targetId, requestId, command, status, message, data);
-      this.logInfo(`设备控制结果已发送: ${command} -> ${targetId}`);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      this.logError(`发送设备控制结果失败: ${msg}`);
     }
   }
 
