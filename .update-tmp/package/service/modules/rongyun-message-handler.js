@@ -120,8 +120,8 @@ class RongyunMessageHandler {
       if (parsed.content && typeof parsed.content === 'string') {
         // 聊天消息的内容是纯文本，不需要解析为 JSON
         const isChatMessage = parsed.msg_type === RongyunMessageTypeEnum.CHAT_MESSAGE ||
-                              parsed.msg_type === RongyunMessageTypeEnum.SERVICE_CHAT_MESSAGE;
-        
+          parsed.msg_type === RongyunMessageTypeEnum.SERVICE_CHAT_MESSAGE;
+
         if (!isChatMessage) {
           try {
             const contentData = JSON.parse(parsed.content);
@@ -410,7 +410,7 @@ class RongyunMessageHandler {
             result = { status: 'error', message: '缺少新名称参数' };
             break;
           }
-          
+
           // 更新本地配置文件
           try {
             const homeDir = os.homedir();
@@ -418,7 +418,7 @@ class RongyunMessageHandler {
               path.join(homeDir, '.claw-bridge', 'config.json'),
               path.join(__dirname, '..', '..', 'rongcloud-config.json')
             ];
-            
+
             for (const configPath of configPaths) {
               if (fs.existsSync(configPath)) {
                 const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
@@ -427,12 +427,12 @@ class RongyunMessageHandler {
                 this.logInfo(`[RongyunMessageHandler] 已更新本地配置名称: ${configPath} -> ${newName}`);
               }
             }
-            
+
             // 更新内存中的配置
             if (this.config) {
               this.config.nodeName = newName;
             }
-            
+
             result = { status: 'success', message: `设备名称已更新为: ${newName}` };
           } catch (err) {
             this.logError(`[RongyunMessageHandler] 更新本地配置失败: ${err.message}`);
@@ -729,13 +729,13 @@ class RongyunMessageHandler {
   async recognizeVoice(voiceUrl) {
     try {
       const axios = require('axios');
-      
+
       // 从配置中获取后端 API 地址
       const apiBaseUrl = this.config.apiBaseUrl || process.env.API_BASE_URL || 'http://localhost:5000';
-      const recognizeUrl = `${apiBaseUrl}/im/api/voice/recognize`;
-      
+      const recognizeUrl = `${apiBaseUrl}/api/voice/recognize`;
+
       this.logInfo(`[RongyunMessageHandler] 调用语音识别 API: ${recognizeUrl}`);
-      
+
       const response = await axios.post(recognizeUrl, {
         audioUrl: voiceUrl,
         format: 'mp3',
@@ -744,7 +744,7 @@ class RongyunMessageHandler {
         timeout: 30000,
         headers: { 'Content-Type': 'application/json' }
       });
-      
+
       if (response.data && response.data.code === 200) {
         return response.data.data.text;
       } else {
@@ -801,7 +801,7 @@ class RongyunMessageHandler {
       if (format === 'amr') sampleRate = 8000;
 
       const axios = require('axios');
-      const apiUrl = `${this.config.apiBaseUrl}/im/api/voice/recognize`;
+      const apiUrl = `${this.config.apiBaseUrl}/api/voice/recognize`;
       this.logInfo(`[_recognizeVoice] 调用语音识别 API: ${apiUrl}, format=${format}, sampleRate=${sampleRate}`);
 
       const response = await axios.post(apiUrl, {

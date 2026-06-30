@@ -11,7 +11,7 @@
     "preuninstall": "node scripts/pre-uninstall.js",
     "install-service": "node scripts/install-silent.js",
     "uninstall-service": "node scripts/uninstall.js",
-    "dev": "nodemon cli.js --run",
+    "dev": "node cli.js --run",
     "publish:patch": "npm version patch && npm publish",
     "publish:minor": "npm version minor && npm publish",
     "publish:major": "npm version major && npm publish",

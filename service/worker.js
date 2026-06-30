@@ -13,6 +13,10 @@ const { SystemConfigManager } = require('./modules/system-config');
 const { HeartbeatManager } = require('./modules/heartbeat-dashboard');
 const { getMacAddress } = require('./modules/mac-address');
 const { startOpencodeService, stopOpencodeService } = require('./modules/opencode-starter');
+const { DeviceRegistration } = require('./modules/device-registration');
+const { getServerUrl, getAppKey, getApiBaseUrl } = require('./config');
+const { SkillLoader } = require('./skills/skill-loader');
+const { SkillRouter } = require('./skills/skill-router');
 
 const log = createLogger('worker');
 const PORT = process.env.SILENT_SERVICE_PORT ? parseInt(process.env.SILENT_SERVICE_PORT, 10) : 28765;
@@ -35,7 +39,7 @@ process.stderr.write = (chunk, encoding, callback) => {
 
 /**
  * 查找占用指定端口的进程 PID
- * Windows 下检查本地地址（第二列）是否匹配目标端口，不限于 LISTENING 状态
+ * Windows 下只处理 LISTENING 状态的本地绑定，忽略 TIME_WAIT / CLOSE_WAIT
  */
 function findPidOnPort(port) {
   try {
@@ -45,12 +49,16 @@ function findPidOnPort(port) {
       });
       for (const line of out.split('\n')) {
         const parts = line.trim().split(/\s+/);
+        if (parts.length < 5) continue;
         // netstat -ano 格式: Proto LocalAddress ForeignAddress State PID
-        // 检查本地地址是否以目标端口结尾（避免匹配到 ForeignAddress）
         const localAddr = parts[1] || '';
+        const state = (parts[3] || '').toUpperCase();
+        // 忽略 TIME_WAIT / CLOSE_WAIT 等无活跃进程状态
+        if (state === 'TIME_WAIT' || state === 'CLOSE_WAIT') continue;
+        // 检查本地地址是否以目标端口结尾（避免匹配到 ForeignAddress）
         if (localAddr.endsWith(`:${port}`) || localAddr.endsWith(`]:${port}`)) {
           const pid = parseInt(parts[parts.length - 1], 10);
-          if (!isNaN(pid)) return pid;
+          if (!isNaN(pid) && pid > 0 && pid !== process.pid) return pid;
         }
       }
     } else {
@@ -74,6 +82,18 @@ function findPidOnPort(port) {
 }
 
 /**
+ * 判断终止进程错误是否因为目标已不存在
+ */
+function isProcessAlreadyGoneError(err) {
+  if (!err || !err.message) return false;
+  const msg = err.message;
+  return msg.includes('没有找到进程') ||
+         msg.includes('not found') ||
+         msg.includes('ERROR:') ||
+         /process.*not found/i.test(msg);
+}
+
+/**
  * 强制终止进程
  */
 function forceKill(pid) {
@@ -84,7 +104,11 @@ function forceKill(pid) {
       process.kill(pid, 'SIGKILL');
     }
     return true;
-  } catch { return false; }
+  } catch (e) {
+    // 进程已退出视为成功
+    if (isProcessAlreadyGoneError(e)) return true;
+    return false;
+  }
 }
 
 /**
@@ -105,7 +129,10 @@ function ensurePortFree(port) {
       return true;
     }
     log.warn(`[WORKER] 端口 ${port} 被进程 ${pid} 占用，正在释放...`);
-    forceKill(pid);
+    const killed = forceKill(pid);
+    if (!killed) {
+      log.warn(`[WORKER] 终止进程 ${pid} 失败，继续重试...`);
+    }
     // 同步等待端口释放（最多 1.5s）
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500);
   }
@@ -176,16 +203,21 @@ function getRealHomeDir() {
 const homeDir = getRealHomeDir();
 const clawBridgeConfigPath = path.join(homeDir, '.claw-bridge', 'config.json');
 
-function loadRongCloudConfig() {
+async function loadRongCloudConfigWithAutoRegister() {
   let config = {};
+  let autoRegistered = false;
 
+  // 1. 加载 silent-subagent 自己的手动配置（~/.claw-bridge/config.json）
   try {
     if (fs.existsSync(clawBridgeConfigPath)) {
       const clawConfig = JSON.parse(fs.readFileSync(clawBridgeConfigPath, 'utf8'));
       config.token = clawConfig.token;
       config.accountId = clawConfig.nodeId;
       config.nodeName = clawConfig.nodeName;
+      config.omRongcloudId = clawConfig.omRongcloudId;
+      config.omToken = clawConfig.omToken;
       if (clawConfig.apiBaseUrl) config.apiBaseUrl = clawConfig.apiBaseUrl;
+      if (clawConfig.appKey) config.appKey = clawConfig.appKey;
       log.info(`[WORKER] 从 claw-bridge 加载配置: nodeId=${clawConfig.nodeId}, nodeName=${clawConfig.nodeName}`);
     } else {
       log.warn(`[WORKER] 未找到 ${clawBridgeConfigPath}`);
@@ -194,13 +226,54 @@ function loadRongCloudConfig() {
     log.error(`[WORKER] 加载 claw-bridge 配置失败: ${err.message}`);
   }
 
+  // 2. 检查 openclaw-clawmessenger 的节点 ID 是否与当前配置一致
+  //    若 openclaw 已重新注册（nodeId 变化），必须重新获取对应运维账户
+  const deviceReg = new DeviceRegistration(log);
+  const openclawConfig = deviceReg.loadOpenclawConfig();
+  const openclawNodeId = openclawConfig?.nodeId;
+  const currentNodeId = config.accountId;
+  const needReRegister = openclawNodeId && currentNodeId && openclawNodeId !== currentNodeId;
+
+  if (needReRegister) {
+    log.warn(`[WORKER] openclaw 节点 ID 变化: ${currentNodeId} -> ${openclawNodeId}，将重新获取运维账户`);
+  }
+
+  // 3. 检查手动配置是否有效且包含运维账户，不满足时按需自动注册
+  const manualNotExpired = !config.expiresAt || Date.now() <= config.expiresAt;
+  const hasBasicConfig = config.token && config.accountId && manualNotExpired;
+  const hasOmAccount = config.omRongcloudId && config.omToken;
+
+  if (!hasBasicConfig || !hasOmAccount || needReRegister) {
+    if (!hasBasicConfig) {
+      log.info('[WORKER] 手动配置缺失或已过期，尝试从 openclaw 配置获取节点并自动补齐运维账户...');
+    } else if (needReRegister) {
+      log.info('[WORKER] openclaw 节点 ID 已变化，重新获取运维账户...');
+    } else {
+      log.info('[WORKER] 手动配置缺少运维账户，尝试自动补齐...');
+    }
+
+    const registered = await deviceReg.autoRegister();
+    if (registered) {
+      config.token = registered.token;
+      config.accountId = registered.nodeId;
+      config.omRongcloudId = registered.omRongcloudId;
+      config.omToken = registered.omToken;
+      config.appKey = registered.appKey;
+      config.nodeName = registered.nodeName || config.nodeName;
+      autoRegistered = true;
+      log.info(`[WORKER] 自动注册完成，nodeId=${registered.nodeId}, omRongcloudId=${registered.omRongcloudId}`);
+    } else {
+      log.error('[WORKER] 自动注册失败，将尝试使用已有配置');
+    }
+  }
+
+  // 4. 加载本地 rongcloud-config.json（补充或覆盖，但不覆盖自动注册结果）
   try {
     if (fs.existsSync(localConfigPath)) {
       const localConfig = JSON.parse(fs.readFileSync(localConfigPath, 'utf8'));
       config.appKey = localConfig.appKey || config.appKey;
-      if (localConfig.token) config.token = localConfig.token;
-      if (localConfig.accountId) config.accountId = localConfig.accountId;
-      // appSecret 不再从本地配置加载，统一从服务端获取
+      if (localConfig.token && !autoRegistered) config.token = localConfig.token;
+      if (localConfig.accountId && !autoRegistered) config.accountId = localConfig.accountId;
       if (localConfig.apiBaseUrl) config.apiBaseUrl = localConfig.apiBaseUrl;
       log.info(`[WORKER] 从本地配置加载: appKey=${config.appKey?.substring(0, 8)}...`);
     }
@@ -208,31 +281,31 @@ function loadRongCloudConfig() {
     log.error(`[WORKER] 加载本地配置失败: ${err.message}`);
   }
 
-  // 加载 apiBaseUrl（Python 后端地址，用于代理发送流式消息）
-  // 优先级：环境变量 > 配置文件 > 推导值(DM_SERVER_URL) > 默认值
+  // 5. 环境变量最高优先级
   config.apiBaseUrl = process.env.API_BASE_URL || config.apiBaseUrl;
 
   if (!config.apiBaseUrl) {
-    const serverUrl = process.env.DM_SERVER_URL || 'https://newsradar.dreamdt.cn/im';
-    try {
-      const url = new URL(serverUrl);
-      config.apiBaseUrl = `${url.protocol}//${url.host}`;
-      log.info(`[WORKER] 从 serverUrl 推导 apiBaseUrl: ${config.apiBaseUrl}`);
-    } catch {
-      config.apiBaseUrl = 'http://127.0.0.1:5000';
-    }
+    config.apiBaseUrl = getApiBaseUrl();
+    log.info(`[WORKER] 从统一配置加载 apiBaseUrl: ${config.apiBaseUrl}`);
   }
 
   if (!config.appKey) {
-    config.appKey = process.env.DM_APP_KEY || 'bmdehs6pbyyks';
+    config.appKey = getAppKey();
+  }
+
+  // 6. 使用运维账户连接融云（如果可用）
+  if (config.omToken && config.omRongcloudId) {
+    config.originalAccountId = config.accountId;
+    config.originalToken = config.token;
+    config.accountId = config.omRongcloudId;
+    config.token = config.omToken;
+    log.info(`[WORKER] 使用运维账户连接融云: ${config.omRongcloudId}`);
   }
 
   // 设置默认心跳间隔为20秒
   if (!config.heartbeatInterval) {
     config.heartbeatInterval = 20;
   }
-
-  // log.info(`[WORKER] 最终 apiBaseUrl: ${config.apiBaseUrl}`);
 
   if (config.token && config.accountId) {
     return config;
@@ -242,64 +315,51 @@ function loadRongCloudConfig() {
   return null;
 }
 
-rongcloudConfig = loadRongCloudConfig();
-
-let rongcloudClient = null;
-let messageHandler = null;
-
 /**
  * 向服务端刷新融云 token
  */
 async function refreshRongCloudToken() {
-  const nodeId = rongcloudConfig?.accountId;
-  if (!nodeId) {
-    log.error('[WORKER] 无法刷新 token: 缺少 nodeId');
-    return false;
-  }
+  const deviceReg = new DeviceRegistration(log);
 
-  const serverUrl = process.env.DM_SERVER_URL || 'https://newsradar.dreamdt.cn/im';
-  try {
-    log.info(`[WORKER] 正在向服务端刷新 token, nodeId=${nodeId}`);
-    const resp = await axios.get(`${serverUrl}/api/claw/token/${nodeId}`, { timeout: 15000 });
-    if (resp.data?.code === 200) {
-      const newToken = resp.data.data?.token || resp.data.token || '';
-      const newAppKey = resp.data.data?.app_key || resp.data.app_key || '';
-      if (!newToken) {
-        log.error('[WORKER] 服务端返回了空 token');
-        return false;
-      }
-      log.info('[WORKER] token 刷新成功');
+  // 优先刷新运维 token
+  if (rongcloudConfig?.omRongcloudId) {
+    let nodeId = rongcloudConfig.originalAccountId || rongcloudConfig.accountId;
+    // 兼容旧配置：如果 accountId 本身就是 om_xxx 且没有 originalAccountId
+    if (!nodeId || nodeId.startsWith('om_')) {
+      nodeId = rongcloudConfig.omRongcloudId.replace(/^om_/, '');
+    }
+    log.info(`[WORKER] 正在刷新运维 token, nodeId=${nodeId}`);
+    const omResult = await deviceReg._getOmToken(nodeId);
+    if (omResult?.token) {
+      rongcloudConfig.omToken = omResult.token;
+      rongcloudConfig.token = omResult.token;
 
-      // 更新内存配置
-      rongcloudConfig.token = newToken;
-      if (newAppKey) {
-        rongcloudConfig.appKey = newAppKey;
-        log.info(`[WORKER] appKey 已更新: ${newAppKey}`);
-      }
+      // 持久化
+      const savedConfig = deviceReg.loadConfig() || {};
+      savedConfig.omToken = omResult.token;
+      savedConfig.expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
+      await deviceReg._saveConfig(savedConfig);
 
-      // 保存到 config.json
-      try {
-        if (fs.existsSync(clawBridgeConfigPath)) {
-          const clawConfig = JSON.parse(fs.readFileSync(clawBridgeConfigPath, 'utf8'));
-          clawConfig.token = newToken;
-          if (newAppKey) {
-            clawConfig.appKey = newAppKey;
-          }
-          clawConfig.expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7天
-          fs.writeFileSync(clawBridgeConfigPath, JSON.stringify(clawConfig, null, 2));
-          log.info('[WORKER] 新 token 已保存到 config.json');
-        }
-      } catch (err) {
-        log.error(`[WORKER] 保存新 token 失败: ${err.message}`);
-      }
+      log.info('[WORKER] 运维 token 刷新成功');
       return true;
     }
-    log.error(`[WORKER] 刷新 token 失败: ${resp.data?.message || '未知错误'}`);
-    return false;
-  } catch (err) {
-    log.error(`[WORKER] 刷新 token 异常: ${err.message}`);
-    return false;
   }
+
+  // 兜底：刷新节点 token
+  const refreshed = await deviceReg.refreshToken();
+  if (refreshed) {
+    const savedConfig = deviceReg.loadConfig();
+    if (savedConfig?.token) {
+      rongcloudConfig.token = savedConfig.token;
+      if (rongcloudConfig.omRongcloudId) {
+        // 如果当前使用运维账户，但节点 token 刷新成功，也更新 originalToken
+        rongcloudConfig.originalToken = savedConfig.token;
+      }
+    }
+    return true;
+  }
+
+  return false;
 }
 
 /**
@@ -316,8 +376,55 @@ async function syncCustomerServiceAccountId() {
   return false;
 }
 
+/**
+ * 构建 Skill 框架需要的 messageContext
+ */
+function buildMessageContext(rawMsg, parsed, innerContent, config) {
+  const msgType = parsed.msg_type;
+  const senderUserId = parsed.source_im_id || rawMsg.senderUserId;
+  const targetId = rawMsg.targetId;
+  const conversationType = rawMsg.conversationType;
+
+  // content 优先使用 innerContent.content（聊天消息的真实文本），否则使用 innerContent 本身或原始 content
+  let content = '';
+  if (innerContent && typeof innerContent === 'object') {
+    content = innerContent.content || innerContent.message || '';
+  } else if (typeof innerContent === 'string') {
+    content = innerContent;
+  }
+  if (!content && typeof parsed.content === 'string') {
+    content = parsed.content;
+  }
+
+  return {
+    msgType,
+    content,
+    senderUserId,
+    targetId,
+    conversationType,
+    data: {
+      ...parsed,
+      ...innerContent,
+      content,
+      source_im_id: senderUserId,
+      targetId,
+      conversationType,
+    },
+    rawMsg,
+    config,
+  };
+}
+
 async function initRongCloud() {
-  if (!rongcloudConfig) return;
+  // 按需自动注册设备并获取运维账户
+  if (!rongcloudConfig) {
+    rongcloudConfig = await loadRongCloudConfigWithAutoRegister();
+  }
+
+  if (!rongcloudConfig) {
+    log.error('[WORKER] 无法获取有效融云配置，融云功能未启用');
+    return;
+  }
 
   log.info(`[WORKER] Worker 启动，目录: ${__dirname}`);
 
@@ -356,6 +463,28 @@ async function initRongCloud() {
   rongyunMessageHandler.setMessageSender(messageSender);
   rongyunMessageHandler.setServerAPI(serverAPI); // 注入 serverAPI
 
+  // 初始化 Skill 框架
+  let skillLoader = null;
+  let skillRouter = null;
+  let fallbackSkill = null;
+  const enableSkillFramework = process.env.ENABLE_SKILL_FRAMEWORK !== 'false';
+  try {
+    skillLoader = new SkillLoader(path.join(__dirname, 'skills'), log);
+    const skills = await skillLoader.loadAll(rongcloudConfig, messageSender);
+    skillRouter = new SkillRouter(skills, log);
+    fallbackSkill = skills.find((s) => s.name === 'ops-assistant');
+    if (fallbackSkill) {
+      skillRouter.setFallbackSkill(fallbackSkill);
+    }
+    if (enableSkillFramework) {
+      log.info(`[WORKER] Skill framework enabled, loaded ${skills.length} skill(s)`);
+    } else {
+      log.info(`[WORKER] Skill framework loaded but disabled (set ENABLE_SKILL_FRAMEWORK=true to enable), loaded ${skills.length} skill(s)`);
+    }
+  } catch (err) {
+    log.error(`[WORKER] Failed to initialize skill framework: ${err.message}`);
+  }
+
   messageHandler = new MessageHandler(
     rongcloudConfig,
     async (targetId, content, conversationType) => {
@@ -369,6 +498,15 @@ async function initRongCloud() {
 
   // 包装 MessageHandler.handleMessage 以处理结构化消息
   const originalHandleMessage = messageHandler.handleMessage.bind(messageHandler);
+
+  // 辅助：给需要 SkillRouter 处理的消息发送已读回执（fire-and-forget）
+  const sendReadReceiptForMessage = (msg) => {
+    if (rongcloudClient && rongcloudClient.isConnected && msg.messageUId) {
+      rongcloudClient.sendReadReceipt(msg).catch((err) => {
+        log.warn(`[WORKER] 发送已读回执失败: ${err.message}`);
+      });
+    }
+  };
 
   messageHandler.handleMessage = async (msg) => {
     // 检查是否是结构化消息（支持字符串和对象两种格式）
@@ -434,13 +572,78 @@ async function initRongCloud() {
           conversationType: msg.conversationType,
         };
 
-        // 使用 RongyunMessageHandler 处理
+        // 协议消息（非聊天类）始终由旧的 RongyunMessageHandler 处理，不进入 Skill 框架
+        // 避免 device_status_request 等消息被路由到 ops-assistant 触发 AI 卡片
+        const protocolMessageTypes = [
+          'device_status_request',
+          'device_status_report',
+          'heartbeat',
+          'heartbeat_ack',
+          'client_connected',
+          'client_disconnected',
+          'create_opencode_session',
+          'opencode_session_created',
+          'delete_opencode_session',
+          'create_service_session',
+          'service_session_created',
+          'service_chat_message',
+          'service_chat_response',
+          'command',
+          'command_result',
+        ];
+        const isProtocolMessage = protocolMessageTypes.includes(parsed.msg_type);
+
+        // 根据 ENABLE_SKILL_FRAMEWORK 决定使用 Skill 框架还是旧的消息处理器
+        if (enableSkillFramework && skillRouter && !isProtocolMessage && !msg.isOffLineMessage) {
+          // SkillRouter 分支也需要发送已读回执
+          sendReadReceiptForMessage(msg);
+          try {
+            const messageContext = buildMessageContext(msg, parsed, innerContent, rongcloudConfig);
+            await skillRouter.route(messageContext);
+          } catch (err) {
+            log.error(`[WORKER] SkillRouter 处理异常: ${err.message}`);
+          }
+          return;
+        }
+
+        // 使用 RongyunMessageHandler 处理（旧逻辑）
         try {
           await rongyunMessageHandler.handle(messageData);
         } catch (err) {
           log.error(`[WORKER] RongyunMessageHandler 处理异常: ${err.message}`);
         }
         return;
+      }
+    }
+
+    // 新增：普通单聊消息也交给 SkillRouter，由 ops-assistant 作为 fallback 处理
+    // 解决用户直接给运维助手发普通文本消息（RC:TxtMsg）被 MessageHandler 忽略的问题
+    if (enableSkillFramework && skillRouter && msg.conversationType === 1 && !msg.isOffLineMessage) {
+      // 普通单聊消息进入 SkillRouter 前也需要发送已读回执
+      // 注意：离线消息（isOffLineMessage）会被跳过，避免重启后积压的历史消息被重复处理
+      sendReadReceiptForMessage(msg);
+      try {
+        const textContent = typeof msg.content === 'string' ? msg.content : (msg.content?.content || '');
+        const messageContext = {
+          msgType: msg.messageType,
+          content: textContent,
+          senderUserId: msg.senderUserId,
+          targetId: msg.targetId,
+          conversationType: msg.conversationType,
+          data: {
+            content: textContent,
+            source_im_id: msg.senderUserId,
+            targetId: msg.targetId,
+            conversationType: msg.conversationType,
+          },
+          rawMsg: msg,
+          config: rongcloudConfig,
+        };
+        log.info(`[WORKER] 普通单聊消息进入 SkillRouter: from=${msg.senderUserId}, content=${String(messageContext.content).substring(0, 50)}`);
+        await skillRouter.route(messageContext);
+        return;
+      } catch (err) {
+        log.error(`[WORKER] SkillRouter 处理普通单聊消息异常: ${err.message}`);
       }
     }
 
@@ -456,7 +659,18 @@ async function initRongCloud() {
   // 连接失败时尝试刷新 token 并重试一次
   if (!connected) {
     log.warn('[WORKER] 首次融云连接失败，尝试刷新 token...');
-    const refreshed = await refreshRongCloudToken();
+    let refreshed = await refreshRongCloudToken();
+
+    if (!refreshed) {
+      log.warn('[WORKER] 刷新 token 失败，尝试重新自动注册...');
+      const deviceReg = new DeviceRegistration(log);
+      const registered = await deviceReg.autoRegister();
+      if (registered) {
+        rongcloudConfig = await loadRongCloudConfigWithAutoRegister();
+        refreshed = true;
+      }
+    }
+
     if (refreshed) {
       // 使用新 token 重新创建客户端并连接
       rongcloudClient = new RongCloudClient(rongcloudConfig, log);
@@ -552,9 +766,17 @@ if (!ensurePortFree(PORT)) {
 }
 
 // 错误处理器必须先注册，再调用 listen，避免 EADDRINUSE 成为未捕获异常
+let listenRetryCount = 0;
+const MAX_LISTEN_RETRIES = 3;
+
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
-    log.error(`[WORKER] 端口 ${PORT} 被占用，尝试释放并重启监听...`);
+    listenRetryCount++;
+    if (listenRetryCount > MAX_LISTEN_RETRIES) {
+      log.error(`[WORKER] 端口 ${PORT} 被占用，重试 ${MAX_LISTEN_RETRIES} 次后放弃，进程退出`);
+      process.exit(1);
+    }
+    log.error(`[WORKER] 端口 ${PORT} 被占用，尝试释放并重启监听... (第 ${listenRetryCount} 次)`);
     // 尝试杀死占用进程后重试
     const pid = findPidOnPort(PORT);
     if (pid && pid !== process.pid) {

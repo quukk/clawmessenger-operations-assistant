@@ -9,13 +9,15 @@ const log = createLogger('daemon');
 const WORKER_PATH = path.join(__dirname, 'worker.js');
 const PORT = process.env.SILENT_SERVICE_PORT ? parseInt(process.env.SILENT_SERVICE_PORT, 10) : 28765;
 // 使用全局 PID 文件，防止不同安装路径的多个实例同时运行
-const PID_FILE = (() => {
+const PID_FILE_PRIMARY = (() => {
   if (process.platform === 'win32') {
     const programData = process.env.PROGRAMDATA || process.env.ALLUSERSPROFILE || 'C:\\ProgramData';
     return path.join(programData, 'claw-subagent-service', 'daemon.pid');
   }
   return path.join(os.tmpdir(), '.claw-subagent-service.pid');
 })();
+const PID_FILE_FALLBACK = path.join(os.tmpdir(), '.claw-subagent-service.pid');
+let PID_FILE = PID_FILE_PRIMARY;
 
 let worker = null;
 let currentWorkerPid = null;
@@ -55,46 +57,101 @@ function detectUpdateRestart() {
 process.chdir(__dirname);
 
 /**
- * 检查是否有其他 Daemon 实例在运行
+ * 检查 PID 对应的进程是否为本 Daemon 进程
+ * Windows 下通过 tasklist 校验映像名与命令行，避免把被复用的无关 PID 误判为活跃 Daemon
  */
-function checkSingleton() {
+function isDaemonProcess(pid) {
+  if (process.platform !== 'win32') return true; // Unix 下仅依赖 process.kill(0)
   try {
-    if (fs.existsSync(PID_FILE)) {
-      const pid = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10);
+    const out = execSync(`tasklist /FI "PID eq ${pid}" /FO CSV /NH`, {
+      encoding: 'utf8', timeout: 5000, windowsHide: true,
+    }).trim();
+    if (!out) return false;
+    const cols = out.split(',').map(s => s.replace(/^"|"$/g, ''));
+    const imageName = cols[0] || '';
+    if (imageName.toLowerCase() !== 'node.exe') return false;
+    // 映像是 node，再确认命令行包含 daemon.js（避免误判其他 node 进程）
+    // tasklist /FO CSV 命令行中逗号会被转义，简单包含判断即可
+    return out.toLowerCase().includes('daemon.js');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 读取 PID 文件并判断是否存在活跃 Daemon
+ * @returns {boolean|null} false=存在活跃实例应退出；true=可继续；null=未得出结论
+ */
+function readAndCheckPidFile(pidFile) {
+  try {
+    if (fs.existsSync(pidFile)) {
+      const pid = parseInt(fs.readFileSync(pidFile, 'utf8').trim(), 10);
       if (!isNaN(pid)) {
         try {
-          // 发送信号 0 检查进程是否存在（Windows 也支持）
           process.kill(pid, 0);
-          log.error(`[DAEMON] 另一个 Daemon 实例已在运行 (PID: ${pid})，当前实例退出`);
-          return false;
-        } catch (err) {
-          if (err.code === 'EPERM') {
-            // 进程存在但无权限发送信号，视为仍在运行
-            log.error(`[DAEMON] 另一个 Daemon 实例已在运行 (PID: ${pid}, 权限不足)，当前实例退出`);
+          if (isDaemonProcess(pid)) {
+            log.error(`[DAEMON] 另一个 Daemon 实例已在运行 (PID: ${pid})，当前实例退出`);
             return false;
           }
-          // 进程不存在（ESRCH），清理 stale PID 文件
-          log.info(`[DAEMON] 发现 stale PID 文件 (PID: ${pid} 已不存在)，清理中...`);
-          try { fs.unlinkSync(PID_FILE); } catch { /* 忽略 */ }
+          // PID 存活但不是 Daemon，按 stale 处理
+          log.info(`[DAEMON] 发现 stale PID 文件 (PID: ${pid} 不是 Daemon)，清理中...`);
+        } catch (err) {
+          if (err.code === 'EPERM') {
+            // 进程存在但无权限发信号，二次确认
+            if (isDaemonProcess(pid)) {
+              log.error(`[DAEMON] 另一个 Daemon 实例已在运行 (PID: ${pid}, 权限不足)，当前实例退出`);
+              return false;
+            }
+            log.info(`[DAEMON] 发现 stale PID 文件 (PID: ${pid} 非 Daemon 且权限不足)，清理中...`);
+          } else {
+            log.info(`[DAEMON] 发现 stale PID 文件 (PID: ${pid} 已不存在)，清理中...`);
+          }
         }
-      } else {
-        // PID 文件内容无效，清理
-        try { fs.unlinkSync(PID_FILE); } catch { /* 忽略 */ }
       }
+      try { fs.unlinkSync(pidFile); } catch { /* 忽略 */ }
     }
-  } catch {
-    // PID 文件读取失败，继续启动
-  }
+  } catch { /* PID 文件读取失败，继续尝试 */ }
+  return null;
+}
 
+/**
+ * 写入 PID 文件
+ * @returns {boolean} 是否成功
+ */
+function writePidFile(pidFile) {
   try {
-    const pidDir = path.dirname(PID_FILE);
+    const pidDir = path.dirname(pidFile);
     if (!fs.existsSync(pidDir)) {
       fs.mkdirSync(pidDir, { recursive: true });
     }
-    fs.writeFileSync(PID_FILE, String(process.pid));
+    fs.writeFileSync(pidFile, String(process.pid));
+    PID_FILE = pidFile;
+    return true;
   } catch (err) {
     log.warn(`[DAEMON] 写入 PID 文件失败: ${err.message}`);
+    return false;
   }
+}
+
+/**
+ * 检查是否有其他 Daemon 实例在运行
+ */
+function checkSingleton() {
+  // 1. 尝试主 PID 文件路径
+  let result = readAndCheckPidFile(PID_FILE_PRIMARY);
+  if (result === false) return false;
+  if (writePidFile(PID_FILE_PRIMARY)) return true;
+
+  // 2. 主路径不可写，回退到 temp
+  result = readAndCheckPidFile(PID_FILE_FALLBACK);
+  if (result === false) return false;
+  if (writePidFile(PID_FILE_FALLBACK)) {
+    log.info(`[DAEMON] 使用 fallback PID 文件: ${PID_FILE_FALLBACK}`);
+    return true;
+  }
+
+  // 3. 所有 PID 文件都不可写，记录警告后继续启动
+  log.warn('[DAEMON] PID 文件完全不可写，单例保护已降级，继续启动');
   return true;
 }
 
@@ -123,8 +180,20 @@ process.on('SIGINT', cleanupPidFile);
 process.on('SIGTERM', cleanupPidFile);
 
 /**
+ * 判断 taskkill 错误是否因为目标进程已不存在
+ */
+function isProcessAlreadyGoneError(err) {
+  if (!err || !err.message) return false;
+  const msg = err.message;
+  return msg.includes('没有找到进程') ||
+         msg.includes('not found') ||
+         msg.includes('ERROR:') ||
+         /process.*not found/i.test(msg);
+}
+
+/**
  * 尝试释放占用的端口（杀死占用进程）
- * Windows 下检查本地地址（第二列）是否匹配目标端口，不限于 LISTENING 状态
+ * Windows 下只处理 LISTENING 状态的本地绑定，忽略 TIME_WAIT / CLOSE_WAIT
  */
 function freePortIfNeeded(port) {
   try {
@@ -134,14 +203,22 @@ function freePortIfNeeded(port) {
       });
       for (const line of out.split('\n')) {
         const parts = line.trim().split(/\s+/);
+        if (parts.length < 5) continue;
         const localAddr = parts[1] || '';
-        if (localAddr.endsWith(`:${port}`) || localAddr.endsWith(`]:${port}`)) {
-          const pid = parseInt(parts[parts.length - 1], 10);
-          if (pid && pid > 0 && pid !== currentWorkerPid && pid !== process.pid) {
-            log.warn(`[DAEMON] 端口 ${port} 被进程 ${pid} 占用，正在释放...`);
-            try {
-              execSync(`taskkill /F /PID ${pid}`, { timeout: 5000, windowsHide: true });
-            } catch (e) {
+        const state = (parts[3] || '').toUpperCase();
+        // 只处理真实监听的连接，忽略 TIME_WAIT / CLOSE_WAIT 等无活跃进程状态
+        if (!localAddr.endsWith(`:${port}`) && !localAddr.endsWith(`]:${port}`)) continue;
+        if (state !== 'LISTENING') continue;
+        const pid = parseInt(parts[parts.length - 1], 10);
+        if (pid && pid > 0 && pid !== currentWorkerPid && pid !== process.pid) {
+          log.warn(`[DAEMON] 端口 ${port} 被进程 ${pid} 占用（状态: ${state}），正在释放...`);
+          try {
+            execSync(`taskkill /F /PID ${pid}`, { timeout: 5000, windowsHide: true });
+            log.info(`[DAEMON] 终止进程 ${pid} 成功`);
+          } catch (e) {
+            if (isProcessAlreadyGoneError(e)) {
+              log.info(`[DAEMON] 进程 ${pid} 已不存在，无需终止`);
+            } else {
               log.warn(`[DAEMON] 终止进程 ${pid} 失败: ${e.message}`);
             }
           }
@@ -221,6 +298,11 @@ function startWorker(isAfterUpdate = false, backupDirForRollback = null) {
 
   // 启动前释放旧端口，防止旧 worker 残留占用
   freePortIfNeeded(PORT);
+
+  // Windows 下端口释放后需要短暂等待句柄清理，避免新 Worker 立即监听触发 EADDRINUSE
+  if (process.platform === 'win32') {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+  }
 
   const forkOptions = {
     stdio: ['pipe', 'pipe', 'pipe', 'ipc'],

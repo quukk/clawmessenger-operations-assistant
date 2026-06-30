@@ -1,3 +1,7 @@
+/**
+ * @deprecated 该模块使用旧的 OpenCode Gateway HTTP 调用模式，已被 Skill 框架中的
+ * service/opencode/opencode-runner.js 取代。保留此文件仅用于紧急回滚。
+ */
 const axios = require('axios');
 
 const GATEWAY_URL = 'http://127.0.0.1:4096';

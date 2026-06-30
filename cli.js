@@ -35,7 +35,48 @@ if (command === '--version' || command === '-v') {
   process.exit(0);
 }
 
+function isPortInUse(port) {
+  try {
+    if (process.platform === 'win32') {
+      const out = execSync(`netstat -ano | findstr ":${port}"`, {
+        encoding: 'utf8', timeout: 5000, windowsHide: true,
+      });
+      for (const line of out.split('\n')) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length < 5) continue;
+        const localAddr = parts[1] || '';
+        const state = (parts[3] || '').toUpperCase();
+        // 只处理真实监听的连接，忽略 TIME_WAIT / CLOSE_WAIT 等无活跃进程状态
+        if (!localAddr.endsWith(`:${port}`) && !localAddr.endsWith(`]:${port}`)) continue;
+        if (state !== 'LISTENING') continue;
+        const pid = parseInt(parts[parts.length - 1], 10);
+        if (pid && pid > 0 && pid !== process.pid) {
+          return pid;
+        }
+      }
+    } else {
+      try {
+        const out = execSync(`lsof -i :${port} -t 2>/dev/null || ss -tlnp 2>/dev/null | grep ":${port}" | sed -n 's/.*pid=\\([0-9]*\\).*/\\1/p'`, {
+          encoding: 'utf8', timeout: 5000,
+        }).trim();
+        const pid = parseInt(out.split('\n')[0], 10);
+        if (pid && pid > 0 && pid !== process.pid) return pid;
+      } catch {}
+    }
+  } catch {}
+  return null;
+}
+
 function runDaemon() {
+  // 前置检查：如果 28765 已被占用，说明已有 Daemon/Worker 在运行，避免多实例竞争
+  const PORT = process.env.SILENT_SERVICE_PORT ? parseInt(process.env.SILENT_SERVICE_PORT, 10) : 28765;
+  const existingPid = isPortInUse(PORT);
+  if (existingPid) {
+    console.log(`[CLI] 端口 ${PORT} 已被进程 ${existingPid} 占用，推测 Daemon 已在运行，跳过启动`);
+    console.log(`[CLI] 如需重启，请先停止现有实例：taskkill /F /PID ${existingPid}`);
+    process.exit(0);
+  }
+
   console.log('[CLI] 启动 Daemon...');
   console.log(`[CLI] CLI 路径: ${__filename}`);
   console.log(`[CLI] Daemon 路径: ${DAEMON_PATH}`);

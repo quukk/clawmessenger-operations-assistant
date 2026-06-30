@@ -83,7 +83,7 @@ async function recognizeVoice(msg) {
     let sampleRate = content?.sampleRate || msg.sampleRate || 16000;
     if (format === 'amr') sampleRate = 8000;
 
-    const apiUrl = `${config.apiBaseUrl}/im/api/voice/recognize`;
+    const apiUrl = `${config.apiBaseUrl}/api/voice/recognize`;
     console.log(`[recognizeVoice] 调用语音识别 API: ${apiUrl}, format=${format}, sampleRate=${sampleRate}`);
 
     const response = await axios.post(apiUrl, {

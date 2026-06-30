@@ -156,20 +156,26 @@ class RongCloudServerAPI {
 
   /**
    * 获取融云配置
+   * 使用服务端专用接口：
+   * - /api/config/rongcloud 获取 appKey（公开）
+   * - /api/config/rongcloud/secret 获取 appSecret（需节点认证）
    */
   async _getRongCloudConfig() {
-    const configs = await this.configManager.getConfigs([
-      'rongcloud_app_key',
-      'rongcloud_app_secret'
-    ]);
-    
-    if (!configs.rongcloud_app_key || !configs.rongcloud_app_secret) {
+    const config = this.configManager?.config || {};
+    // 优先使用节点原 token/id（运维账户场景下 originalToken/originalAccountId 才是节点真实身份）
+    const nodeToken = config.originalToken || config.token;
+    const nodeId = config.originalAccountId || config.accountId;
+
+    const appKey = await this.configManager.fetchRongcloudAppKey();
+    const appSecret = await this.configManager.fetchRongcloudAppSecret(nodeToken, nodeId);
+
+    if (!appKey || !appSecret) {
       throw new Error('融云配置未找到，请先配置 rongcloud_app_key 和 rongcloud_app_secret');
     }
-    
+
     return {
-      appKey: configs.rongcloud_app_key,
-      appSecret: configs.rongcloud_app_secret
+      appKey,
+      appSecret
     };
   }
 

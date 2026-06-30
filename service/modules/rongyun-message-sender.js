@@ -151,9 +151,10 @@ class RongyunMessageSender {
       // 客服消息和聊天消息都将业务内容放在顶层，方便前端解析
       if (this.rongcloudClient.ServiceChatMessage && (msgType.includes('service') || msgType === 'chat_message')) {
         // 对于客服/聊天消息，直接将业务内容放在顶层，方便前端解析
+        // 兼容字符串内容（如快捷命令结果），避免 ...content 展开字符串成字符数组
         const serviceChatPayload = {
           msg_type: msgType,
-          ...content,  // 展开业务内容（status, content, sessionId, userId 等）
+          ...(typeof content === 'object' && content !== null ? content : { content }),
           request_id: requestId || '',
           timestamp: Math.floor(Date.now() / 1000),
         };
@@ -258,6 +259,41 @@ class RongyunMessageSender {
    */
   setServerAPI(serverAPI) {
     this.serverAPI = serverAPI;
+  }
+
+  /**
+   * 发送卡片消息（P2P）
+   * 与 openclaw-clawmessenger 对齐的 card_message 格式
+   * @param {string} targetId - 目标用户ID
+   * @param {Object} cardData - 卡片数据（version, card_id, template, title, description, actions, state, metadata）
+   * @param {number} [conversationType=1] - 会话类型（1=单聊, 3=群聊）
+   * @returns {Promise<boolean>}
+   */
+  async sendCardMessage(targetId, cardData, conversationType = 1) {
+    if (!this.rongcloudClient?.isConnected) {
+      this.log?.error('[RongyunMessageSender] 未连接，无法发送卡片消息');
+      return false;
+    }
+
+    try {
+      const result = await this.rongcloudClient.sendCustomMessage(
+        targetId,
+        cardData,
+        conversationType,
+        'card_message'
+      );
+
+      if (result) {
+        this.log?.info(`[RongyunMessageSender] 卡片消息已发送 -> ${targetId}, card_id=${cardData.card_id || 'unknown'}`);
+      } else {
+        this.log?.warn(`[RongyunMessageSender] 卡片消息发送失败 -> ${targetId}`);
+      }
+
+      return result;
+    } catch (err) {
+      this.log?.error(`[RongyunMessageSender] 发送卡片消息异常: ${err.message}`);
+      return false;
+    }
   }
 }
 

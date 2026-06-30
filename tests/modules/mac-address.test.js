@@ -1,25 +1,31 @@
-const { getMacAddress } = require('../../service/modules/mac-address');
+const assert = require('assert');
+const { getMacAddress, normalizeMac } = require('../../service/modules/mac-address');
 
-describe('getMacAddress', () => {
-  test('should return a string', () => {
-    const mac = getMacAddress();
-    expect(typeof mac).toBe('string');
-  });
+function run() {
+  const mac = getMacAddress();
 
-  test('should return valid MAC address format (12 hex chars) or unknown', () => {
-    const mac = getMacAddress();
-    const isValidMac = /^[0-9a-f]{12}$/.test(mac);
-    const isUnknown = mac === 'unknown';
-    expect(isValidMac || isUnknown).toBe(true);
-  });
+  // 1. 返回字符串
+  assert.strictEqual(typeof mac, 'string', 'MAC 应为字符串');
 
-  test('should not contain colons', () => {
-    const mac = getMacAddress();
-    expect(mac).not.toContain(':');
-  });
+  // 2. 格式为 AA:BB:CC:DD:EE:FF
+  assert.ok(
+    /^([0-9A-F]{2}:){5}[0-9A-F]{2}$/.test(mac),
+    `MAC 格式应为 AA:BB:CC:DD:EE:FF 大写，实际: ${mac}`
+  );
 
-  test('should be lowercase', () => {
-    const mac = getMacAddress();
-    expect(mac).toBe(mac.toLowerCase());
-  });
-});
+  // 3. normalizeMac 测试
+  assert.strictEqual(normalizeMac('00e070e943bc'), '00:E0:70:E9:43:BC');
+  assert.strictEqual(normalizeMac('00:E0:70:E9:43:BC'), '00:E0:70:E9:43:BC');
+  assert.strictEqual(normalizeMac('00-E0-70-E9-43-BC'), '00:E0:70:E9:43:BC');
+  assert.strictEqual(normalizeMac('"00-E0-70-E9-43-BC"'), '00:E0:70:E9:43:BC');
+  assert.strictEqual(normalizeMac('invalid'), null);
+
+  console.log('✓ mac-address tests passed');
+}
+
+try {
+  run();
+} catch (err) {
+  console.error('✗ mac-address tests failed:', err);
+  process.exit(1);
+}

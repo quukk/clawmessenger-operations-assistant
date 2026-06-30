@@ -1,6 +1,9 @@
 /**
  * 融云消息处理器 - 与桌面客户端对齐
  *
+ * @deprecated 该模块使用硬编码 switch-case 分发消息，已被 Skill 框架取代。
+ * 保留此文件仅用于紧急回滚。新逻辑见 service/skills/ 目录。
+ *
  * 处理服务端发送的所有结构化消息类型：
  * - CHAT_MESSAGE: 转发消息到 OpenClaw AI 服务
  * - CREATE_OPENCODE_SESSION: 创建新会话
@@ -9,6 +12,7 @@
 const { RongyunMessageTypeEnum } = require('./rongyun-message-types');
 const { createOpencodeSession, deleteOpencodeSession, forwardChatMessage, getOrCreateGatewaySession } = require('./opencode-service');
 const { getMacAddress } = require('./mac-address');
+const { getApiBaseUrl } = require('../config');
 
 // 客服会话存储（内存缓存，生产环境建议用 Redis）
 const serviceSessions = new Map();
@@ -95,18 +99,18 @@ class RongyunMessageHandler {
   async _sendStreamChunk(fromUserId, targetId, content, streamId, isFirstChunk, isLastChunk, seq = 1) {
     const contentPreview = typeof content === 'string' ? content.substring(0, 100) : JSON.stringify(content).substring(0, 100);
     this.logInfo(`[RongyunMessageHandler] _sendStreamChunk: target=${targetId}, streamId=${streamId}, seq=${seq}, first=${isFirstChunk}, last=${isLastChunk}, content_len=${content?.length || 0}`);
-    
+
     if (!this.serverAPI) {
       this.logWarn('[RongyunMessageHandler] _sendStreamChunk skipped: serverAPI not configured');
       return;
     }
-    
+
     // 使用队列确保流式消息片段串行发送，避免并发导致后端处理错乱
     this._streamQueue = this._streamQueue.then(async () => {
       try {
         // 获取已存储的 RongCloud messageUID（首流响应返回的）
         const messageUID = this._streamMessageUIDs.get(streamId);
-        
+
         const result = await this.serverAPI.sendStreamPrivate({
           fromUserId,
           toUserId: targetId,
@@ -117,19 +121,19 @@ class RongyunMessageHandler {
           seq,
           messageUID
         });
-        
+
         // 首流时存储 RongCloud 返回的 messageUID
         if (isFirstChunk && result?.messageUID) {
           this._streamMessageUIDs.set(streamId, result.messageUID);
           this.logInfo(`[RongyunMessageHandler] 首流 messageUID 已存储: ${result.messageUID}, streamId=${streamId}`);
         }
-        
+
         this.logInfo(`[RongyunMessageHandler] _sendStreamChunk 成功: seq=${seq}`);
       } catch (err) {
         this.logWarn(`[RongyunMessageHandler] 发送流式消息失败: ${err.message}, seq=${seq}`);
       }
     });
-    
+
     await this._streamQueue;
   }
 
@@ -169,8 +173,8 @@ class RongyunMessageHandler {
       if (parsed.content && typeof parsed.content === 'string') {
         // 聊天消息的内容是纯文本，不需要解析为 JSON
         const isChatMessage = parsed.msg_type === RongyunMessageTypeEnum.CHAT_MESSAGE ||
-                              parsed.msg_type === RongyunMessageTypeEnum.SERVICE_CHAT_MESSAGE;
-        
+          parsed.msg_type === RongyunMessageTypeEnum.SERVICE_CHAT_MESSAGE;
+
         if (!isChatMessage) {
           try {
             const contentData = JSON.parse(parsed.content);
@@ -247,25 +251,49 @@ class RongyunMessageHandler {
     let fullResponse = '';
     let buffer = ''; // 用于流式发送的缓冲区
     const chatTimeoutMs = (this.config.chatTimeout || 600) * 1000;
-    
+
     // 生成流式消息唯一ID
     const streamId = `stream-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const cardId = `card-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     let seq = 0;
     let hasSentChunk = false;
     const fromUserId = this.config.accountId || '';
 
     try {
+      // 发送初始流式卡片（与 openclaw-clawmessenger 对齐）
+      await this._sendCardMessage(sourceId, {
+        version: 3,
+        card_id: cardId,
+        template: 'ai_streaming',
+        title: 'AI 助手',
+        description: '正在思考...',
+        actions: [
+          {
+            id: 'stop',
+            label: '停止',
+            action: 'stop_stream',
+            style: 'danger',
+            payload: { __card_id__: cardId },
+          },
+        ],
+        metadata: {
+          session_id: `chat-${sourceId}`,
+          is_streaming: true,
+        },
+      });
+
+      // 原有的流式转发逻辑
       await forwardChatMessage(sessionId, content, async (delta) => {
         fullResponse += delta;
         buffer += delta;
-        
+
         // 当缓冲区达到一定大小或包含标点时，发送流式片段
         // 使用 50 字符作为触发阈值（与 message-handler.js 保持一致）
         if (buffer.length >= 50) {
           seq += 1;
           const chunkToSend = buffer;
           buffer = ''; // 清空缓冲区
-          
+
           // 首流时发送首流标记
           const isFirstChunk = seq === 1;
           await this._sendStreamChunk(fromUserId, sourceId, chunkToSend, streamId, isFirstChunk, false, seq);
@@ -296,6 +324,29 @@ class RongyunMessageHandler {
         await this._sendStreamChunk(fromUserId, sourceId, '', streamId, false, true, seq);
       }
 
+      // 发送最终持久化卡片（与 openclaw-clawmessenger 对齐）
+      try {
+        await this._sendCardMessage(sourceId, {
+          version: 3,
+          card_id: cardId,
+          template: 'ai_streaming',
+          title: 'AI 助手',
+          description: fullResponse,
+          state: {
+            status: 'completed',
+            result: fullResponse,
+            completed_at: Date.now(),
+          },
+          actions: [],
+          metadata: {
+            session_id: `chat-${sourceId}`,
+            is_streaming: false,
+          },
+        });
+      } catch (cardErr) {
+        this.logWarn(`[RongyunMessageHandler] 发送最终卡片失败: ${cardErr.message}`);
+      }
+
       // 同时发送完整的 command 消息作为历史记录（兼容旧前端）
       await this.sendResponse(RongyunMessageTypeEnum.CHAT_MESSAGE, {
         status: 'success',
@@ -303,26 +354,26 @@ class RongyunMessageHandler {
         content: fullResponse,
         metadata: {}
       }, requestId, sourceId);
-      
+
       // 清理已存储的 messageUID
       this._streamMessageUIDs.delete(streamId);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.logError(`聊天消息处理异常: ${msg}`);
-      
+
       // 如果已经开始流式发送，发送错误标记
       if (hasSentChunk) {
         seq += 1;
         await this._sendStreamChunk(fromUserId, sourceId, `[错误] 转发失败: ${msg}`, streamId, false, true, seq);
       }
-      
+
       await this.sendResponse(RongyunMessageTypeEnum.CHAT_MESSAGE, {
         status: 'error',
         message: msg,
         content: `[错误] 转发失败: ${msg}`,
         metadata: {}
       }, requestId, sourceId);
-      
+
       // 清理已存储的 messageUID
       this._streamMessageUIDs.delete(streamId);
     }
@@ -567,13 +618,13 @@ class RongyunMessageHandler {
   async recognizeVoice(voiceUrl) {
     try {
       const axios = require('axios');
-      
+
       // 从配置中获取后端 API 地址
-      const apiBaseUrl = this.config.apiBaseUrl || process.env.API_BASE_URL || 'http://localhost:5000';
-      const recognizeUrl = `${apiBaseUrl}/im/api/voice/recognize`;
-      
+      const apiBaseUrl = this.config.apiBaseUrl || getApiBaseUrl();
+      const recognizeUrl = `${apiBaseUrl}/api/voice/recognize`;
+
       this.logInfo(`[RongyunMessageHandler] 调用语音识别 API: ${recognizeUrl}`);
-      
+
       const response = await axios.post(recognizeUrl, {
         audioUrl: voiceUrl,
         format: 'mp3',
@@ -582,7 +633,7 @@ class RongyunMessageHandler {
         timeout: 30000,
         headers: { 'Content-Type': 'application/json' }
       });
-      
+
       if (response.data && response.data.code === 200) {
         return response.data.data.text;
       } else {
@@ -616,6 +667,24 @@ class RongyunMessageHandler {
   }
 
   /**
+   * 发送卡片消息（与 openclaw-clawmessenger 对齐）
+   */
+  async _sendCardMessage(targetId, cardData) {
+    if (!this.messageSender) {
+      this.logError('MessageSender 未设置，无法发送卡片消息');
+      return;
+    }
+
+    try {
+      await this.messageSender.sendCardMessage(targetId, cardData);
+      this.logInfo(`卡片消息已发送 -> ${targetId}, card_id=${cardData.card_id || 'unknown'}`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.logError(`发送卡片消息失败: ${msg}`);
+    }
+  }
+
+  /**
    * 语音识别：调用后端百度语音 API 将语音转为文字
    */
   async _recognizeVoice(voiceUrl, voiceDuration) {
@@ -639,7 +708,7 @@ class RongyunMessageHandler {
       if (format === 'amr') sampleRate = 8000;
 
       const axios = require('axios');
-      const apiUrl = `${this.config.apiBaseUrl}/im/api/voice/recognize`;
+      const apiUrl = `${this.config.apiBaseUrl}/api/voice/recognize`;
       this.logInfo(`[_recognizeVoice] 调用语音识别 API: ${apiUrl}, format=${format}, sampleRate=${sampleRate}`);
 
       const response = await axios.post(apiUrl, {

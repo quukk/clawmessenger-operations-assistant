@@ -18,7 +18,9 @@ class HeartbeatManager {
 
       try {
         const mac = getMacAddress();
-        const sent = await this.messageSender.sendProtocolMessage(
+
+        // 1. 发送兼容心跳（HEARTBEAT）
+        const heartbeatSent = await this.messageSender.sendProtocolMessage(
           RongyunMessageTypeEnum.HEARTBEAT,
           {
             mac_address: mac,
@@ -26,8 +28,24 @@ class HeartbeatManager {
             client_status: 1,
           }
         );
-        if (!sent) {
+        if (!heartbeatSent) {
           this.log?.warn('[HeartbeatManager] 心跳发送失败');
+        }
+
+        // 2. 发送设备状态报告（DEVICE_STATUS_REPORT），让后端更新 deploy_status 为 online
+        const reportSent = await this.messageSender.sendProtocolMessage(
+          RongyunMessageTypeEnum.DEVICE_STATUS_REPORT,
+          {
+            mac_address: mac,
+            nickname: this.config.nodeName,
+            openclaw_status: 0,
+            opencode_status: 1,
+            status_message: '运行中',
+            timestamp: Date.now(),
+          }
+        );
+        if (!reportSent) {
+          this.log?.warn('[HeartbeatManager] 设备状态报告发送失败');
         }
       } catch (err) {
         this.log?.error(`[HeartbeatManager] 心跳发送异常: ${err.message}`);

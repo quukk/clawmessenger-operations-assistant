@@ -20,21 +20,21 @@ class SystemConfigManager {
    */
   async fetchConfig(configKey) {
     try {
-      const url = `${this.serverUrl}/im/api/system/config/${configKey}`;
+      const url = `${this.serverUrl}/api/system/config/${configKey}`;
       this.log?.info(`[SystemConfig] 正在请求配置: ${configKey}, URL=${url}`);
       const response = await axios.get(url, { timeout: 10000 });
-      
+
       if (response.data?.code === 200 && response.data?.data?.value) {
         this.configs.set(configKey, response.data.data.value);
         this.lastFetchTime = Date.now();
         this.log?.info(`[SystemConfig] 获取配置成功: ${configKey}`);
         return response.data.data.value;
       }
-      
+
       this.log?.warn(`[SystemConfig] 获取配置失败: ${configKey}, code=${response.data?.code}`);
       return null;
     } catch (err) {
-      this.log?.error(`[SystemConfig] 获取配置异常: ${configKey}, URL=${this.serverUrl}/im/api/system/config/${configKey}, ${err.message}`);
+      this.log?.error(`[SystemConfig] 获取配置异常: ${configKey}, URL=${this.serverUrl}/api/system/config/${configKey}, ${err.message}`);
       return null;
     }
   }
@@ -48,7 +48,7 @@ class SystemConfigManager {
     if (this.configs.has(configKey) && (now - this.lastFetchTime) < this.fetchInterval) {
       return this.configs.get(configKey);
     }
-    
+
     // 重新获取
     return this.fetchConfig(configKey);
   }

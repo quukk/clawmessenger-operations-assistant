@@ -48,6 +48,10 @@ class RongCloudClient {
         // 注册 service_chat 自定义消息类型（客服消息）
         this.ServiceChatMessage = RongIMLib.registerMessageType('service_chat', false, false);
         this.log?.info('[RongCloudClient] service_chat 自定义消息类型已注册');
+
+        // 注册 card_message 自定义消息类型（卡片消息，存储+计数）
+        this.CardMessage = RongIMLib.registerMessageType('card_message', true, true);
+        this.log?.info('[RongCloudClient] card_message 自定义消息类型已注册');
       } else {
         this.log?.warn('[RongCloudClient] SDK 不支持 registerMessageType');
       }
@@ -129,13 +133,7 @@ class RongCloudClient {
     // 最外层日志：确保任何消息到达都能留下痕迹（在过滤之前）
     this.log?.info(`[RongCloudClient] handleReceivedMessage 入口: messageType=${message.messageType}, senderUserId=${message.senderUserId}, conversationType=${message.conversationType}, isOffLineMessage=${message.isOffLineMessage}, messageDirection=${message.messageDirection}, messageUId=${message.messageUId}`);
 
-    // 1. 过滤离线消息：离线消息是历史记录，不需要重复处理
-    if (message.isOffLineMessage) {
-      this.log?.info('[RongCloudClient] 收到离线消息，忽略');
-      return;
-    }
-
-    // 2. 过滤自己发送的消息（融云 SDK 可能将发送消息回传）
+    // 1. 过滤自己发送的消息（融云 SDK 可能将发送消息回传）
     // messageDirection: 1=发送, 2=接收
     if (message.messageDirection === 1) {
       this.log?.info('[RongCloudClient] 过滤自己发送的消息 (messageDirection=1)');
@@ -294,6 +292,8 @@ class RongCloudClient {
     let MessageCtor = this.SystemServiceMessage;
     if (customType === 'service_chat') {
       MessageCtor = this.ServiceChatMessage;
+    } else if (customType === 'card_message') {
+      MessageCtor = this.CardMessage;
     }
 
     if (!MessageCtor) {

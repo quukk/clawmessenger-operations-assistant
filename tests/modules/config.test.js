@@ -36,7 +36,7 @@ describe('Config Module', () => {
     expect(config).toHaveProperty('scriptTimeout');
     expect(config).toHaveProperty('successKeyword');
     expect(config).toHaveProperty('chatTimeout');
-    expect(config).toHaveProperty('backendUrl');
+    expect(config).toHaveProperty('apiBaseUrl');
   });
 
   test('has correct default values', () => {
@@ -56,7 +56,7 @@ describe('Config Module', () => {
     expect(config.scriptTimeout).toBe(180);
     expect(config.successKeyword).toBe('Success');
     expect(config.chatTimeout).toBe(600);
-    expect(config.backendUrl).toBe('http://127.0.0.1:8003');
+    expect(config.apiBaseUrl).toBe('https://newsradar.dreamdt.cn');
   });
 
   test('reads from claw-bridge config', () => {
@@ -87,7 +87,7 @@ describe('Config Module', () => {
       secretKey: 'local-secret',
       nickname: 'LocalClient',
       reconnectInterval: 30,
-      backendUrl: 'http://localhost:9000'
+      apiBaseUrl: 'http://localhost:9000'
     }));
     
     const config = loadConfig();
@@ -98,7 +98,7 @@ describe('Config Module', () => {
     expect(config.secretKey).toBe('local-secret');
     expect(config.nickname).toBe('LocalClient');
     expect(config.reconnectInterval).toBe(30);
-    expect(config.backendUrl).toBe('http://localhost:9000');
+    expect(config.apiBaseUrl).toBe('http://localhost:9000');
   });
 
   test('environment variable DM_APP_KEY overrides local config', () => {
@@ -210,6 +210,6 @@ describe('Config Module', () => {
     expect(config.scriptTimeout).toBe(180);            // default
     expect(config.successKeyword).toBe('Success');     // default
     expect(config.chatTimeout).toBe(600);              // default
-    expect(config.backendUrl).toBe('http://127.0.0.1:8003'); // default
+    expect(config.apiBaseUrl).toBe('https://newsradar.dreamdt.cn'); // default
   });
 });

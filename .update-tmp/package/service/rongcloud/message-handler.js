@@ -29,7 +29,7 @@ class MessageHandler {
     this._groupConfigCache = new Map();
     this._defaultMaxRounds = 10;
     this._groupConfigCacheTTL = config.groupConfigCacheTTL || 60000; // 默认缓存 60 秒
-    
+
     // 消息合并相关
     this._pendingMessages = new Map(); // 待合并的消息
     this._messageMergeTimeout = 500; // 合并等待时间（毫秒）
@@ -131,7 +131,7 @@ class MessageHandler {
    */
   async _fetchGroupConfig(groupId) {
     try {
-      const apiUrl = `${this.config.apiBaseUrl}/im/api/group/info`;
+      const apiUrl = `${this.config.apiBaseUrl}/api/group/info`;
       this.log?.info(`[MessageHandler] 查询群组配置: groupId=${groupId}, url=${apiUrl}`);
       const resp = await axios.get(apiUrl, {
         params: { groupId: groupId },
@@ -240,43 +240,43 @@ class MessageHandler {
   async _handleImageMessageWithMerge(msg, maxRounds) {
     const userId = msg.senderUserId;
     const conversationKey = `${msg.conversationType}-${msg.targetId}-${userId}`;
-    
+
     // 设置待处理图片消息
     this._pendingMessages.set(conversationKey, {
       imageMsg: msg,
       timestamp: Date.now(),
     });
-    
+
     // 等待一段时间，看是否有文字消息跟随
     await new Promise(resolve => setTimeout(resolve, this._messageMergeTimeout));
-    
+
     // 获取待处理消息
     const pending = this._pendingMessages.get(conversationKey);
     this._pendingMessages.delete(conversationKey);
-    
+
     if (!pending) {
       return; // 消息已被处理
     }
-    
+
     // 构建合并后的消息内容
     const imageContent = this._extractMessageContent(pending.imageMsg);
     let mergedContent = imageContent;
-    
+
     if (pending.textMsg) {
-      const textContent = typeof pending.textMsg.content === 'string' 
-        ? pending.textMsg.content 
+      const textContent = typeof pending.textMsg.content === 'string'
+        ? pending.textMsg.content
         : (pending.textMsg.content?.content || '');
       mergedContent = `${textContent}\n${imageContent}`;
       this.log?.info(`[MessageHandler] 合并消息: 图片+文字`);
     }
-    
+
     // 创建合并后的消息对象
     const mergedMsg = {
       ...pending.imageMsg,
       content: mergedContent,
       messageType: 'RC:TxtMsg', // 转为文本消息处理
     };
-    
+
     await this._processMessage(mergedMsg, maxRounds);
   }
 
@@ -294,7 +294,7 @@ class MessageHandler {
         }
       } catch (err) {
         this.log?.error(`[MessageHandler] 流式处理失败，回退到非流式: ${err.message}`);
-        
+
         // 只有非取消错误才回退到非流式处理
         if (err.message !== 'canceled') {
           const reply = await this.handleNormalMessage(msg);
@@ -428,13 +428,13 @@ class MessageHandler {
         },
         async (fullText) => {
           this.log?.info(`[MessageHandler] onDone 触发, fullText.length=${fullText.length}, buffer.length=${buffer.length}, hasSentChunk=${hasSentChunk}`);
-          
+
           // 清除 typing 定时器
           if (typingTimer) {
             clearTimeout(typingTimer);
             typingTimer = null;
           }
-          
+
           if (buffer.trim()) {
             // 发送尾流：空字符串表示流结束，前端保留已拼接的完整内容
             seq += 1;
@@ -455,7 +455,7 @@ class MessageHandler {
           }
 
           this.log?.info(`[MessageHandler] 流式消息完成，streamId=${streamId}, 总长度: ${fullText.length}`);
-          
+
           // 发送持久化的普通文本消息作为历史记录（融云会保存 RC:TxtMsg）
           if (buffer.trim()) {
             try {
@@ -475,27 +475,27 @@ class MessageHandler {
               this.log?.error(`[MessageHandler] 发送历史记录失败: ${err.message}`);
             }
           }
-          
+
           // 清理已存储的 messageUID，防止内存泄漏
           this._streamMessageUIDs.delete(streamId);
         }
       );
     } catch (err) {
       this.log?.error(`[MessageHandler] 流式处理错误: ${err.message}`);
-      
+
       // 清除 typing 定时器
       if (typingTimer) {
         clearTimeout(typingTimer);
         typingTimer = null;
       }
-      
+
       // 只有非取消错误才发送错误提示
       if (err.message !== 'canceled') {
         await this._sendStreamChunk(fromUserId, targetId, conversationType, '抱歉，AI 响应出现错误，请稍后重试。', streamId, true, true, 1);
       } else {
         this.log?.info(`[MessageHandler] 请求被取消，不发送错误提示消息`);
       }
-      
+
       // 错误时也要清理
       this._streamMessageUIDs.delete(streamId);
       throw err;
@@ -529,13 +529,13 @@ class MessageHandler {
       this.log?.warn('[MessageHandler] _sendStreamChunk  skipped: 未配置 appKey/appSecret');
       return;
     }
-    
+
     // 使用队列确保流式消息片段串行发送，避免并发导致后端处理错乱
     this._streamQueue = this._streamQueue.then(async () => {
       try {
         // 获取已存储的 RongCloud messageUID（首流响应返回的）
         const messageUID = this._streamMessageUIDs.get(streamId);
-        
+
         let result;
         if (conversationType === 3) {
           // 群聊流式消息
@@ -562,19 +562,19 @@ class MessageHandler {
             messageUID
           });
         }
-        
+
         // 首流时存储 RongCloud 返回的 messageUID
         if (isFirstChunk && result?.messageUID) {
           this._streamMessageUIDs.set(streamId, result.messageUID);
           this.log?.info(`[MessageHandler] 首流 messageUID 已存储: ${result.messageUID}, streamId=${streamId}`);
         }
-        
+
         this.log?.info(`[MessageHandler] _sendStreamChunk 成功: seq=${seq}`);
       } catch (err) {
         this.log?.warn(`[MessageHandler] 发送流式消息失败: ${err.message}, seq=${seq}`);
       }
     });
-    
+
     await this._streamQueue;
   }
 
@@ -597,7 +597,7 @@ class MessageHandler {
     if (msgType === 'RC:ImgMsg') {
       // content 可能是对象（包含 imageUri）或字符串（base64 缩略图或 JSON）
       let imageUri = '';
-      
+
       if (typeof content === 'string') {
         // 尝试解析 content 是否为 JSON（包含 imageUri）
         try {
@@ -614,7 +614,7 @@ class MessageHandler {
         // content 是对象，包含 imageUri
         imageUri = content.imageUri || content.imageUrl || content.url || '';
       }
-      
+
       // 如果还是没有找到 URL，尝试从 extra 字段获取
       if (!imageUri && msg.extra) {
         try {
@@ -624,13 +624,13 @@ class MessageHandler {
           // extra 不是 JSON，忽略
         }
       }
-      
+
       this.log?.info(`[_extractMessageContent] 图片消息: imageUri=${imageUri}`);
-      
+
       if (!imageUri) {
         return '[图片]（无法获取图片地址）';
       }
-      
+
       return `[图片] ${imageUri}`;
     }
 
@@ -639,7 +639,7 @@ class MessageHandler {
       let sightUrl = '';
       let name = '未知视频';
       let duration = 0;
-      
+
       if (typeof content === 'object' && content !== null) {
         sightUrl = content.sightUrl || content.url || '';
         name = content.name || '未知视频';
@@ -660,7 +660,7 @@ class MessageHandler {
       } else {
         sightUrl = msg.sightUrl || msg.url || msg.localPath || '';
       }
-      
+
       // 如果还是没有找到 URL，尝试从 extra 字段获取
       if (!sightUrl && msg.extra) {
         try {
@@ -670,13 +670,13 @@ class MessageHandler {
           // extra 不是 JSON，忽略
         }
       }
-      
+
       this.log?.info(`[_extractMessageContent] 视频消息: sightUrl=${sightUrl}`);
-      
+
       if (!sightUrl) {
         return '[视频]（无法获取视频地址）';
       }
-      
+
       return `[视频] ${sightUrl} ${name} ${duration}秒`;
     }
 
@@ -685,7 +685,7 @@ class MessageHandler {
       let fileUrl = '';
       let name = '未知文件';
       let size = 0;
-      
+
       if (typeof content === 'object' && content !== null) {
         fileUrl = content.fileUrl || content.fileUri || content.url || '';
         name = content.name || '未知文件';
@@ -706,7 +706,7 @@ class MessageHandler {
       } else {
         fileUrl = msg.fileUrl || msg.fileUri || msg.url || msg.localPath || '';
       }
-      
+
       // 如果还是没有找到 URL，尝试从 extra 字段获取
       if (!fileUrl && msg.extra) {
         try {
@@ -716,13 +716,13 @@ class MessageHandler {
           // extra 不是 JSON，忽略
         }
       }
-      
+
       this.log?.info(`[_extractMessageContent] 文件消息: fileUrl=${fileUrl}`);
-      
+
       if (!fileUrl) {
         return '[文件]（无法获取文件地址）';
       }
-      
+
       return `[文件] ${fileUrl} ${name} ${size}`;
     }
 
@@ -730,7 +730,7 @@ class MessageHandler {
     if (msgType === 'RC:HQVCMsg') {
       let remoteUrl = '';
       let duration = 0;
-      
+
       // 先尝试解析 content（可能是 JSON 字符串）
       let parsedContent = content;
       if (typeof content === 'string' && content.startsWith('{')) {
@@ -740,12 +740,12 @@ class MessageHandler {
           // 解析失败，保持原样
         }
       }
-      
+
       if (typeof parsedContent === 'object' && parsedContent !== null) {
         remoteUrl = parsedContent.remoteUrl || parsedContent.url || '';
         duration = parsedContent.duration || 0;
       }
-      
+
       // 兜底：从 msg 根对象查找
       if (!remoteUrl) {
         remoteUrl = msg.remoteUrl || msg.url || msg.localPath || '';
@@ -753,7 +753,7 @@ class MessageHandler {
       if (!duration) {
         duration = msg.duration || 0;
       }
-      
+
       this.log?.info(`[_extractMessageContent] 语音消息: remoteUrl=${remoteUrl}, duration=${duration}`);
       return `[语音] ${remoteUrl} ${duration}秒`;
     }
@@ -795,7 +795,7 @@ class MessageHandler {
       let sampleRate = content?.sampleRate || msg.sampleRate || 16000;
       if (format === 'amr') sampleRate = 8000;
 
-      const apiUrl = `${this.config.apiBaseUrl}/im/api/voice/recognize`;
+      const apiUrl = `${this.config.apiBaseUrl}/api/voice/recognize`;
       this.log?.info(`[_recognizeVoice] 调用语音识别 API: ${apiUrl}, format=${format}, sampleRate=${sampleRate}`);
 
       const response = await axios.post(apiUrl, {

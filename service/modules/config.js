@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { getApiBaseUrl, getAppKey } = require('../config');
 
 /**
  * 获取实际用户主目录
@@ -32,10 +33,48 @@ function getRealHomeDir() {
   return homeDir;
 }
 
+/**
+ * 读取 openclaw-clawmessenger 的本地配置
+ * 新版：~/.claw-bridge/openclaw/config.json
+ * 旧版：~/.claw-bridge/config.json（仅当不含 omRongcloudId / omToken 时）
+ */
+function loadOpenclawConfig(homeDir) {
+  const openclawPath = path.join(homeDir, '.claw-bridge', 'openclaw', 'config.json');
+  const legacyPath = path.join(homeDir, '.claw-bridge', 'config.json');
+
+  if (fs.existsSync(openclawPath)) {
+    try {
+      const cfg = JSON.parse(fs.readFileSync(openclawPath, 'utf-8'));
+      if (cfg.nodeId && cfg.token) {
+        return cfg;
+      }
+    } catch (e) {
+      console.error('读取 openclaw 新版配置失败:', e);
+    }
+  }
+
+  if (fs.existsSync(legacyPath)) {
+    try {
+      const cfg = JSON.parse(fs.readFileSync(legacyPath, 'utf-8'));
+      // 若包含运维账户字段，说明是 silent-subagent 自己的配置，不应作为 openclaw 源
+      if (cfg.nodeId && cfg.token && !cfg.omRongcloudId && !cfg.omToken) {
+        return cfg;
+      }
+    } catch (e) {
+      console.error('读取 openclaw 旧版配置失败:', e);
+    }
+  }
+
+  return null;
+}
+
 function loadConfig() {
   const homeDir = getRealHomeDir();
 
-  // Read from ~/.claw-bridge/config.json
+  // 1. 读取 openclaw-clawmessenger 的注册配置（融云用户 ID / token 的真实来源）
+  const openclawConfig = loadOpenclawConfig(homeDir);
+
+  // 2. 读取 silent-subagent 自己的 ~/.claw-bridge/config.json
   const clawBridgePath = path.join(homeDir, '.claw-bridge', 'config.json');
   let clawBridgeConfig = {};
   if (fs.existsSync(clawBridgePath)) {
@@ -49,7 +88,7 @@ function loadConfig() {
     console.warn(`[CONFIG] 未找到 ${clawBridgePath} (home=${homeDir})`);
   }
 
-  // Read from local rongcloud-config.json
+  // 3. 读取本地 rongcloud-config.json
   const localConfigPath = path.join(__dirname, '..', '..', 'rongcloud-config.json');
   let localConfig = {};
   if (fs.existsSync(localConfigPath)) {
@@ -60,23 +99,31 @@ function loadConfig() {
     }
   }
 
-  // 计算 apiBaseUrl：环境变量 > 配置文件 > 推导值 > 默认值
-  let apiBaseUrl = process.env.API_BASE_URL || localConfig.apiBaseUrl || clawBridgeConfig.apiBaseUrl;
+  // 4. 合并配置：openclaw > 本地文件 > silent-subagent 自己的配置
+  const accountId =
+    localConfig.accountId ||
+    openclawConfig?.nodeId ||
+    clawBridgeConfig.nodeId;
+  const token =
+    localConfig.token ||
+    openclawConfig?.token ||
+    clawBridgeConfig.token;
+
+  // 计算 apiBaseUrl：环境变量 > 配置文件 > 统一配置默认值
+  let apiBaseUrl =
+    process.env.API_BASE_URL ||
+    localConfig.apiBaseUrl ||
+    clawBridgeConfig.apiBaseUrl ||
+    openclawConfig?.apiBaseUrl;
   if (!apiBaseUrl) {
-    const serverUrl = process.env.DM_SERVER_URL || 'https://newsradar.dreamdt.cn/im';
-    try {
-      const url = new URL(serverUrl);
-      apiBaseUrl = `${url.protocol}//${url.host}`;
-    } catch {
-      apiBaseUrl = 'http://127.0.0.1:5000';
-    }
+    apiBaseUrl = getApiBaseUrl();
   }
 
   return {
-    appKey: process.env.DM_APP_KEY || localConfig.appKey || 'bmdehs6pbyyks',
-    token: localConfig.token || clawBridgeConfig.token,
-    accountId: localConfig.accountId || clawBridgeConfig.nodeId,
-    nodeName: clawBridgeConfig.nodeName || 'cli-client',
+    appKey: process.env.DM_APP_KEY || localConfig.appKey || clawBridgeConfig.appKey || getAppKey(),
+    token,
+    accountId,
+    nodeName: clawBridgeConfig.nodeName || openclawConfig?.nodeName || 'cli-client',
     secretKey: localConfig.secretKey || 'secret_key',
     nickname: localConfig.nickname || 'CLI客户端',
     reconnectInterval: localConfig.reconnectInterval || 60,
