@@ -52,6 +52,14 @@ class RongCloudClient {
         // 注册 card_message 自定义消息类型（卡片消息，存储+计数）
         this.CardMessage = RongIMLib.registerMessageType('card_message', true, true);
         this.log?.info('[RongCloudClient] card_message 自定义消息类型已注册');
+
+        // 兜底：Node polyfill 环境下 registerMessageType 可能返回 undefined
+        if (!this.CardMessage && RongIMLib.MessageType && RongIMLib.MessageType.card_message) {
+          this.CardMessage = RongIMLib.MessageType.card_message;
+          this.log?.info('[RongCloudClient] card_message 从 MessageType.card_message 兜底获取');
+        }
+
+        this.log?.info(`[RongCloudClient] CardMessage type: ${typeof this.CardMessage}, isFunction: ${typeof this.CardMessage === 'function'}`);
       } else {
         this.log?.warn('[RongCloudClient] SDK 不支持 registerMessageType');
       }
@@ -251,11 +259,33 @@ class RongCloudClient {
         ? (RongIMLib.ConversationType?.GROUP || ConversationType.GROUP)
         : (RongIMLib.ConversationType?.PRIVATE || ConversationType.PRIVATE);
 
-      // this.log?.info(`[RongCloudClient] 发送消息 -> ${targetId} (Type: ${convType}): ${content.substring(0, 50)}`);
+      // 检测 card_message：对齐 openclaw-clawmessenger 的 msg_type 路由模式
+      let messageContent = new RongIMLib.TextMessage({ content });
+      try {
+        const parsed = JSON.parse(content);
+        if (parsed && parsed.msg_type === 'card_message') {
+          this.log?.info('[RongCloudClient] sendMessage 检测到 card_message');
+          if (this.CardMessage) {
+            try {
+              const cardMsg = new this.CardMessage(parsed);
+              this.log?.info(`[RongCloudClient] CardMessage objectName=${cardMsg.objectName || '(empty)'}, messageType=${cardMsg.messageType || '(empty)'}, has content=${!!cardMsg.content}`);
+            } catch (e) {
+              this.log?.warn(`[RongCloudClient] CardMessage 构造函数异常: ${e.message}`);
+            }
+          }
+          // 绕过构造函数的 polyfill 兼容写法：显式构造自定义消息对象
+          messageContent = {
+            objectName: 'card_message',
+            messageType: 'card_message',
+            content: parsed,
+          };
+          this.log?.info('[RongCloudClient] 使用显式 card_message 对象');
+        }
+      } catch (_) { /* not JSON, use text */ }
 
-      const result = await RongIMLib.sendTextMessage(
+      const result = await RongIMLib.sendMessage(
         { conversationType: convType, targetId },
-        { content }
+        messageContent
       );
 
       // this.log?.info(`[RongCloudClient] 发送结果: code=${result.code}`);

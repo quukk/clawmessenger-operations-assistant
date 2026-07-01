@@ -292,6 +292,26 @@ class RongCloudServerAPI {
     }
     return this.requestForm('/message/private/publish.json', data, appKey, appSecret);
   }
+
+  /**
+   * 发送单聊媒体/卡片消息（通过融云 Server REST API）
+   * 绕过 client SDK 的 registerMessageType 限制
+   */
+  async sendPrivateMessage({ fromUserId, toUserId, objectName, content }) {
+    const { appKey, appSecret } = await this._getRongCloudConfig();
+
+    const data = {
+      fromUserId,
+      toUserId,
+      objectName,
+      content: JSON.stringify(content),
+      isPersisted: 1,
+      isCounted: 1,
+    };
+
+    this.log?.info(`[RongCloudServerAPI] 发送单聊消息: ${objectName} -> ${toUserId}`);
+    return this.requestForm('/message/private/publish.json', data, appKey, appSecret);
+  }
 }
 
 module.exports = { RongCloudServerAPI };

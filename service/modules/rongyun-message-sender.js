@@ -270,21 +270,27 @@ class RongyunMessageSender {
    * @returns {Promise<boolean>}
    */
   async sendCardMessage(targetId, cardData, conversationType = 1) {
+    // 对齐 openclaw-clawmessenger：包装 msg_type + timestamp，经 sendMessage 路由
     if (!this.rongcloudClient?.isConnected) {
       this.log?.error('[RongyunMessageSender] 未连接，无法发送卡片消息');
       return false;
     }
 
     try {
-      const result = await this.rongcloudClient.sendCustomMessage(
+      // 对齐 openclaw-clawmessenger：包装 msg_type + timestamp，经 sendMessage 路由
+      const payload = {
+        ...cardData,
+        msg_type: 'card_message',
+        timestamp: cardData.timestamp || Date.now(),
+      };
+      const result = await this.rongcloudClient.sendMessage(
         targetId,
-        cardData,
-        conversationType,
-        'card_message'
+        JSON.stringify(payload),
+        conversationType
       );
 
       if (result) {
-        this.log?.info(`[RongyunMessageSender] 卡片消息已发送 -> ${targetId}, card_id=${cardData.card_id || 'unknown'}`);
+        this.log?.info(`[RongyunMessageSender] 卡片消息(client)已发送 -> ${targetId}, card_id=${cardData.card_id || 'unknown'}`);
       } else {
         this.log?.warn(`[RongyunMessageSender] 卡片消息发送失败 -> ${targetId}`);
       }

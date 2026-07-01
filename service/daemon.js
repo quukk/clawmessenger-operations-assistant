@@ -63,16 +63,20 @@ process.chdir(__dirname);
 function isDaemonProcess(pid) {
   if (process.platform !== 'win32') return true; // Unix 下仅依赖 process.kill(0)
   try {
-    const out = execSync(`tasklist /FI "PID eq ${pid}" /FO CSV /NH`, {
+    // 先确认是 node.exe 进程
+    const tasklistOut = execSync(`tasklist /FI "PID eq ${pid}" /FO CSV /NH`, {
       encoding: 'utf8', timeout: 5000, windowsHide: true,
     }).trim();
-    if (!out) return false;
-    const cols = out.split(',').map(s => s.replace(/^"|"$/g, ''));
-    const imageName = cols[0] || '';
-    if (imageName.toLowerCase() !== 'node.exe') return false;
-    // 映像是 node，再确认命令行包含 daemon.js（避免误判其他 node 进程）
-    // tasklist /FO CSV 命令行中逗号会被转义，简单包含判断即可
-    return out.toLowerCase().includes('daemon.js');
+    if (!tasklistOut) return false;
+    const cols = tasklistOut.split(',').map(s => s.replace(/^"|"$/g, ''));
+    if ((cols[0] || '').toLowerCase() !== 'node.exe') return false;
+
+    // wmic 获取命令行（tasklist /FO CSV 不含命令行）
+    const wmicOut = execSync(
+      `wmic process where ProcessId=${pid} get CommandLine /format:csv 2>nul`,
+      { encoding: 'utf8', timeout: 5000, windowsHide: true },
+    ).trim();
+    return wmicOut.toLowerCase().includes('daemon.js');
   } catch {
     return false;
   }
@@ -137,14 +141,17 @@ function writePidFile(pidFile) {
  * 检查是否有其他 Daemon 实例在运行
  */
 function checkSingleton() {
+  // 检查所有可能的 PID 文件路径，防止两个 daemon 分别落在 primary/fallback 互相不可见
+  const primaryResult = readAndCheckPidFile(PID_FILE_PRIMARY);
+  if (primaryResult === false) return false;
+
+  const fallbackResult = readAndCheckPidFile(PID_FILE_FALLBACK);
+  if (fallbackResult === false) return false;
+
   // 1. 尝试主 PID 文件路径
-  let result = readAndCheckPidFile(PID_FILE_PRIMARY);
-  if (result === false) return false;
   if (writePidFile(PID_FILE_PRIMARY)) return true;
 
   // 2. 主路径不可写，回退到 temp
-  result = readAndCheckPidFile(PID_FILE_FALLBACK);
-  if (result === false) return false;
   if (writePidFile(PID_FILE_FALLBACK)) {
     log.info(`[DAEMON] 使用 fallback PID 文件: ${PID_FILE_FALLBACK}`);
     return true;
@@ -364,6 +371,12 @@ function startWorker(isAfterUpdate = false, backupDirForRollback = null) {
     }
 
     if (!stopping && !isRollingBack) {
+      // 开发模式：正常退出（code=0）不自动重启，方便开发调试
+      const isDevMode = process.env.DEV_MODE === 'true' || process.env.NODE_ENV === 'development';
+      if (isDevMode && isNormalExit) {
+        log.info('[DAEMON] 开发模式，Worker 正常退出，不自动重启');
+        return;
+      }
       // 正常退出使用固定 1 秒延迟；异常退出使用指数退避
       const delay = isNormalExit ? 1000 : getRestartDelay();
       if (!isNormalExit) {

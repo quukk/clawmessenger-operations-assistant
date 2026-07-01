@@ -34,6 +34,28 @@ class OpsAssistantSkill extends BaseSkill {
     // /models 命令执行锁：userId -> boolean，防止用户连续点击触发多次
     this._modelsCommandLocks = new Map();
 
+    // 用户会话偏好：userId -> sessionId
+    this.userSessions = new Map();
+
+    // 用户会话列表缓存：userId -> Array<{id, title, updated}>
+    this.userSessionLists = new Map();
+
+    // 持久化用户偏好文件路径
+    const homeDir = process.env.HOME || process.env.USERPROFILE || '.';
+    this._prefsPath = path.join(homeDir, '.claw-bridge', 'user-preferences.json');
+    try {
+      if (fs.existsSync(this._prefsPath)) {
+        const saved = JSON.parse(fs.readFileSync(this._prefsPath, 'utf8'));
+        if (saved && saved.models) {
+          Object.entries(saved.models).forEach(([uid, model]) => this.userModels.set(uid, model));
+        }
+        if (saved && saved.sessions) {
+          Object.entries(saved.sessions).forEach(([uid, sid]) => this.userSessions.set(uid, sid));
+        }
+        this.log.info(`[OpsAssistant] 加载用户偏好: ${this.userModels.size} models, ${this.userSessions.size} sessions`);
+      }
+    } catch (e) { this.log.warn(`[OpsAssistant] 加载偏好失败: ${e.message}`); }
+
     // 流式消息发送队列：确保片段串行发送
     this._streamQueue = Promise.resolve();
     // 首流返回的 messageUID：streamId -> messageUID
@@ -204,6 +226,14 @@ class OpsAssistantSkill extends BaseSkill {
 
       // 2. 使用 senderUserId 作为 chatId，实现单用户会话隔离
       const chatId = `ops-${senderUserId}`;
+
+      // 如果用户通过 /session-use 指定了会话，注入到 runner 使其复用历史
+      const userSessionId = this.userSessions.get(senderUserId);
+      if (userSessionId) {
+        this.runner.sessions.set(chatId, { id: userSessionId, lastUsed: Date.now() });
+        this.log.info(`[OpsAssistant] 注入用户会话 ${userSessionId} 到 runner chatId=${chatId}`);
+      }
+
       const options = {};
       const preferredModel = this.userModels.get(senderUserId);
       if (preferredModel) options.model = preferredModel;
@@ -392,11 +422,8 @@ class OpsAssistantSkill extends BaseSkill {
       '/attach': { cmd: 'opencode attach --help', desc: 'attach 命令帮助' },
       '/models': { desc: '可用模型列表', handler: async () => this._sendModelsCard(targetId, convType, senderUserId) },
       '/models-page': {
-        desc: '模型列表分页',
-        handler: async () => {
-          const page = parseInt(commandText.replace('/models-page', '').trim(), 10) || 0;
-          return this._sendModelsPage(targetId, convType, senderUserId, page);
-        },
+        desc: '模型列表（已弃用分页，等同于 /models）',
+        handler: async () => this._sendModelsCard(targetId, convType, senderUserId),
       },
       '/models-search': {
         desc: '搜索模型',
@@ -413,9 +440,69 @@ class OpsAssistantSkill extends BaseSkill {
           return this._sendModelsSearchResults(targetId, convType, senderUserId, keyword, matched);
         },
       },
-      '/providers': { cmd: 'opencode providers --help', desc: 'providers 命令帮助' },
+      '/providers': { desc: '提供商管理', handler: async () => this._sendProvidersCard(targetId, convType, senderUserId) },
+      '/providers-login': {
+        desc: '登录提供商',
+        handler: async () => {
+          const name = commandText.replace(/^\/providers-login\s*/, '').trim();
+          if (!name) return '请指定提供商名称，例如 /providers-login opencode';
+          return this._handleProvidersLogin(targetId, convType, senderUserId, name);
+        },
+      },
+      '/providers-logout': {
+        desc: '登出提供商',
+        handler: async () => {
+          const name = commandText.replace(/^\/providers-logout\s*/, '').trim();
+          if (!name) return '请指定提供商名称，例如 /providers-logout opencode';
+          return this._handleProvidersLogout(targetId, convType, senderUserId, name);
+        },
+      },
       '/agent': { cmd: 'opencode agent --help', desc: 'agent 命令帮助' },
-      '/session': { cmd: 'opencode session --help', desc: 'session 命令帮助' },
+      '/session': { desc: '会话管理', handler: async () => this._sendSessionCard(targetId, convType, senderUserId) },
+      '/session-search': {
+        desc: '搜索会话',
+        handler: async () => {
+          const keyword = commandText.replace('/session-search', '').trim().toLowerCase();
+          if (!keyword) {
+            return '请输入搜索关键词，例如 /session-search xxx';
+          }
+          const allSessions = this.userSessionLists.get(senderUserId);
+          if (!allSessions) {
+            return '会话列表未缓存，请重新发送 /session';
+          }
+          const matched = allSessions.filter((s) =>
+            s.title.toLowerCase().includes(keyword) ||
+            s.id.toLowerCase().includes(keyword)
+          );
+          return this._sendSessionSearchResults(targetId, convType, senderUserId, keyword, matched);
+        },
+      },
+      '/new': {
+        desc: '新建空白会话',
+        handler: async () => {
+          this.userSessions.delete(senderUserId);
+          await this._savePreferences();
+          return '新会话已创建。下一次对话将使用全新的空白上下文，不会加载之前的聊天历史。';
+        },
+      },
+      '/session-use': {
+        desc: '切换活跃会话',
+        handler: async () => {
+          const sessionId = commandText.replace(/^\/session-use\s*/, '').trim();
+          if (!sessionId) return '用法: /session-use <sessionId>';
+          this.userSessions.set(senderUserId, sessionId);
+          await this._savePreferences();
+          return `已切换到会话 ${sessionId}，后续对话将使用此会话。`;
+        },
+      },
+      '/session-delete': {
+        desc: '删除会话',
+        handler: async () => {
+          const sessionId = commandText.replace(/^\/session-delete\s*/, '').trim();
+          if (!sessionId) return '请指定会话 ID，例如 /session-delete abc123';
+          return this._handleSessionDelete(targetId, convType, senderUserId, sessionId);
+        },
+      },
       '/mcp': {
         desc: 'MCP 管理',
         handler: async () => {
@@ -446,7 +533,6 @@ class OpsAssistantSkill extends BaseSkill {
               actions: [
                 { id: 'mcp-back', label: '← 返回管理', action: 'send_text', payload: { text: '/mcp' } },
               ],
-              state: { status: success ? 'completed' : 'error' },
               metadata: { session_id: `ops-assistant-${senderUserId}`, is_streaming: false },
             }, convType);
             return undefined; // card already sent
@@ -481,6 +567,7 @@ class OpsAssistantSkill extends BaseSkill {
             return '请指定模型，例如 /use-model opencode/gpt-5';
           }
           this.userModels.set(senderUserId, model);
+          await this._savePreferences();
           return `已切换模型至 ${model}，后续对话将使用该模型。`;
         },
       },
@@ -544,12 +631,12 @@ class OpsAssistantSkill extends BaseSkill {
   }
 
   async _doSendModelsCard(targetId, convType, senderUserId) {
-    this.log.info('[OpsAssistant] 开始执行 CLI: opencode models');
+    this.log.info('[OpsAssistant] 开始执行 CLI: opencode models --refresh');
     let stdout = '';
     let stderr = '';
     try {
-      const result = await execAsync('opencode models', {
-        timeout: 30000,
+      const result = await execAsync('opencode models --refresh', {
+        timeout: 60000,
         encoding: 'utf8',
         cwd: path.join(__dirname, 'opencode-workdir'),
       });
@@ -570,14 +657,13 @@ class OpsAssistantSkill extends BaseSkill {
 
     // 缓存完整模型列表并发送第一页
     this.userModelLists.set(senderUserId, allModels);
-    return this._sendModelsPage(targetId, convType, senderUserId, 0);
+    return this._sendModelsPage(targetId, convType, senderUserId);
   }
 
   /**
-   * 发送模型列表分页卡片
+   * 发送模型列表卡片（全部模型，不再分页）
    */
-  async _sendModelsPage(targetId, convType, senderUserId, page) {
-    const batchSize = 10;
+  async _sendModelsPage(targetId, convType, senderUserId) {
     const allModels = this.userModelLists.get(senderUserId);
 
     if (!allModels) {
@@ -585,51 +671,37 @@ class OpsAssistantSkill extends BaseSkill {
       return;
     }
 
-    const totalPages = Math.ceil(allModels.length / batchSize);
-    const safePage = Math.max(0, Math.min(page, totalPages - 1));
-    const start = safePage * batchSize;
-    const end = start + batchSize;
-    const pageModels = allModels.slice(start, end);
     const currentModel = this.userModels.get(senderUserId) || '';
 
-    const actions = pageModels.map((model, index) => ({
-      id: `model-${index}`,
+    // RongCloud 自定义消息上限 ~32KB，321 个模型全量 ~47KB 超限
+    // 截断到 50 个（~7KB），剩余通过搜索 /models-search 获取
+    const MAX_ACTIONS = 50;
+    const displayModels = allModels.slice(0, MAX_ACTIONS);
+    const remaining = allModels.length - MAX_ACTIONS;
+    const actions = displayModels.map((model, index) => ({
+      id: `m${index}`,
       label: model,
       action: 'send_text',
       payload: { text: `/use-model ${model}` },
     }));
 
-    if (safePage > 0) {
-      actions.push({
-        id: 'load-prev',
-        label: '上一页',
-        action: 'send_text',
-        payload: { text: `/models-page ${safePage - 1}` },
-      });
-    }
-
-    if (end < allModels.length) {
-      actions.push({
-        id: 'load-next',
-        label: '下一页',
-        action: 'send_text',
-        payload: { text: `/models-page ${safePage + 1}` },
-      });
+    let desc = `当前模型：${currentModel || '未选择'} | 默认: opencode`;
+    if (remaining > 0) {
+      desc += ` | 共${allModels.length}个模型，已显示${MAX_ACTIONS}个，搜索查看更多`;
     }
 
     const cardData = {
       version: 3,
       card_id: `card-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
       template: 'ai_streaming',
-      title: '可用模型列表',
-      description: `当前模型：${currentModel || '未选择'} | 第 ${safePage + 1}/${totalPages} 页，共 ${allModels.length} 个模型`,
+      title: `可用模型列表 (共 ${allModels.length} 个)`,
+      description: desc,
       actions,
       metadata: {
         session_id: `ops-assistant-${senderUserId}`,
         is_streaming: false,
         is_model_list: true,
         current_model: currentModel,
-        all_models: allModels,
       },
     };
 
@@ -637,10 +709,25 @@ class OpsAssistantSkill extends BaseSkill {
   }
 
   /**
+   * 持久化保存用户偏好（模型 + 会话）到 JSON 文件
+   */
+  async _savePreferences() {
+    try {
+      const dir = path.dirname(this._prefsPath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const models = {};
+      this.userModels.forEach((v, k) => { models[k] = v; });
+      const sessions = {};
+      this.userSessions.forEach((v, k) => { sessions[k] = v; });
+      fs.writeFileSync(this._prefsPath, JSON.stringify({ models, sessions }, null, 2), 'utf8');
+    } catch (e) { this.log.warn(`[OpsAssistant] 保存偏好失败: ${e.message}`); }
+  }
+
+  /**
    * 发送模型搜索结果卡片
    */
   async _sendModelsSearchResults(targetId, convType, senderUserId, keyword, models) {
-    const limitedModels = models.slice(0, 30);
+    const limitedModels = models.slice(0, 50);
     const currentModel = this.userModels.get(senderUserId) || '';
 
     const cardData = {
@@ -659,6 +746,7 @@ class OpsAssistantSkill extends BaseSkill {
         session_id: `ops-assistant-${senderUserId}`,
         is_streaming: false,
         is_model_list: true,
+        is_model_search: true,
         current_model: currentModel,
       },
     };
@@ -686,6 +774,330 @@ class OpsAssistantSkill extends BaseSkill {
     };
 
     await this.sendCard(targetId, cardData, convType);
+  }
+
+  /**
+   * 发送会话管理交互式卡片
+   */
+  async _sendSessionCard(targetId, convType, senderUserId) {
+    this.log.info('[OpsAssistant] 开始执行 CLI: opencode session list');
+    let output = '';
+    try {
+      const result = await execAsync('opencode session list', {
+        timeout: 30000,
+        encoding: 'utf8',
+        cwd: path.join(__dirname, 'opencode-workdir'),
+      });
+      output = result.stdout || result.stderr || '';
+    } catch (execErr) {
+      this.log.warn(`[OpsAssistant] opencode session list 失败: ${execErr.message}`);
+      output = execErr.stdout || execErr.stderr || '';
+    }
+
+    // 去除 ANSI 转义码
+    output = output.replace(/\x1b\[[0-9;]*m/g, '');
+
+    // 解析表格行：Session ID (32 字符 ses_xxx) | Title | Updated
+    const sessions = [];
+    const lines = output.split('\n').map((l) => l.trimEnd()).filter(Boolean);
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      // 跳过表头和分隔线
+      if (/^(─+|═+|=+)/.test(trimmed)) continue;
+      if (/^Session ID/i.test(trimmed)) continue;
+      // 用 2+ 空格或制表符分割列
+      const parts = trimmed.split(/\s{2,}|\t/).map((s) => s.trim()).filter(Boolean);
+      if (parts.length < 1) continue;
+      const sid = parts[0];
+      // Session ID 必须是 ses_ 开头的 32 字符格式
+      if (!/^ses_[a-zA-Z0-9]{20,}$/.test(sid)) continue;
+      const title = parts[1] || '(无标题)';
+      const updated = parts[2] || '';
+      sessions.push({ id: sid, title, updated });
+    }
+
+    // 缓存完整 session 列表供搜索使用
+    this.userSessionLists.set(senderUserId, sessions);
+
+    if (sessions.length === 0) {
+      await this.sendText(targetId, '暂无会话记录。使用对话功能后将自动创建会话。', convType);
+      return;
+    }
+
+    // 限制数量避免卡片过大（与 models 一致）
+    const MAX_SESSIONS = 50;
+    const displaySessions = sessions.slice(0, MAX_SESSIONS);
+    const currentSessionId = this.userSessions.get(senderUserId) || '';
+    const currentSession = currentSessionId
+      ? displaySessions.find((s) => s.id === currentSessionId)
+      : null;
+    const currentSessionTitle = currentSession ? currentSession.title : '';
+
+    // 每个 session 一个 action（前端下拉框：点击切换，右侧删除按钮）
+    // 只显示标题，不在这里加 ✓ 前缀（前端通过 current_session_id 高亮）
+    const actions = [];
+    for (const s of displaySessions) {
+      actions.push({
+        id: `session-${s.id}`,
+        label: s.title,
+        sublabel: s.updated || '',
+        action: 'send_text',
+        payload: {
+          text: `/session-use ${s.id}`,
+          sessionId: s.id,
+          sessionTitle: s.title,
+        },
+      });
+    }
+
+    const cardData = {
+      version: 3,
+      card_id: `card-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      template: 'ai_streaming',
+      title: `会话列表 (共 ${sessions.length} 个${sessions.length > MAX_SESSIONS ? `，显示前 ${MAX_SESSIONS}` : ''})`,
+      description: currentSessionTitle ? `当前会话：${currentSessionTitle}` : '未指定会话',
+      actions,
+      metadata: {
+        session_id: `ops-assistant-${senderUserId}`,
+        is_streaming: false,
+        is_session_list: true,
+        current_session_id: currentSessionId,
+        current_session_title: currentSessionTitle,
+      },
+    };
+
+    await this.sendCard(targetId, cardData, convType);
+  }
+
+  /**
+   * 发送会话搜索结果卡片
+   */
+  async _sendSessionSearchResults(targetId, convType, senderUserId, keyword, sessions) {
+    const limitedSessions = sessions.slice(0, 50);
+    const currentSessionId = this.userSessions.get(senderUserId) || '';
+    const currentSession = currentSessionId
+      ? limitedSessions.find((s) => s.id === currentSessionId)
+      : null;
+    const currentSessionTitle = currentSession ? currentSession.title : '';
+
+    const actions = [];
+    for (const s of limitedSessions) {
+      actions.push({
+        id: `session-${s.id}`,
+        label: s.title,
+        sublabel: s.updated || '',
+        action: 'send_text',
+        payload: {
+          text: `/session-use ${s.id}`,
+          sessionId: s.id,
+          sessionTitle: s.title,
+        },
+      });
+    }
+
+    const cardData = {
+      version: 3,
+      card_id: `card-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      template: 'ai_streaming',
+      title: '会话搜索结果',
+      description: `搜索 "${keyword}" 找到 ${sessions.length} 个会话`,
+      actions,
+      metadata: {
+        session_id: `ops-assistant-${senderUserId}`,
+        is_streaming: false,
+        is_session_list: true,
+        is_session_search: true,
+        current_session_id: currentSessionId,
+        current_session_title: currentSessionTitle,
+      },
+    };
+
+    await this.sendCard(targetId, cardData, convType);
+  }
+
+  /**
+   * 删除会话并刷新卡片
+   */
+  async _handleSessionDelete(targetId, convType, senderUserId, sessionId) {
+    let output = '';
+    let success = true;
+    try {
+      const result = await execAsync(`opencode session delete ${sessionId}`, {
+        timeout: 30000,
+        encoding: 'utf8',
+        cwd: path.join(__dirname, 'opencode-workdir'),
+      });
+      output = result.stdout || result.stderr || '删除成功';
+    } catch (execErr) {
+      output = execErr.stdout || execErr.stderr || execErr.message;
+      success = !!(execErr.stdout || execErr.stderr);
+    }
+
+    output = output.replace(/\x1b\[[0-9;]*m/g, '');
+    const maxLength = 2000;
+    const finalOutput = output.length > maxLength
+      ? output.substring(0, maxLength) + '\n\n...（输出已截断）'
+      : output;
+
+    await this.sendText(targetId, `【删除会话 ${sessionId}】\n${finalOutput}`, convType);
+
+    // 如果删除的是用户当前活跃的会话，清除偏好
+    if (this.userSessions.get(senderUserId) === sessionId) {
+      this.userSessions.delete(senderUserId);
+      this.log.info(`[OpsAssistant] 已清除用户 ${senderUserId} 的会话偏好（会话 ${sessionId} 已删除）`);
+    }
+
+    // 刷新会话列表卡片
+    await this._sendSessionCard(targetId, convType, senderUserId);
+  }
+
+  /**
+   * 发送提供商管理交互式卡片
+   */
+  async _sendProvidersCard(targetId, convType, senderUserId) {
+    this.log.info('[OpsAssistant] 开始执行 CLI: opencode providers list');
+    let output = '';
+    try {
+      const result = await execAsync('opencode providers list', {
+        timeout: 30000,
+        encoding: 'utf8',
+        cwd: path.join(__dirname, 'opencode-workdir'),
+      });
+      output = result.stdout || result.stderr || '';
+    } catch (execErr) {
+      this.log.warn(`[OpsAssistant] opencode providers list 失败: ${execErr.message}`);
+      output = execErr.stdout || execErr.stderr || '';
+    }
+
+    output = output.replace(/\x1b\[[0-9;]*m/g, '');
+
+    const lines = output.split('\n').map((l) => l.trim()).filter(Boolean);
+    const providers = [];
+
+    // 解析提供商列表：常见格式有表格、列表
+    for (const line of lines) {
+      // 跳过标题行、分隔线
+      if (/^(─+|═+|Provider|Name|名称|提供)/.test(line)) continue;
+
+      const parts = line.split(/\s+/);
+      if (parts.length > 0 && parts[0]) {
+        const name = parts[0];
+        // 过滤明显不是提供商名称的行
+        if (name.length > 1 && !/^\d+$/.test(name)) {
+          // 检测登录状态：查找 logged in / connected / ✓ / ✅ 等关键词
+          const lineLower = line.toLowerCase();
+          const isLoggedIn = lineLower.includes('logged in')
+            || lineLower.includes('connected')
+            || lineLower.includes('login')
+            || line.includes('✓')
+            || line.includes('✅');
+          providers.push({ name, isLoggedIn });
+        }
+      }
+    }
+
+    if (providers.length === 0) {
+      await this.sendText(targetId, '暂无提供商配置。请检查 opencode providers 配置。', convType);
+      return;
+    }
+
+    const actions = [];
+    for (const p of providers) {
+      // 提供商名称按钮
+      actions.push({
+        id: `prov-${p.name}`,
+        label: p.name,
+        action: 'send_text',
+        payload: { text: p.isLoggedIn ? `/providers-logout ${p.name}` : `/providers-login ${p.name}` },
+      });
+
+      // 登录/登出按钮
+      actions.push({
+        id: `prov-action-${p.name}`,
+        label: p.isLoggedIn ? '登出' : '登录',
+        action: 'send_text',
+        style: p.isLoggedIn ? 'danger' : undefined,
+        payload: { text: p.isLoggedIn ? `/providers-logout ${p.name}` : `/providers-login ${p.name}` },
+      });
+    }
+
+    const loggedInCount = providers.filter((p) => p.isLoggedIn).length;
+
+    const cardData = {
+      version: 3,
+      card_id: `card-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      template: 'ai_streaming',
+      title: '提供商管理',
+      description: `共 ${providers.length} 个提供商，${loggedInCount} 个已登录`,
+      actions,
+      metadata: {
+        session_id: `ops-assistant-${senderUserId}`,
+        is_streaming: false,
+      },
+    };
+
+    await this.sendCard(targetId, cardData, convType);
+  }
+
+  /**
+   * 登录提供商并刷新卡片
+   */
+  async _handleProvidersLogin(targetId, convType, senderUserId, name) {
+    let output = '';
+    let success = true;
+    try {
+      const result = await execAsync(`opencode providers login ${name}`, {
+        timeout: 30000,
+        encoding: 'utf8',
+        cwd: path.join(__dirname, 'opencode-workdir'),
+      });
+      output = result.stdout || result.stderr || '登录成功';
+    } catch (execErr) {
+      output = execErr.stdout || execErr.stderr || execErr.message;
+      success = !!(execErr.stdout || execErr.stderr);
+    }
+
+    output = output.replace(/\x1b\[[0-9;]*m/g, '');
+    const maxLength = 2000;
+    const finalOutput = output.length > maxLength
+      ? output.substring(0, maxLength) + '\n\n...（输出已截断）'
+      : output;
+
+    await this.sendText(targetId, `【登录提供商 ${name}】\n${finalOutput}`, convType);
+
+    // 刷新提供商列表卡片
+    await this._sendProvidersCard(targetId, convType, senderUserId);
+  }
+
+  /**
+   * 登出提供商并刷新卡片
+   */
+  async _handleProvidersLogout(targetId, convType, senderUserId, name) {
+    let output = '';
+    let success = true;
+    try {
+      const result = await execAsync(`opencode providers logout ${name}`, {
+        timeout: 30000,
+        encoding: 'utf8',
+        cwd: path.join(__dirname, 'opencode-workdir'),
+      });
+      output = result.stdout || result.stderr || '登出成功';
+    } catch (execErr) {
+      output = execErr.stdout || execErr.stderr || execErr.message;
+      success = !!(execErr.stdout || execErr.stderr);
+    }
+
+    output = output.replace(/\x1b\[[0-9;]*m/g, '');
+    const maxLength = 2000;
+    const finalOutput = output.length > maxLength
+      ? output.substring(0, maxLength) + '\n\n...（输出已截断）'
+      : output;
+
+    await this.sendText(targetId, `【登出提供商 ${name}】\n${finalOutput}`, convType);
+
+    // 刷新提供商列表卡片
+    await this._sendProvidersCard(targetId, convType, senderUserId);
   }
 
   /**
