@@ -20,6 +20,9 @@ class RongCloudServerAPI {
     this.hosts = API_HOSTS_CN;
     this.currentHostIndex = 0;
     this.timeout = 10000;
+    this._cachedConfig = null;
+    this._cachedConfigTime = 0;
+    this._configCacheTtl = 60 * 60 * 1000; // 1 小时
   }
 
   get currentHost() {
@@ -155,12 +158,17 @@ class RongCloudServerAPI {
   }
 
   /**
-   * 获取融云配置
+   * 获取融云配置，带缓存（1小时），避免每次发送消息都请求后端接口。
    * 使用服务端专用接口：
    * - /api/config/rongcloud 获取 appKey（公开）
    * - /api/config/rongcloud/secret 获取 appSecret（需节点认证）
    */
   async _getRongCloudConfig() {
+    const now = Date.now();
+    if (this._cachedConfig && now - this._cachedConfigTime < this._configCacheTtl) {
+      return this._cachedConfig;
+    }
+
     const config = this.configManager?.config || {};
     // 优先使用节点原 token/id（运维账户场景下 originalToken/originalAccountId 才是节点真实身份）
     const nodeToken = config.originalToken || config.token;
@@ -173,37 +181,66 @@ class RongCloudServerAPI {
       throw new Error('融云配置未找到，请先配置 rongcloud_app_key 和 rongcloud_app_secret');
     }
 
-    return {
-      appKey,
-      appSecret
-    };
+    this._cachedConfig = { appKey, appSecret };
+    this._cachedConfigTime = now;
+    return this._cachedConfig;
   }
 
   /**
-   * 发送单聊流式消息
+   * 强制刷新融云配置缓存，用于启动预热。
+   */
+  async refreshRongCloudConfig() {
+    this._cachedConfig = null;
+    this._cachedConfigTime = 0;
+    return this._getRongCloudConfig();
+  }
+
+  /**
+   * 发送单聊流式消息(B3:RC:StreamMsg 升级,B4 删除旧纯文本模式)。
+   *
+   * 规范契约(CARD-SPEC.md §8.3,两层包装):
+   *   RC:StreamMsg
+   *   ├── content.extra (卡片壳): { stream_type:"card", card_template:"ai_streaming", card_id, title, version, actions }
+   *   └── content.content (stream_delta): StreamDelta JSON 字符串
+   *
+   * StreamDelta 结构(规范 §7):
+   *   { content?, reasoning_content?, tools?, pending_interaction?,
+   *     session_status: thinking|responding|tool_executing|waiting_interaction|completed|error|cancelled,
+   *     seq, is_final?, error? }
+   *
+   * @param {Object} p
+   * @param {string} p.fromUserId
+   * @param {string} p.toUserId
+   * @param {string} p.streamId
+   * @param {boolean} [p.isFirstChunk=false]
+   * @param {boolean} [p.isLastChunk=false]
+   * @param {number} [p.seq=1]
+   * @param {string} [p.messageUID] 首流后服务端返回的 messageUID,后续流带上以续流
+   * @param {Object} p.streamDelta B4 必传:StreamDelta 对象(序列化为 content.content)
+   * @param {Object} [p.extra] B3:卡片壳对象(stream_type/card_template/card_id/title/version/actions),
+   *                            首流时写入 content.extra 让前端渲染卡片壳并续流
+   * @throws {Error} streamDelta 缺失时抛错
    */
   async sendStreamPrivate({
     fromUserId,
     toUserId,
-    content,
     streamId,
     isFirstChunk = false,
     isLastChunk = false,
     seq = 1,
-    streamType = 'markdown',
-    messageUID = null
+    messageUID = null,
+    streamDelta,
+    extra = null,
   }) {
     const { appKey, appSecret } = await this._getRongCloudConfig();
-    
-    const contentBody = {
-      content,
-      complete: isLastChunk,
-      seq
-    };
 
-    if (isFirstChunk) {
-      contentBody.type = streamType;
-    }
+    const contentBody = this._buildStreamContentBody({
+      isLastChunk,
+      seq,
+      isFirstChunk,
+      streamDelta,
+      extra,
+    });
 
     if (!isFirstChunk && messageUID) {
       contentBody.messageUID = messageUID;
@@ -219,35 +256,34 @@ class RongCloudServerAPI {
       disableUpdateLastMsg: !isLastChunk
     };
 
-    this.log?.info(`[RongCloudServerAPI] 发送单聊流式消息: to=${toUserId}, streamId=${streamId}, first=${isFirstChunk}, last=${isLastChunk}, seq=${seq}`);
+    this.log?.info(`[RongCloudServerAPI] 发送单聊流式消息: to=${toUserId}, streamId=${streamId}, first=${isFirstChunk}, last=${isLastChunk}, seq=${seq}, hasExtra=${!!extra}`);
     return this.request('/v3/message/private/publish_stream.json', data, appKey, appSecret);
   }
 
   /**
-   * 发送群聊流式消息
+   * 发送群聊流式消息(B3:同 sendStreamPrivate 升级,B4 删除旧纯文本模式)
+   * @see sendStreamPrivate 参数说明
    */
   async sendStreamGroup({
     fromUserId,
     toGroupId,
-    content,
     streamId,
     isFirstChunk = false,
     isLastChunk = false,
     seq = 1,
-    streamType = 'markdown',
-    messageUID = null
+    messageUID = null,
+    streamDelta,
+    extra = null,
   }) {
     const { appKey, appSecret } = await this._getRongCloudConfig();
-    
-    const contentBody = {
-      content,
-      complete: isLastChunk,
-      seq
-    };
 
-    if (isFirstChunk) {
-      contentBody.type = streamType;
-    }
+    const contentBody = this._buildStreamContentBody({
+      isLastChunk,
+      seq,
+      isFirstChunk,
+      streamDelta,
+      extra,
+    });
 
     if (!isFirstChunk && messageUID) {
       contentBody.messageUID = messageUID;
@@ -264,8 +300,43 @@ class RongCloudServerAPI {
       disableUpdateLastMsg: !isLastChunk
     };
 
-    this.log?.info(`[RongCloudServerAPI] 发送群聊流式消息: to=${toGroupId}, streamId=${streamId}, first=${isFirstChunk}, last=${isLastChunk}, seq=${seq}`);
+    this.log?.info(`[RongCloudServerAPI] 发送群聊流式消息: to=${toGroupId}, streamId=${streamId}, first=${isFirstChunk}, last=${isLastChunk}, seq=${seq}, hasExtra=${!!extra}`);
     return this.request('/v3/message/group/publish_stream.json', data, appKey, appSecret);
+  }
+
+  /**
+   * 构造 RC:StreamMsg 的 content body(B3 抽出,B4 删除旧纯文本回退,单聊/群聊共用)。
+   *
+   * 规范 §8.3 两层包装:
+   *   - streamDelta 必传 → content.content = JSON.stringify(streamDelta)
+   *   - extra 提供 + 首流 → content.extra = extra(卡片壳,前端据此渲染 ai_streaming 卡并续流)
+   *
+   * 字段映射:
+   *   - complete: isLastChunk(融云原生字段,表示流结束)
+   *   - seq: 序号(融云原生,与 StreamDelta.seq 一致)
+   *   - content: StreamDelta JSON 字符串(规范模式)
+   *   - extra: 卡片壳(仅首流写,后续流前端按 card_id 续流无需重发)
+   *
+   * @private
+   * @throws {Error} streamDelta 缺失时抛错(规范要求,无旧纯文本回退)
+   */
+  _buildStreamContentBody({ isLastChunk, seq, isFirstChunk, streamDelta, extra }) {
+    if (!streamDelta || typeof streamDelta !== 'object') {
+      throw new Error('streamDelta 必传(规范 §7),旧纯文本回退已在 B4 删除');
+    }
+
+    const contentBody = {
+      complete: isLastChunk,
+      seq,
+      content: JSON.stringify(streamDelta),
+    };
+
+    // 首流写 extra 卡片壳(stream_type 信息在 extra)
+    if (isFirstChunk && extra && typeof extra === 'object') {
+      contentBody.extra = extra;
+    }
+
+    return contentBody;
   }
 
   /**

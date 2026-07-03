@@ -1,43 +1,63 @@
 /**
- * OpenCode Runner
+ * OpenCode Runner(SSE 异步真实流式)
  *
- * 通过 `opencode run` 子进程与 OpenCode 交互。
- * 参考 opencode-clawmessenger/src/core/ops-assistant.ts，翻译为纯 JavaScript。
+ * 通过 @opencode-ai/sdk 与 OpenCode server 交互。
+ * 参考 opencode-clawmessenger/src/opencode/client.ts + event-handler.ts。
  *
- * 特性：
- * - 按 chatId 持久化 session
- * - 单 chatId 队列串行化
- * - 超时后 SIGKILL 并返回部分结果
- * - 失败时清除 session 重试一次
+ * 与旧版(CLI spawn)的关键差异:
+ *   - sendMessage(chatId,msg) 改为 fire-and-forget:内部 promptAsync 触发后立即返回 void,
+ *     真实回复由 EventHandler 消费 SSE 流(message.part.delta)驱动流式发送
+ *   - chatId → sessionId 映射仍持久化(sessions.json),便于复用历史会话
+ *   - 失败重试逻辑移除(promptAsync 失败由调用方捕获并发错误卡片)
+ *   - 快捷命令(/models 等)仍走 execAsync('opencode ...') CLI,不在本类
+ *
+ * 依赖:
+ *   - 持有的 opencode client(OpencodeClient,封装 SDK)
+ *   - 持有的 eventHandler(EventHandler,消费 SSE 流并回调发送流片)
+ *   - 两者由 worker 在启动时注入(见 worker.js)
  */
-const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { OpencodeClient } = require('./opencode-client');
+const { EventHandler } = require('./event-handler');
+const { buildStreamExtra } = require('../skills/ops-assistant/stream-builders');
 
 class OpencodeRunner {
   /**
    * @param {Object} options
-   * @param {string} options.directory - opencode 工作目录（含 .opencode/prompt.md）
-   * @param {string} [options.opencodeUrl='http://127.0.0.1:19877'] --attach 地址
-   * @param {number} [options.timeout=600000] - 单次调用超时（毫秒）
+   * @param {string} options.directory - opencode 工作目录(含 .opencode/prompt.md)
+   * @param {string} [options.opencodeUrl='http://127.0.0.1:4096'] opencode server 地址
+   * @param {string} [options.password] - Basic auth 密码(OPENCODE_SERVER_PASSWORD)
+   * @param {number} [options.timeout] - 兼容旧参数(不再用于 spawn 超时,保留以避免破坏调用方)
    * @param {string} [options.sessionFile] - session 持久化文件路径
    * @param {Object} [options.log] - 日志对象
    */
   constructor(options) {
     this.directory = options.directory || process.cwd();
-    this.opencodeUrl = options.opencodeUrl || 'http://127.0.0.1:19877';
-    this.timeout = options.timeout || 120000; // 默认 2 分钟，避免子进程无限运行
+    this.opencodeUrl = options.opencodeUrl || 'http://127.0.0.1:4096';
+    this.password = options.password || null;
+    this.timeout = options.timeout || 600000;
     this.sessionFile =
       options.sessionFile || path.join(os.homedir(), '.config', 'opencode', 'ops-assistant-sessions.json');
     this.log = options.log || console;
 
+    /** @type {Map<string, {id:string, lastUsed:number}>} chatId → session */
     this.sessions = new Map();
-    this.activeProcesses = new Map();
-    this.processQueue = new Map();
+
+    // per-chatId 串行队列:同一 chatId 的 promptAsync 按顺序触发(避免并发乱序)
+    /** @type {Map<string, Promise<void>>} */
+    this.chatQueues = new Map();
 
     this.systemPrompt = this._loadSystemPrompt();
     this._loadSessions();
+
+    /** @type {OpencodeClient|null} */
+    this.opencode = null;
+    /** @type {EventHandler|null} */
+    this.eventHandler = null;
+    /** SSE 是否已启动 */
+    this._sseStarted = false;
   }
 
   _loadSystemPrompt() {
@@ -88,250 +108,162 @@ class OpencodeRunner {
   }
 
   /**
-   * 发送消息并获取回复
+   * 初始化 OpenCode SDK client 与 EventHandler。
+   * 注入 OpsAssistantSkill 的发送回调(sendStreamChunk / sendFinalCard / sendErrorCard)。
+   * 启动 SSE 事件流(后台异步循环,不阻塞)。
    *
-   * @param {string} chatId - 会话标识（如 userId）
+   * @param {Object} callbacks
+   * @param {Function} callbacks.sendStreamChunk
+   * @param {Function} callbacks.sendFinalCard
+   * @param {Function} callbacks.sendErrorCard
+   */
+  async initSse(callbacks) {
+    if (this._sseStarted) {
+      this.log.info('[OpencodeRunner] SSE 已启动,跳过重复初始化');
+      return;
+    }
+
+    this.opencode = new OpencodeClient({
+      baseUrl: this.opencodeUrl,
+      directory: this.directory,
+      password: this.password,
+      systemPrompt: this.systemPrompt,
+      log: this.log,
+    });
+
+    this.eventHandler = new EventHandler({
+      opencode: this.opencode,
+      log: this.log,
+      sendStreamChunk: callbacks.sendStreamChunk,
+      sendFinalCard: callbacks.sendFinalCard,
+      sendErrorCard: callbacks.sendErrorCard,
+    });
+
+    // 连接 SSE 流并启动事件循环
+    try {
+      const eventStream = await this.opencode.subscribeGlobalEvents();
+      await this.eventHandler.start(eventStream);
+      this._sseStarted = true;
+      this.log.info('[OpencodeRunner] SSE 事件流已启动(真实流式)');
+    } catch (err) {
+      this.log.error(`[OpencodeRunner] SSE 启动失败,流式将不可用: ${err.message}`);
+      // EventHandler 内部会在 isRunning 后自动重试订阅,但首次失败时 start 未调用
+      // 这里降级:即便首次订阅失败,也标记启动以便后续重试
+      this._sseStarted = true;
+      // 触发一次后台重试循环
+      this._retrySubscribeInBackground();
+    }
+  }
+
+  /**
+   * SSE 首次连接失败时的后台重试(指数退避)
+   */
+  _retrySubscribeInBackground() {
+    const attempt = async () => {
+      while (this._sseStarted && this.eventHandler && !this.eventHandler.isRunning) {
+        try {
+          const eventStream = await this.opencode.subscribeGlobalEvents();
+          await this.eventHandler.start(eventStream);
+          this.log.info('[OpencodeRunner] SSE 后台重连成功');
+          return;
+        } catch (err) {
+          this.log.warn(`[OpencodeRunner] SSE 后台重连失败: ${err.message},5s 后重试`);
+          await new Promise((r) => setTimeout(r, 5000));
+        }
+      }
+    };
+    attempt().catch((err) => this.log.error(`[OpencodeRunner] SSE 后台重试异常: ${err.message}`));
+  }
+
+  /**
+   * 发送消息(异步真实流式)。
+   *
+   * 语义变化(关键!):
+   *   - 旧版返回 Promise<string>,阻塞等待完整回复
+   *   - 新版 fire-and-forget,触发 promptAsync 后立即返回 void
+   *   - 真实回复由 EventHandler 消费 SSE 流(message.part.delta → 回调 sendStreamChunk)
+   *
+   * 因此本方法不再返回回复内容,调用方(OpsAssistantSkill.handle)在发完 thinking 首流后
+   * 立即返回,后续流式完全由 SSE 驱动。
+   *
+   * @param {string} chatId - 会话标识(如 ops-<senderUserId>)
    * @param {string} message - 用户消息
-   * @returns {Promise<string>}
+   * @param {Object} [options]
+   * @param {Object} [options.routeCtx] - 路由上下文(必需,用于注册 SSE 路由映射)
+   *   @param {string} options.routeCtx.targetId
+   *   @param {string} options.routeCtx.senderUserId
+   *   @param {number} options.routeCtx.convType
+   *   @param {string} options.routeCtx.cardId
+   *   @param {string} options.routeCtx.streamId
+   * @returns {Promise<void>}
    */
   async sendMessage(chatId, message, options = {}) {
-    if (this.activeProcesses.get(chatId)) {
-      this.log.info(`[OpencodeRunner] chatId=${chatId} busy, queuing message`);
-      return new Promise((resolve, reject) => {
-        if (!this.processQueue.has(chatId)) {
-          this.processQueue.set(chatId, []);
-        }
-
-        const queue = this.processQueue.get(chatId);
-        const timeoutId = setTimeout(() => {
-          const idx = queue.findIndex((item) => item.resolve === resolve);
-          if (idx > -1) queue.splice(idx, 1);
-          reject(new Error('OpencodeRunner queue timeout'));
-        }, 300000);
-
-        const wrappedResolve = (value) => {
-          clearTimeout(timeoutId);
-          resolve(value);
-        };
-        const wrappedReject = (reason) => {
-          clearTimeout(timeoutId);
-          reject(reason);
-        };
-
-        queue.push({
-          message,
-          options,
-          resolve: wrappedResolve,
-          reject: wrappedReject,
-        });
-      });
+    const routeCtx = options.routeCtx;
+    if (!routeCtx) {
+      throw new Error('OpencodeRunner.sendMessage 需要 options.routeCtx(SSE 路由上下文)');
     }
 
-    return this._doSendMessage(chatId, message, false, options);
+    // 串行化:同一 chatId 的 promptAsync 按顺序触发
+    const prev = this.chatQueues.get(chatId) || Promise.resolve();
+    const run = prev.then(
+      () => this._doSendMessage(chatId, message, routeCtx),
+      () => this._doSendMessage(chatId, message, routeCtx),
+    );
+    const tail = run.then(() => undefined, () => undefined);
+    this.chatQueues.set(chatId, tail);
+    void tail.then(() => {
+      if (this.chatQueues.get(chatId) === tail) this.chatQueues.delete(chatId);
+    });
+    // 不返回执行结果(fire-and-forget 语义由调用方决定)
+    // 但若有错误需抛出,调用方可 await run
+    return run;
   }
 
-  async _doSendMessage(chatId, message, isRetry = false, options = {}) {
-    this.activeProcesses.set(chatId, true);
+  async _doSendMessage(chatId, message, routeCtx) {
+    if (!this.opencode || !this.eventHandler) {
+      throw new Error('OpencodeRunner 未初始化 SSE(请先调用 initSse)');
+    }
 
-    try {
-      const result = await this._executeOpencode(chatId, message, options);
-      setImmediate(() => this._processQueue(chatId));
-      return result;
-    } catch (err) {
-      this.log.warn(`[OpencodeRunner] chatId=${chatId} failed: ${err.message}, isRetry=${isRetry}`);
-
-      if (!isRetry) {
-        // 清除可能损坏的 session，重试一次
-        this.log.info(`[OpencodeRunner] Clearing session and retrying for chatId=${chatId}`);
-        this.sessions.delete(chatId);
+    // 复用或创建 session
+    let session = this.sessions.get(chatId);
+    if (!session) {
+      try {
+        const created = await this.opencode.createSession(`ops-assistant ${chatId}`);
+        session = { id: created.id, lastUsed: Date.now() };
+        this.sessions.set(chatId, session);
         this._saveSessions();
-
-        try {
-          const result = await this._executeOpencode(chatId, message, options);
-          setImmediate(() => this._processQueue(chatId));
-          return result;
-        } catch (retryErr) {
-          setImmediate(() => this._processQueue(chatId));
-          throw retryErr;
-        }
+        this.log.info(`[OpencodeRunner] 新建 session: ${created.id} for chatId=${chatId}`);
+      } catch (err) {
+        throw new Error(`创建会话失败: ${err.message}`);
       }
+    } else {
+      session.lastUsed = Date.now();
+      this._saveSessions();
+    }
 
-      setImmediate(() => this._processQueue(chatId));
+    const sessionId = session.id;
+
+    // 注册 SSE 路由映射(promptAsync 触发前注册,避免首个 delta 到达时无映射)
+    this.eventHandler.registerSession(sessionId, {
+      chatId,
+      targetId: routeCtx.targetId,
+      senderUserId: routeCtx.senderUserId,
+      convType: routeCtx.convType,
+      cardId: routeCtx.cardId,
+      streamId: routeCtx.streamId,
+      extra: buildStreamExtra({ cardId: routeCtx.cardId, title: '运维助手' }),
+    });
+
+    // 异步触发 prompt(fire-and-forget,真实回复由 SSE 驱动)
+    try {
+      await this.opencode.promptAsync(sessionId, message);
+    } catch (err) {
+      // 触发失败:清理刚注册的映射,抛出让调用方发错误卡片
+      // (不删除 session,避免损坏的 session 影响后续;真实损坏由下次 createSession 兜底)
+      // 注意:registerSession 已清除 sentSessions,这里只清状态
+      this.eventHandler.streamStates.delete(sessionId);
       throw err;
     }
-  }
-
-  async _processQueue(chatId) {
-    const queue = this.processQueue.get(chatId);
-    if (!queue || queue.length === 0) {
-      this.activeProcesses.delete(chatId);
-      return;
-    }
-
-    const next = queue.shift();
-    if (!next) {
-      this.activeProcesses.delete(chatId);
-      return;
-    }
-
-    try {
-      const result = await this._executeOpencode(chatId, next.message, next.options);
-      next.resolve(result);
-    } catch (err) {
-      next.reject(err);
-    } finally {
-      setImmediate(() => this._processQueue(chatId));
-    }
-  }
-
-  _executeOpencode(chatId, message, options = {}) {
-    return new Promise((resolve, reject) => {
-      const session = this.sessions.get(chatId);
-      const args = [
-        'run',
-        '--dir', this.directory,
-        '--format', 'json',
-        '--dangerously-skip-permissions',
-        '--attach', this.opencodeUrl,
-      ];
-
-      if (session) {
-        args.push('--session', session.id, '--continue');
-        this.log.info(`[OpencodeRunner] chatId=${chatId} continuing session ${session.id}`);
-      } else {
-        this.log.info(`[OpencodeRunner] chatId=${chatId} starting new session`);
-      }
-
-      if (options.model) {
-        args.push('-m', options.model);
-        this.log.info(`[OpencodeRunner] chatId=${chatId} using model ${options.model}`);
-      }
-
-      const inputLines = [];
-      if (this.systemPrompt) {
-        inputLines.push('[系统指令]');
-        inputLines.push(this.systemPrompt);
-        inputLines.push('');
-      }
-      inputLines.push('[用户消息]');
-      inputLines.push(message);
-      const input = inputLines.join('\n');
-
-      const texts = [];
-      let currentSessionId = null;
-      let stderr = '';
-      let isCompleted = false;
-
-      const isWindows = process.platform === 'win32';
-      // Windows 上 opencode 安装为 opencode.cmd，且 worker PATH 可能不完整，使用 node 同级目录的绝对路径
-      // 路径含空格，必须加引号
-      const opencodeCmd = isWindows
-        ? `"${path.join(path.dirname(process.execPath), 'opencode.cmd')}"`
-        : 'opencode';
-      this.log.info(`[OpencodeRunner] Spawning ${opencodeCmd} run for chatId=${chatId}`);
-
-      const child = spawn(opencodeCmd, args, {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: process.env,
-        shell: isWindows,
-      });
-
-      child.stdin.write(input);
-      child.stdin.end();
-
-      const timeoutId = setTimeout(() => {
-        if (isCompleted) return;
-        isCompleted = true;
-
-        this.log.warn(`[OpencodeRunner] chatId=${chatId} timeout (${this.timeout}ms), killing process`);
-        child.kill('SIGKILL');
-
-        const response = texts.join('');
-        if (response) {
-          this.log.info(`[OpencodeRunner] Returning partial response (${response.length} chars)`);
-          resolve(response);
-        } else {
-          reject(new Error('OpencodeRunner timeout'));
-        }
-      }, this.timeout);
-
-      let apiError = null;
-
-      child.stdout.on('data', (data) => {
-        if (isCompleted) return;
-
-        const lines = data.toString().split('\n').filter((l) => l.trim());
-        for (const line of lines) {
-          try {
-            const event = JSON.parse(line);
-
-            // 捕获 API 错误（如配额用完、认证失败等）
-            if (event.type === 'error' && event.error) {
-              const errMsg = event.error?.data?.message || event.error?.message || JSON.stringify(event.error);
-              this.log.warn(`[OpencodeRunner] API error event: ${errMsg.substring(0, 200)}`);
-              apiError = errMsg;
-            }
-
-            if (event.type === 'text' && event.part && event.part.text) {
-              texts.push(event.part.text);
-            }
-            if (event.sessionID && !currentSessionId) {
-              currentSessionId = event.sessionID;
-            }
-            if (event.session_id && !currentSessionId) {
-              currentSessionId = event.session_id;
-            }
-          } catch {
-            // ignore non-JSON lines
-          }
-        }
-      });
-
-      child.stderr.on('data', (data) => {
-        if (isCompleted) return;
-        const chunk = data.toString();
-        stderr += chunk;
-        // 调试：记录 stderr 输出
-        if (chunk.trim()) {
-          this.log.info(`[OpencodeRunner] stderr: ${chunk.trim().substring(0, 200)}`);
-        }
-      });
-
-      child.on('close', (code) => {
-        if (isCompleted) return;
-        isCompleted = true;
-        clearTimeout(timeoutId);
-
-        if (currentSessionId) {
-          this.sessions.set(chatId, { id: currentSessionId, lastUsed: Date.now() });
-          this._saveSessions();
-          this.log.info(`[OpencodeRunner] Session saved: ${currentSessionId} for chatId=${chatId}`);
-        }
-
-        if (code !== 0 && code !== null) {
-          this.log.warn(`[OpencodeRunner] opencode exited with code ${code}: ${stderr.slice(0, 500)}`);
-        }
-
-        const response = texts.join('');
-        if (response) {
-          resolve(response);
-        } else if (apiError) {
-          // API 返回了错误事件（配额用完、认证失败等）
-          reject(new Error(`OpenCode API 错误: ${apiError.substring(0, 150)}`));
-        } else if (stderr) {
-          reject(new Error(`OpencodeRunner failed: ${stderr.slice(0, 200)}`));
-        } else {
-          reject(new Error('OpencodeRunner returned empty response'));
-        }
-      });
-
-      child.on('error', (err) => {
-        if (isCompleted) return;
-        isCompleted = true;
-        clearTimeout(timeoutId);
-        reject(new Error(`Failed to spawn opencode: ${err.message}`));
-      });
-    });
   }
 
   /**

@@ -124,10 +124,14 @@ class BaseSkill {
 
   /**
    * 发送卡片消息（需要 messageSender 已注入）
-   * 与 openclaw-clawmessenger 对齐的 card_message 格式
+   * 与 CardKit 规范对齐：接受 CardModel
+   *   {schema:'1.0.0', id, header:{title,...}, sections:[...], config:{...}}
+   * 透传至 messageSender.sendCardMessage。
+   *
+   * B4:删除 v3 兼容期,cardData 必须是规范 CardModel(用 id 字段)。
    *
    * @param {string} targetId - 目标用户/会话 ID
-   * @param {Object} cardData - 卡片数据
+   * @param {Object} cardData - CardModel(规范)
    * @param {number} [conversationType=1] - 会话类型
    * @returns {Promise<boolean>}
    */
@@ -135,8 +139,76 @@ class BaseSkill {
     if (!this.messageSender) {
       throw new Error(`Skill ${this.name}: messageSender not injected`);
     }
-    this.log.info(`[BaseSkill.sendCard] skill=${this.name}, targetId=${targetId}, card_id=${cardData?.card_id}, template=${cardData?.template}`);
+    this.log.info(`[BaseSkill.sendCard] skill=${this.name}, targetId=${targetId}, card_id=${cardData?.id || 'unknown'}`);
     return this.messageSender.sendCardMessage(targetId, cardData, conversationType);
+  }
+
+  /**
+   * 发送卡片增量更新消息(card_update),用于分批流式推送。
+   *
+   * 首卡通过 sendCard 发出,后续批次用本方法发 card_update,小程序按 cardId 累积追加。
+   *
+   * @param {string} targetId - 目标用户/会话 ID
+   * @param {string} cardId - 首卡 ID(必须与首卡一致)
+   * @param {Object} appendData - { appendCommands?: [], appendSessions?: [] }
+   * @param {number} [conversationType=1] - 会话类型
+   * @returns {Promise<boolean>}
+   */
+  async sendCardUpdate(targetId, cardId, appendData, conversationType = 1) {
+    if (!this.messageSender) {
+      throw new Error(`Skill ${this.name}: messageSender not injected`);
+    }
+    if (typeof this.messageSender.sendCardUpdate !== 'function') {
+      this.log.warn(`[BaseSkill.sendCardUpdate] messageSender.sendCardUpdate 不存在,跳过分批推送`);
+      return false;
+    }
+    return this.messageSender.sendCardUpdate(targetId, cardId, appendData, conversationType);
+  }
+
+  /**
+   * 分批流式追加卡片内容(card_update)。
+   *
+   * 用于解决融云单条 card_message ~7KB 体积上限:首卡已通过 sendCard 发出(调用方自建),
+   * 本方法把 allItems 中 [batchSize, end) 的剩余项分批通过 card_update 增量推送,
+   * 小程序按 cardId 找到原卡片并将 appendCommands / appendSessions 累积追加到对应 section。
+   *
+   * fire-and-forget:本方法返回后后台异步推送(不阻塞调用方),每批间隔 SLEEP_MS 防止融云限流。
+   * 仅当剩余项 > 0 时启动后台循环;否则立即返回已 resolved 的 Promise(no-op)。
+   *
+   * @param {Object} opts
+   * @param {string} opts.targetId
+   * @param {number} opts.convType - 会话类型
+   * @param {string} opts.cardId - 首卡 ID(必须与首卡一致)
+   * @param {Array} opts.allItems - 完整数据项数组(含首批)
+   * @param {number} [opts.batchSize=50] - 首批/每批大小(剩余项从 index=batchSize 开始)
+   * @param {number} [opts.sleepMs=300] - 批次间隔
+   * @param {Function} opts.buildAppendData - (batchItems) => card_update 的 appendData 对象
+   * @returns {Promise<void>} 立即 resolve(后台推送不阻塞)
+   */
+  _streamRemainingBatches({
+    targetId, convType, cardId, allItems,
+    batchSize = 50, sleepMs = 300, buildAppendData,
+  }) {
+    const restCount = Math.max(0, allItems.length - batchSize);
+    if (restCount <= 0) return Promise.resolve();
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    (async () => {
+      for (let i = batchSize; i < allItems.length; i += batchSize) {
+        const batch = allItems.slice(i, i + batchSize);
+        try {
+          await this.sendCardUpdate(targetId, cardId, buildAppendData(batch), convType);
+        } catch (err) {
+          this.log.warn(`[BaseSkill._streamRemainingBatches] 批次 i=${i} 发送失败: ${err.message}`);
+        }
+        if (i + batchSize < allItems.length) {
+          await sleep(sleepMs);
+        }
+      }
+    })().catch((err) => {
+      this.log.warn(`[BaseSkill._streamRemainingBatches] 后台分批推送异常: ${err.message}`);
+    });
+    return Promise.resolve();
   }
 }
 

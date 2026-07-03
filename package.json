@@ -30,6 +30,7 @@
     "README.md"
   ],
   "dependencies": {
+    "@opencode-ai/sdk": "^1.17.13",
     "@rongcloud/imlib-next": "^5.36.6",
     "axios": "^1.15.2",
     "fake-indexeddb": "^6.2.5",

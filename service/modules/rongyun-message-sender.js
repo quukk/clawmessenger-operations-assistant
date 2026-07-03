@@ -205,24 +205,36 @@ class RongyunMessageSender {
   /**
    * 发送流式消息片段（P2P）
    * 使用融云服务端API发送 RC:StreamMsg
+   *
+   * B3:支持 StreamDelta + extra 卡片壳(规范 §8.3 两层包装),透传给 serverAPI.sendStreamPrivate。
+   * B4:删除旧纯文本 content/streamType 参数,强制 streamDelta。
+   * 调用方按状态机构造 streamDelta:
+   *   - 初始(思考中): {content:'', session_status:'thinking', seq:0, is_final:false}
+   *   - 内容流:       {content: chunk, session_status:'responding', seq:n, is_final:false}
+   *   - 最终(完成):   {content: fullText, session_status:'completed', seq:last, is_final:true}
+   *   - 失败:         {session_status:'error', is_final:true, error: msg}
+   *
    * @param {Object} options - 流式消息选项
    * @param {string} options.targetId - 目标用户ID
-   * @param {string} options.content - 消息片段内容
    * @param {string} options.streamId - 流式消息ID
-   * @param {number} options.seq - 片段序号
-   * @param {boolean} options.isFirstChunk - 是否首流
-   * @param {boolean} options.isLastChunk - 是否尾流
-   * @param {string} options.messageUID - 首流返回的messageUID（后续流使用）
+   * @param {number} [options.seq=1] - 片段序号
+   * @param {boolean} [options.isFirstChunk=false] - 是否首流
+   * @param {boolean} [options.isLastChunk=false] - 是否尾流
+   * @param {string} [options.messageUID] - 首流返回的messageUID（后续流使用）
+   * @param {Object} options.streamDelta - StreamDelta 对象(必传,序列化为 content.content)
+   * @param {Object} [options.extra] - 卡片壳对象(stream_type/card_template/card_id/title/version/actions),
+   *                                   首流写入 content.extra 让前端渲染卡片壳并续流
    * @returns {Promise<Object>} 发送结果
    */
   async sendStreamToTarget({
     targetId,
-    content,
     streamId,
     seq = 1,
     isFirstChunk = false,
     isLastChunk = false,
-    messageUID = null
+    messageUID = null,
+    streamDelta,
+    extra = null,
   }) {
     // 需要 serverAPI 支持
     if (!this.serverAPI) {
@@ -232,20 +244,20 @@ class RongyunMessageSender {
 
     try {
       const fromUserId = this.config.accountId || '';
-      
+
       const result = await this.serverAPI.sendStreamPrivate({
         fromUserId,
         toUserId: targetId,
-        content,
         streamId,
         isFirstChunk,
         isLastChunk,
         seq,
-        streamType: 'text',
-        messageUID
+        messageUID,
+        streamDelta,
+        extra,
       });
 
-      this.log?.info(`[RongyunMessageSender] 流式消息已发送: seq=${seq}, first=${isFirstChunk}, last=${isLastChunk}`);
+      this.log?.info(`[RongyunMessageSender] 流式消息已发送: seq=${seq}, first=${isFirstChunk}, last=${isLastChunk}, status=${streamDelta?.session_status || 'n/a'}`);
       return result;
     } catch (err) {
       this.log?.error(`[RongyunMessageSender] 发送流式消息失败: ${err.message}`);
@@ -263,21 +275,26 @@ class RongyunMessageSender {
 
   /**
    * 发送卡片消息（P2P）
-   * 与 openclaw-clawmessenger 对齐的 card_message 格式
+   * 与 CardKit 规范对齐：接受规范 CardModel
+   *   {schema:'1.0.0', id, header:{title,...}, sections:[...], config:{...}}
+   *
+   * B4:删除 v3 兼容期,cardData 必须是规范 CardModel(用 id 字段)。统一包装为
+   * msg_type:'card_message' 经 sendMessage 路由,小程序按 schema/header/sections 渲染规范卡。
+   *
    * @param {string} targetId - 目标用户ID
-   * @param {Object} cardData - 卡片数据（version, card_id, template, title, description, actions, state, metadata）
+   * @param {Object} cardData - CardModel(规范)
    * @param {number} [conversationType=1] - 会话类型（1=单聊, 3=群聊）
    * @returns {Promise<boolean>}
    */
   async sendCardMessage(targetId, cardData, conversationType = 1) {
-    // 对齐 openclaw-clawmessenger：包装 msg_type + timestamp，经 sendMessage 路由
+    // 包装 msg_type + timestamp,经 sendMessage 路由
     if (!this.rongcloudClient?.isConnected) {
       this.log?.error('[RongyunMessageSender] 未连接，无法发送卡片消息');
       return false;
     }
 
     try {
-      // 对齐 openclaw-clawmessenger：包装 msg_type + timestamp，经 sendMessage 路由
+      // 规范 CardModel 直接透传,仅补 msg_type + timestamp
       const payload = {
         ...cardData,
         msg_type: 'card_message',
@@ -290,7 +307,7 @@ class RongyunMessageSender {
       );
 
       if (result) {
-        this.log?.info(`[RongyunMessageSender] 卡片消息(client)已发送 -> ${targetId}, card_id=${cardData.card_id || 'unknown'}`);
+        this.log?.info(`[RongyunMessageSender] 卡片消息(client)已发送 -> ${targetId}, card_id=${cardData.id || 'unknown'}`);
       } else {
         this.log?.warn(`[RongyunMessageSender] 卡片消息发送失败 -> ${targetId}`);
       }
@@ -298,6 +315,59 @@ class RongyunMessageSender {
       return result;
     } catch (err) {
       this.log?.error(`[RongyunMessageSender] 发送卡片消息异常: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * 发送卡片增量更新消息(P2P)。
+   *
+   * 用于分批流式推送:首张卡片用 sendCardMessage 发出,后续批次用本方法发 card_update,
+   * 小程序按 cardId 找到原卡片并将 appendCommands / appendSessions 累积追加到对应 section。
+   *
+   * 载荷契约(与前端约定):
+   *   { msg_type:'card_update', cardId, appendCommands?: CommandItem[], appendSessions?: SessionItem[] }
+   *
+   * 复用与 sendCardMessage 相同的 sendMessage 路由,仅 msg_type 设为 'card_update'
+   * (rongcloud-client.sendMessage 已对 card_update 做显式对象构造,与 card_message 同构)。
+   *
+   * @param {string} targetId - 目标用户ID
+   * @param {string} cardId - 首张卡片 ID(必须与首卡一致,前端按此合并)
+   * @param {Object} appendData - 增量字段 { appendCommands?: [], appendSessions?: [] }
+   * @param {number} [conversationType=1] - 会话类型
+   * @returns {Promise<boolean>}
+   */
+  async sendCardUpdate(targetId, cardId, appendData, conversationType = 1) {
+    if (!this.rongcloudClient?.isConnected) {
+      this.log?.error('[RongyunMessageSender] 未连接，无法发送卡片更新');
+      return false;
+    }
+
+    try {
+      const payload = {
+        msg_type: 'card_update',
+        cardId,
+        timestamp: Date.now(),
+        ...appendData,
+      };
+      const result = await this.rongcloudClient.sendMessage(
+        targetId,
+        JSON.stringify(payload),
+        conversationType
+      );
+
+      if (result) {
+        const summary = [];
+        if (appendData.appendCommands) summary.push(`+${appendData.appendCommands.length} cmd`);
+        if (appendData.appendSessions) summary.push(`+${appendData.appendSessions.length} sess`);
+        this.log?.info(`[RongyunMessageSender] card_update 已发送 -> ${targetId}, cardId=${cardId}, ${summary.join(' ')}`);
+      } else {
+        this.log?.warn(`[RongyunMessageSender] card_update 发送失败 -> ${targetId}, cardId=${cardId}`);
+      }
+
+      return result;
+    } catch (err) {
+      this.log?.error(`[RongyunMessageSender] 发送 card_update 异常: ${err.message}`);
       return false;
     }
   }

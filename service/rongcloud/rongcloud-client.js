@@ -60,6 +60,20 @@ class RongCloudClient {
         }
 
         this.log?.info(`[RongCloudClient] CardMessage type: ${typeof this.CardMessage}, isFunction: ${typeof this.CardMessage === 'function'}`);
+
+        // B1: CardKit 相关自定义消息类型注册
+        // 对齐 opencode-clawmessenger/src/rongcloud/card-transport.ts 的传输约定。
+        //   - card_update: 卡片更新(本地替换),持久化+计数(与 card_message 一致,允许离线补发)
+        //   - card_action: 按钮点击回传(小程序→插件),非持久化、不计数(瞬时交互,无需漫游)
+        //   - command_result: 按钮处理确认 / 流式 delta 载体,非持久化、不计数(已有白名单但此前未注册为自定义类型)
+        this.CardUpdate = RongIMLib.registerMessageType('card_update', true, true);
+        this.log?.info('[RongCloudClient] card_update 自定义消息类型已注册');
+
+        this.CardAction = RongIMLib.registerMessageType('card_action', false, false);
+        this.log?.info('[RongCloudClient] card_action 自定义消息类型已注册');
+
+        this.CommandResult = RongIMLib.registerMessageType('command_result', false, false);
+        this.log?.info('[RongCloudClient] command_result 自定义消息类型已注册');
       } else {
         this.log?.warn('[RongCloudClient] SDK 不支持 registerMessageType');
       }
@@ -81,7 +95,7 @@ class RongCloudClient {
       RongIMLib.addEventListener(RongIMLib.Events?.MESSAGES || 'MESSAGES', (event) => {
         this.log?.info(`[RongCloudClient] MESSAGES 事件触发, messages长度=${event?.messages?.length || 0}`);
         event.messages?.forEach(msg => {
-          this.log?.info(`[RongCloudClient] MESSAGES 单条消息: messageType=${msg.messageType}, senderUserId=${msg.senderUserId}, conversationType=${msg.conversationType}, isOffLineMessage=${msg.isOffLineMessage}, messageDirection=${msg.messageDirection}`);
+          this.log?.debug(`[RongCloudClient] MESSAGES 单条消息: messageType=${msg.messageType}, senderUserId=${msg.senderUserId}, conversationType=${msg.conversationType}, isOffLineMessage=${msg.isOffLineMessage}, messageDirection=${msg.messageDirection}`);
           this.handleReceivedMessage(msg);
         });
       });
@@ -111,7 +125,7 @@ class RongCloudClient {
 
       RongIMLib.setOnReceiveMessageListener({
         onReceived: (message) => {
-          this.log?.info(`[RongCloudClient] onReceived: messageType=${message.messageType}, senderUserId=${message.senderUserId}, conversationType=${message.conversationType}, isOffLineMessage=${message.isOffLineMessage}, messageDirection=${message.messageDirection}`);
+          this.log?.debug(`[RongCloudClient] onReceived: messageType=${message.messageType}, senderUserId=${message.senderUserId}, conversationType=${message.conversationType}, isOffLineMessage=${message.isOffLineMessage}, messageDirection=${message.messageDirection}`);
           this.handleReceivedMessage(message);
         }
       });
@@ -138,32 +152,40 @@ class RongCloudClient {
   }
 
   handleReceivedMessage(message) {
-    // 最外层日志：确保任何消息到达都能留下痕迹（在过滤之前）
-    this.log?.info(`[RongCloudClient] handleReceivedMessage 入口: messageType=${message.messageType}, senderUserId=${message.senderUserId}, conversationType=${message.conversationType}, isOffLineMessage=${message.isOffLineMessage}, messageDirection=${message.messageDirection}, messageUId=${message.messageUId}`);
+    // ============================================================
+    // 过滤阶段：所有过滤判断提前到日志之前，命中即静默 return（仅 debug）
+    // 这样离线消息风暴中 messageDirection===1 / 自发 / 已处理 的消息
+    // 在生产 INFO 级别下完全不产生日志，避免淹没业务日志。
+    // ============================================================
 
     // 1. 过滤自己发送的消息（融云 SDK 可能将发送消息回传）
     // messageDirection: 1=发送, 2=接收
     if (message.messageDirection === 1) {
-      this.log?.info('[RongCloudClient] 过滤自己发送的消息 (messageDirection=1)');
+      this.log?.debug('[RongCloudClient] 过滤自己发送的消息 (messageDirection=1)');
       return;
     }
     if (message.senderUserId === this.config.accountId) {
-      this.log?.info(`[RongCloudClient] 过滤自己发送的消息 (senderUserId=${message.senderUserId} === accountId=${this.config.accountId})`);
+      this.log?.debug(`[RongCloudClient] 过滤自己发送的消息 (senderUserId=${message.senderUserId} === accountId=${this.config.accountId})`);
       return;
     }
 
-    // 2.5 通过发送缓存过滤：融云 SDK 回传自己消息时，messageDirection/senderUserId 可能不一致
+    // 2. 通过发送缓存过滤：融云 SDK 回传自己消息时，messageDirection/senderUserId 可能不一致
     if (message.messageUId && this.sentMessageUIds.has(message.messageUId)) {
-      this.log?.info(`[RongCloudClient] 过滤自己发送的消息 (messageUId=${message.messageUId} 在发送缓存中)`);
+      this.log?.debug(`[RongCloudClient] 过滤自己发送的消息 (messageUId=${message.messageUId} 在发送缓存中)`);
       return;
     }
 
     // 3. 消息去重：防止同一条消息被多次触发（融云重推或多端同步）
     const dedupKey = message.messageUId || `${message.senderUserId}-${message.sentTime}-${message.messageType}`;
     if (this.processedMessageUIds.has(dedupKey)) {
-      this.log?.info(`[RongCloudClient] 消息去重过滤: dedupKey=${dedupKey}`);
+      this.log?.debug(`[RongCloudClient] 消息去重过滤: dedupKey=${dedupKey}`);
       return;
     }
+
+    // 过滤全部通过：此处之后才是真正进入业务处理的消息。
+    // 入口 trace 降级为 debug（仅排查时使用），业务日志保持 INFO。
+    this.log?.debug(`[RongCloudClient] handleReceivedMessage 入口: messageType=${message.messageType}, senderUserId=${message.senderUserId}, conversationType=${message.conversationType}, isOffLineMessage=${message.isOffLineMessage}, messageDirection=${message.messageDirection}, messageUId=${message.messageUId}`);
+
     this.processedMessageUIds.add(dedupKey);
     if (this.processedMessageUIds.size > this.messageDedupMaxSize) {
       const first = this.processedMessageUIds.values().next().value;
@@ -259,13 +281,14 @@ class RongCloudClient {
         ? (RongIMLib.ConversationType?.GROUP || ConversationType.GROUP)
         : (RongIMLib.ConversationType?.PRIVATE || ConversationType.PRIVATE);
 
-      // 检测 card_message：对齐 openclaw-clawmessenger 的 msg_type 路由模式
+      // 检测 card_message / card_update:对齐自定义消息类型路由
+      // card_update 复用与 card_message 相同的显式对象构造方式(已注册为 card_update 类型)
       let messageContent = new RongIMLib.TextMessage({ content });
       try {
         const parsed = JSON.parse(content);
-        if (parsed && parsed.msg_type === 'card_message') {
-          this.log?.info('[RongCloudClient] sendMessage 检测到 card_message');
-          if (this.CardMessage) {
+        if (parsed && (parsed.msg_type === 'card_message' || parsed.msg_type === 'card_update')) {
+          const mt = parsed.msg_type;
+          if (mt === 'card_message' && this.CardMessage) {
             try {
               const cardMsg = new this.CardMessage(parsed);
               this.log?.info(`[RongCloudClient] CardMessage objectName=${cardMsg.objectName || '(empty)'}, messageType=${cardMsg.messageType || '(empty)'}, has content=${!!cardMsg.content}`);
@@ -275,11 +298,11 @@ class RongCloudClient {
           }
           // 绕过构造函数的 polyfill 兼容写法：显式构造自定义消息对象
           messageContent = {
-            objectName: 'card_message',
-            messageType: 'card_message',
+            objectName: mt,
+            messageType: mt,
             content: parsed,
           };
-          this.log?.info('[RongCloudClient] 使用显式 card_message 对象');
+          this.log?.info(`[RongCloudClient] 使用显式 ${mt} 对象`);
         }
       } catch (_) { /* not JSON, use text */ }
 

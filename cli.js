@@ -67,14 +67,59 @@ function isPortInUse(port) {
   return null;
 }
 
+function killProcessTree(pid) {
+  if (process.platform === 'win32') {
+    try {
+      execSync(`taskkill /F /PID ${pid} /T 2>nul`, { stdio: 'ignore', timeout: 10000, windowsHide: true });
+      return true;
+    } catch { return false; }
+  } else {
+    try { process.kill(pid, 'SIGTERM'); return true; }
+    catch { return false; }
+  }
+}
+
 function runDaemon() {
-  // 前置检查：如果 28765 已被占用，说明已有 Daemon/Worker 在运行，避免多实例竞争
   const PORT = process.env.SILENT_SERVICE_PORT ? parseInt(process.env.SILENT_SERVICE_PORT, 10) : 28765;
+
+  // 步骤 1: 按 PID 文件找到旧 daemon，杀整个进程树(含 worker 子进程)
+  const pidFilePaths = [
+    path.join(process.env.ProgramData || 'C:\\ProgramData', SERVICE_NAME, 'daemon.pid'),
+    path.join(os.tmpdir(), `.${SERVICE_NAME}.pid`),
+  ];
+  let killed = false;
+  for (const pf of pidFilePaths) {
+    try {
+      const raw = fs.readFileSync(pf, 'utf8').trim();
+      const pid = parseInt(raw, 10);
+      if (pid && pid > 0 && pid !== process.pid) {
+        console.log(`[CLI] 发现旧 daemon PID=${pid}(文件 ${pf}),正在清理...`);
+        killProcessTree(pid);
+        try { fs.unlinkSync(pf); } catch {}
+        killed = true;
+      }
+    } catch {}
+  }
+
+  // 步骤 2: 兜底——按端口反查并杀占用进程
   const existingPid = isPortInUse(PORT);
   if (existingPid) {
-    console.log(`[CLI] 端口 ${PORT} 已被进程 ${existingPid} 占用，推测 Daemon 已在运行，跳过启动`);
-    console.log(`[CLI] 如需重启，请先停止现有实例：taskkill /F /PID ${existingPid}`);
-    process.exit(0);
+    console.log(`[CLI] 端口 ${PORT} 被进程 ${existingPid} 占用,正在清理...`);
+    killProcessTree(existingPid);
+    killed = true;
+  }
+
+  // 步骤 3: 等端口释放(Windows TCP 释放有延迟)
+  if (killed) {
+    for (let i = 0; i < 20; i++) {
+      if (!isPortInUse(PORT)) break;
+      if (i === 0) console.log(`[CLI] 等待端口 ${PORT} 释放...`);
+      execSync('timeout /t 1 /nobreak >nul 2>&1', { stdio: 'ignore', timeout: 2000 });
+    }
+    if (isPortInUse(PORT)) {
+      console.error(`[CLI] 端口 ${PORT} 仍被占用,请手动清理后重试`);
+      process.exit(1);
+    }
   }
 
   console.log('[CLI] 启动 Daemon...');

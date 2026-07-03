@@ -11,8 +11,21 @@ const axios = require('axios');
 const { BaseSkill } = require('../base-skill');
 const { OpencodeRunner } = require('../../opencode/opencode-runner');
 const { RongyunMessageTypeEnum } = require('../../modules/rongyun-message-types');
+// CardKit 规范卡片构造器(B2:v3 硬编码卡片迁移至 builders)
+const {
+  card, md, note, divider, buttons, btn, action,
+  sessionList, commandPalette,
+} = require('../../cardkit/builders');
+// B3:StreamDelta + extra 卡片壳构造器(抽离至 stream-builders,供 event-handler 共享)
+const { buildStreamDelta, buildStreamExtra } = require('./stream-builders');
 
 const execAsync = promisify(exec);
+
+// ============================================================================
+// B3:StreamDelta + extra 卡片壳构造器已抽离至 ./stream-builders.js
+// (event-handler.js 与本文件共享,避免循环依赖)
+// 状态机覆盖:thinking → responding → completed(以及 error)
+// ============================================================================
 
 class OpsAssistantSkill extends BaseSkill {
   constructor(options) {
@@ -91,10 +104,12 @@ class OpsAssistantSkill extends BaseSkill {
 
     const opencodeUrl = this.config.opencodeUrl || process.env.CLAW_OPENCODE_URL || 'http://127.0.0.1:4096';
     const timeout = this.config.opencodeTimeout || parseInt(process.env.CLAW_OPENCODE_TIMEOUT, 10) || 120000; // 默认 2 分钟
+    const password = process.env.OPENCODE_SERVER_PASSWORD || null;
 
     this.runner = new OpencodeRunner({
       directory: opencodeDir,
       opencodeUrl,
+      password,
       timeout,
       sessionFile: path.join(
         process.env.CLAW_OPS_SESSION_FILE || path.join(require('os').homedir(), '.config', 'opencode'),
@@ -103,11 +118,33 @@ class OpsAssistantSkill extends BaseSkill {
       log: this.log,
     });
 
+    // 初始化 SSE 真实流式(注入本 skill 的流式发送回调)
+    // 失败不阻断 init:EventHandler 内部会后台重连,降级时 promptAsync 会抛错由 handle() catch
+    try {
+      await this.runner.initSse({
+        sendStreamChunk: (targetId, streamId, isFirstChunk, isLastChunk, seq, opts) =>
+          this._sendStreamChunk(targetId, streamId, isFirstChunk, isLastChunk, seq, opts),
+        sendFinalCard: (ctx) =>
+          this._sendFinalCard(ctx),
+        sendErrorCard: (ctx) =>
+          this._sendErrorCard(ctx),
+      });
+    } catch (err) {
+      this.log.error(`[OpsAssistant] SSE 初始化失败,流式将降级: ${err.message}`);
+    }
+
     this.log.info('[OpsAssistant] Initialized');
   }
 
   async destroy() {
-    // OpencodeRunner 无长时间运行资源，无需额外清理
+    // 停止 SSE 事件循环(EventHandler 内部清理 streamStates/队列)
+    if (this.runner && this.runner.eventHandler) {
+      try {
+        this.runner.eventHandler.stop();
+      } catch (err) {
+        this.log.warn(`[OpsAssistant] EventHandler.stop 异常: ${err.message}`);
+      }
+    }
     this.log.info('[OpsAssistant] Destroyed');
   }
 
@@ -200,69 +237,52 @@ class OpsAssistantSkill extends BaseSkill {
     }
 
     const cardId = `card-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const streamId = `stream-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
     try {
-      // 1. 发送初始流式卡片（与 openclaw-clawmessenger 对齐）
-      await this.sendCard(replyTarget, {
-        version: 3,
-        card_id: cardId,
-        template: 'ai_streaming',
-        title: '运维助手',
-        description: '正在思考...',
-        actions: [
-          {
-            id: 'stop',
-            label: '停止',
-            action: 'stop_stream',
-            style: 'danger',
-            payload: { __card_id__: cardId },
-          },
-        ],
-        metadata: {
-          session_id: `ops-assistant-${senderUserId}`,
-          is_streaming: true,
-        },
-      }, convType);
+      // 1. 发送初始静态卡片(规范 CardModel,thinking 占位)
+      //    按钮停止由前端在 StreamDelta 协议层处理(action.type='none' 占位)
+      await this.sendCard(replyTarget, card(cardId, '运维助手', [
+        md('正在思考...'),
+        buttons([
+          btn('停止', action.none(), { id: 'stop', variant: 'danger' }),
+        ], 'inline'),
+        note(`session_id: ops-assistant-${senderUserId}`),
+      ], { color: 'blue' }), convType);
 
-      // 2. 使用 senderUserId 作为 chatId，实现单用户会话隔离
+      // 2. 使用 senderUserId 作为 chatId,实现单用户会话隔离
       const chatId = `ops-${senderUserId}`;
 
-      // 如果用户通过 /session-use 指定了会话，注入到 runner 使其复用历史
+      // 如果用户通过 /session-use 指定了会话,注入到 runner 使其复用历史
       const userSessionId = this.userSessions.get(senderUserId);
       if (userSessionId) {
         this.runner.sessions.set(chatId, { id: userSessionId, lastUsed: Date.now() });
         this.log.info(`[OpsAssistant] 注入用户会话 ${userSessionId} 到 runner chatId=${chatId}`);
       }
 
-      const options = {};
-      const preferredModel = this.userModels.get(senderUserId);
-      if (preferredModel) options.model = preferredModel;
-      const reply = await this.runner.sendMessage(chatId, content, options);
+      // 3. 异步触发 prompt(fire-and-forget)。
+      //    真实回复由 EventHandler 消费 SSE 流(message.part.delta)驱动,
+      //    通过回调 _sendStreamChunk / _sendFinalCard / _sendErrorCard 发送。
+      //    这里只等 promptAsync 触发成功(若触发失败,catch 发错误卡片);
+      //    触发成功后立即返回,不阻塞主流程。
+      const routeCtx = {
+        targetId: replyTarget,
+        senderUserId,
+        convType,
+        cardId,
+        streamId,
+      };
+      await this.runner.sendMessage(chatId, content, { routeCtx });
 
-      // 3. 流式发送回复 + 最终卡片
-      await this._sendStreamResponse(replyTarget, reply, requestId, convType, cardId, senderUserId);
-
-      this.log.info(`[OpsAssistant] Reply sent to ${replyTarget}, length=${reply.length}`);
+      this.log.info(`[OpsAssistant] promptAsync 已触发: chatId=${chatId}, cardId=${cardId}, streamId=${streamId}(后续流式由 SSE 驱动)`);
     } catch (err) {
       this.log.error(`[OpsAssistant] Failed to handle message: ${err.message}`);
 
-      // 执行失败时发送错误卡片
-      await this.sendCard(replyTarget, {
-        version: 3,
-        card_id: cardId,
-        template: 'ai_streaming',
-        title: '运维助手',
-        description: `执行失败：${err.message}`,
-        state: {
-          status: 'error',
-          result: `执行失败：${err.message}`,
-        },
-        actions: [],
-        metadata: {
-          session_id: `ops-assistant-${senderUserId}`,
-          is_streaming: false,
-        },
-      }, convType);
+      // 执行失败时发送错误卡片(规范 CardModel)
+      await this.sendCard(replyTarget, card(cardId, '运维助手', [
+        md(`**执行失败**\n${err.message}`),
+        note(`session_id: ops-assistant-${senderUserId}`),
+      ], { color: 'red' }), convType);
     }
   }
 
@@ -313,71 +333,89 @@ class OpsAssistantSkill extends BaseSkill {
   }
 
   /**
-   * 流式发送完整回复
+   * 发送最终持久化卡片(session.idle 完成时由 EventHandler 回调)。
+   *
+   * SSE 真实流式架构下,真实增量(token 级)已由 message.part.delta 逐片发送,
+   * completed 终态(is_final)也已在 EventHandler._handleSessionIdle 中发送。
+   * 这里只负责:
+   *   1. 最终持久化卡片(规范 CardModel,card_id 复用,作为历史记录)
+   *   2. command 历史消息(兼容旧前端)
+   *
+   * @param {Object} ctx
+   * @param {string} ctx.targetId
+   * @param {number} ctx.convType
+   * @param {string} ctx.senderUserId
+   * @param {string} ctx.cardId
+   * @param {string} ctx.fullContent
    */
-  async _sendStreamResponse(targetId, fullResponse, requestId, convType, cardId, senderUserId) {
+  async _sendFinalCard(ctx) {
+    const { targetId, convType, senderUserId, cardId, fullContent } = ctx;
     const accountId = this.config.accountId || '';
-    const streamId = `stream-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    let seq = 0;
-    let hasSentChunk = false;
-    const chunkSize = 50;
 
-    // 1. 按 chunkSize 切片流式发送
-    for (let i = 0; i < fullResponse.length; i += chunkSize) {
-      const chunk = fullResponse.slice(i, i + chunkSize);
-      seq += 1;
-      const isFirstChunk = seq === 1;
-      await this._sendStreamChunk(targetId, chunk, streamId, isFirstChunk, false, seq);
-      hasSentChunk = true;
-    }
-
-    // 2. 发送尾流标记
-    if (hasSentChunk) {
-      seq += 1;
-      await this._sendStreamChunk(targetId, '', streamId, false, true, seq);
-    }
-
-    // 3. 发送最终持久化卡片（与 openclaw-clawmessenger 对齐）
+    // 最终持久化卡片(规范 CardModel,card_id 复用)
     try {
-      await this.sendCard(targetId, {
-        version: 3,
-        card_id: cardId,
-        template: 'ai_streaming',
-        title: '运维助手',
-        description: fullResponse,
-        state: {
-          status: 'completed',
-          result: fullResponse,
-          completed_at: Date.now(),
-        },
-        actions: [],
-        metadata: {
-          session_id: `ops-assistant-${senderUserId}`,
-          is_streaming: false,
-        },
-      }, convType);
+      await this.sendCard(targetId, card(cardId, '运维助手', [
+        md(fullContent || '(空回复)'),
+        note(`session_id: ops-assistant-${senderUserId}`),
+      ], { color: 'blue' }), convType);
     } catch (cardErr) {
       this.log.warn(`[OpsAssistant] 发送最终卡片失败: ${cardErr.message}`);
     }
 
-    // 4. 同时发送完整的 command 消息作为历史记录（兼容旧前端）
-    await this.sendReply(targetId, {
-      status: 'success',
-      message: 'Response received',
-      content: fullResponse,
-      request_id: requestId,
-      node_id: accountId,
-    }, requestId);
+    // command 历史消息(兼容旧前端)
+    try {
+      await this.sendReply(targetId, {
+        status: 'success',
+        message: 'Response received',
+        content: fullContent || '',
+        request_id: '',
+        node_id: accountId,
+      });
+    } catch (replyErr) {
+      this.log.warn(`[OpsAssistant] 发送 command 历史消息失败: ${replyErr.message}`);
+    }
   }
 
   /**
-   * 发送单个流式消息片段
+   * 发送错误卡片(session.error 时由 EventHandler 回调)。
+   * @param {Object} ctx
+   * @param {string} ctx.targetId
+   * @param {number} ctx.convType
+   * @param {string} ctx.senderUserId
+   * @param {string} ctx.cardId
+   * @param {string} ctx.error
    */
-  async _sendStreamChunk(targetId, content, streamId, isFirstChunk, isLastChunk, seq) {
+  async _sendErrorCard(ctx) {
+    const { targetId, convType, senderUserId, cardId, error } = ctx;
+    try {
+      await this.sendCard(targetId, card(cardId, '运维助手', [
+        md(`**执行失败**\n${error}`),
+        note(`session_id: ops-assistant-${senderUserId}`),
+      ], { color: 'red' }), convType);
+    } catch (cardErr) {
+      this.log.warn(`[OpsAssistant] 发送错误卡片失败: ${cardErr.message}`);
+    }
+  }
+
+  /**
+   * 发送单个流式消息片段(B3:带 StreamDelta + extra;B4:删除旧 content 参数)
+   *
+   * @param {string} targetId 目标用户/会话 ID
+   * @param {string} streamId 流 ID
+   * @param {boolean} isFirstChunk 是否首流(决定是否写 extra)
+   * @param {boolean} isLastChunk 是否尾流(决定 complete 标志)
+   * @param {number} seq 序号
+   * @param {Object} [opts]
+   * @param {Object} [opts.streamDelta] StreamDelta 对象(必传)
+   * @param {Object} [opts.extra] extra 卡片壳(仅首流写)
+   */
+  async _sendStreamChunk(targetId, streamId, isFirstChunk, isLastChunk, seq, opts = {}) {
     if (!this.messageSender) {
       this.log.warn('[OpsAssistant] messageSender not injected, skip stream chunk');
       return;
     }
+
+    const { streamDelta = null, extra = null } = opts;
 
     // 使用队列确保流式消息片段串行发送
     this._streamQueue = this._streamQueue.then(async () => {
@@ -385,12 +423,13 @@ class OpsAssistantSkill extends BaseSkill {
         const messageUID = this._streamMessageUIDs.get(streamId);
         const result = await this.messageSender.sendStreamToTarget({
           targetId,
-          content,
           streamId,
           seq,
           isFirstChunk,
           isLastChunk,
           messageUID,
+          streamDelta,
+          extra,
         });
 
         // 首流时存储 messageUID
@@ -524,17 +563,17 @@ class OpsAssistantSkill extends BaseSkill {
             }
             // 去除 ANSI 转义码
             output = output.replace(/\x1b\[[0-9;]*m/g, '');
-            await this.sendCard(targetId, {
-              version: 3,
-              card_id: `card-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-              template: 'ai_streaming',
-              title: `MCP ${args}`,
-              description: output.length > 3000 ? output.substring(0, 3000) + '\n\n---\n*输出已截断*' : output,
-              actions: [
-                { id: 'mcp-back', label: '← 返回管理', action: 'send_text', payload: { text: '/mcp' } },
+            await this.sendCard(targetId, card(
+              `card-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+              `MCP ${args}`,
+              [
+                md(output.length > 3000 ? output.substring(0, 3000) + '\n\n---\n*输出已截断*' : output),
+                buttons([
+                  btn('← 返回管理', action.command('mcp'), { id: 'mcp-back' }),
+                ], 'inline'),
               ],
-              metadata: { session_id: `ops-assistant-${senderUserId}`, is_streaming: false },
-            }, convType);
+              { color: 'blue' },
+            ), convType);
             return undefined; // card already sent
           }
           // 无子命令：显示管理卡片
@@ -661,7 +700,10 @@ class OpsAssistantSkill extends BaseSkill {
   }
 
   /**
-   * 发送模型列表卡片（全部模型，不再分页）
+   * 发送模型列表卡片(分批流式:首卡 50 个 + card_update 增量追加剩余)。
+   *
+   * 用户共 337 个模型,融云单条 card_message ~7KB(50 项约 4.4KB 安全,337 项触发 code 20115)。
+   * 方案:首卡发前 50 个,剩余用 card_update 异步分批推送,前端累积追加到 commandPalette。
    */
   async _sendModelsPage(targetId, convType, senderUserId) {
     const allModels = this.userModelLists.get(senderUserId);
@@ -673,39 +715,46 @@ class OpsAssistantSkill extends BaseSkill {
 
     const currentModel = this.userModels.get(senderUserId) || '';
 
-    // RongCloud 自定义消息上限 ~32KB，321 个模型全量 ~47KB 超限
-    // 截断到 50 个（~7KB），剩余通过搜索 /models-search 获取
-    const MAX_ACTIONS = 50;
-    const displayModels = allModels.slice(0, MAX_ACTIONS);
-    const remaining = allModels.length - MAX_ACTIONS;
-    const actions = displayModels.map((model, index) => ({
-      id: `m${index}`,
-      label: model,
-      action: 'send_text',
-      payload: { text: `/use-model ${model}` },
-    }));
+    const MAX_MODELS = 50;
+    const displayModels = allModels.slice(0, MAX_MODELS);
 
-    let desc = `当前模型：${currentModel || '未选择'} | 默认: opencode`;
-    if (remaining > 0) {
-      desc += ` | 共${allModels.length}个模型，已显示${MAX_ACTIONS}个，搜索查看更多`;
-    }
+    // 首卡说明:告知总数 + 正在加载。剩余批次后台异步推送,前端累积追加。
+    const total = allModels.length;
+    const loading = total > MAX_MODELS ? '，正在加载剩余…' : '';
+    const desc = `当前模型：${currentModel || '未选择'} | 默认: opencode | 共 ${total} 个模型（显示前 ${MAX_MODELS} 个${loading}）`;
 
-    const cardData = {
-      version: 3,
-      card_id: `card-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-      template: 'ai_streaming',
-      title: `可用模型列表 (共 ${allModels.length} 个)`,
-      description: desc,
-      actions,
-      metadata: {
-        session_id: `ops-assistant-${senderUserId}`,
-        is_streaming: false,
-        is_model_list: true,
-        current_model: currentModel,
-      },
-    };
+    const commands = displayModels.map((model) => ({ name: `use-model ${model}`, description: '' }));
+
+    /** @type {import('../../cardkit/schema').CardSection[]} */
+    const sections = [
+      note(desc),
+      divider(),
+      commandPalette({ commands, searchCommand: 'models-search' }),
+    ];
+
+    // 稳定 cardId:首卡与后续 card_update 共用,前端按 cardId 累积合并
+    const cardId = `card-models-${senderUserId}-${Date.now()}`;
+    const cardData = card(
+      cardId,
+      `可用模型列表 (共 ${total} 个)`,
+      sections,
+      { color: 'blue', icon: '🤖' },
+    );
 
     await this.sendCard(targetId, cardData, convType);
+
+    // 分批流式追加剩余模型(fire-and-forget,不阻塞)
+    this._streamRemainingBatches({
+      targetId,
+      convType,
+      cardId,
+      allItems: allModels,
+      batchSize: MAX_MODELS,
+      sleepMs: 300,
+      buildAppendData: (batch) => ({
+        appendCommands: batch.map((model) => ({ name: `use-model ${model}`, description: '' })),
+      }),
+    });
   }
 
   /**
@@ -726,52 +775,65 @@ class OpsAssistantSkill extends BaseSkill {
   /**
    * 发送模型搜索结果卡片
    */
+  /**
+   * 发送模型搜索结果卡片(防御性分批:匹配超 50 时同样流式追加)。
+   */
   async _sendModelsSearchResults(targetId, convType, senderUserId, keyword, models) {
-    const limitedModels = models.slice(0, 50);
     const currentModel = this.userModels.get(senderUserId) || '';
 
-    const cardData = {
-      version: 3,
-      card_id: `card-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-      template: 'ai_streaming',
-      title: '模型搜索结果',
-      description: `当前模型：${currentModel || '未选择'} | 搜索 "${keyword}" 找到 ${models.length} 个模型`,
-      actions: limitedModels.map((model, index) => ({
-        id: `model-${index}`,
-        label: model,
-        action: 'send_text',
-        payload: { text: `/use-model ${model}` },
-      })),
-      metadata: {
-        session_id: `ops-assistant-${senderUserId}`,
-        is_streaming: false,
-        is_model_list: true,
-        is_model_search: true,
-        current_model: currentModel,
-      },
-    };
+    // 搜索结果通常远少于 50,但防御性截断以防极端情况触发融云体积上限。
+    // 超过 50 时启用分批流式追加(逻辑同 _sendModelsPage)。
+    const MAX_MODELS = 50;
+    const displayModels = models.slice(0, MAX_MODELS);
+    const commands = displayModels.map((model) => ({ name: `use-model ${model}`, description: '' }));
+
+    const total = models.length;
+    const loading = total > MAX_MODELS ? `（显示前 ${MAX_MODELS} 个，正在加载剩余…）` : '';
+    /** @type {import('../../cardkit/schema').CardSection[]} */
+    const sections = [
+      note(`当前模型：${currentModel || '未选择'} | 搜索 "${keyword}" 找到 ${total} 个模型${loading}`),
+      divider(),
+      commandPalette({ commands, searchCommand: 'models-search' }),
+    ];
+
+    const cardId = `card-models-search-${senderUserId}-${Date.now()}`;
+    const cardData = card(
+      cardId,
+      '模型搜索结果',
+      sections,
+      { color: 'blue', icon: '🔍' },
+    );
 
     await this.sendCard(targetId, cardData, convType);
+
+    this._streamRemainingBatches({
+      targetId,
+      convType,
+      cardId,
+      allItems: models,
+      batchSize: MAX_MODELS,
+      sleepMs: 300,
+      buildAppendData: (batch) => ({
+        appendCommands: batch.map((model) => ({ name: `use-model ${model}`, description: '' })),
+      }),
+    });
   }
 
   /**
    * 发送 MCP 管理交互式卡片
    */
   async _sendMcpCard(targetId, convType, senderUserId) {
-    const cardData = {
-      version: 3,
-      card_id: `card-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-      template: 'ai_streaming',
-      title: 'MCP 管理',
-      description: '管理 Model Context Protocol 服务器',
-      actions: [
-        { id: 'mcp-list', label: '列表', action: 'send_text', payload: { text: '/mcp list' } },
+    const cardData = card(
+      `card-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      'MCP 管理',
+      [
+        md('管理 Model Context Protocol 服务器'),
+        buttons([
+          btn('列表', action.command('mcp list'), { id: 'mcp-list' }),
+        ], 'inline'),
       ],
-      metadata: {
-        session_id: `ops-assistant-${senderUserId}`,
-        is_streaming: false,
-      },
-    };
+      { color: 'blue', icon: '🔧' },
+    );
 
     await this.sendCard(targetId, cardData, convType);
   }
@@ -825,95 +887,131 @@ class OpsAssistantSkill extends BaseSkill {
       return;
     }
 
-    // 限制数量避免卡片过大（与 models 一致）
+    // 融云体积上限:首卡发前 50 个会话,剩余用 card_update 异步分批推送。
     const MAX_SESSIONS = 50;
     const displaySessions = sessions.slice(0, MAX_SESSIONS);
+
     const currentSessionId = this.userSessions.get(senderUserId) || '';
     const currentSession = currentSessionId
       ? displaySessions.find((s) => s.id === currentSessionId)
       : null;
     const currentSessionTitle = currentSession ? currentSession.title : '';
 
-    // 每个 session 一个 action（前端下拉框：点击切换，右侧删除按钮）
-    // 只显示标题，不在这里加 ✓ 前缀（前端通过 current_session_id 高亮）
-    const actions = [];
-    for (const s of displaySessions) {
-      actions.push({
-        id: `session-${s.id}`,
-        label: s.title,
-        sublabel: s.updated || '',
-        action: 'send_text',
-        payload: {
-          text: `/session-use ${s.id}`,
-          sessionId: s.id,
-          sessionTitle: s.title,
-        },
-      });
-    }
+    // sessionList session 对象字段为 {id, title, updatedAt?}(前端 SectionSessionList 读 updatedAt,
+    // 并按 section.currentSessionId 高亮当前会话)。将缓存里的 updated → updatedAt。
+    const listSessions = displaySessions.map((s) => ({
+      id: s.id,
+      title: s.title,
+      ...(s.updated ? { updatedAt: s.updated } : {}),
+    }));
 
-    const cardData = {
-      version: 3,
-      card_id: `card-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-      template: 'ai_streaming',
-      title: `会话列表 (共 ${sessions.length} 个${sessions.length > MAX_SESSIONS ? `，显示前 ${MAX_SESSIONS}` : ''})`,
-      description: currentSessionTitle ? `当前会话：${currentSessionTitle}` : '未指定会话',
-      actions,
-      metadata: {
-        session_id: `ops-assistant-${senderUserId}`,
-        is_streaming: false,
-        is_session_list: true,
-        current_session_id: currentSessionId,
-        current_session_title: currentSessionTitle,
-      },
-    };
+    const total = sessions.length;
+    const loading = total > MAX_SESSIONS ? `，正在加载剩余…` : '';
+
+    /** @type {import('../../cardkit/schema').CardSection[]} */
+    const sections = [
+      note(currentSessionTitle ? `当前会话：${currentSessionTitle}` : '未指定会话'),
+      divider(),
+      sessionList({
+        sessions: listSessions,
+        searchCommand: 'session-search',
+        ...(currentSessionId ? { currentSessionId } : {}),
+      }),
+    ];
+
+    // 稳定 cardId:首卡与后续 card_update 共用
+    const cardId = `card-sessions-${senderUserId}-${Date.now()}`;
+    const cardData = card(
+      cardId,
+      `会话列表 (共 ${total} 个，显示前 ${MAX_SESSIONS} 个${loading})`,
+      sections,
+      { color: 'blue', icon: '💬' },
+    );
 
     await this.sendCard(targetId, cardData, convType);
+
+    // 分批流式追加剩余会话(fire-and-forget)
+    this._streamRemainingBatches({
+      targetId,
+      convType,
+      cardId,
+      allItems: sessions,
+      batchSize: MAX_SESSIONS,
+      sleepMs: 300,
+      buildAppendData: (batch) => ({
+        appendSessions: batch.map((s) => ({
+          id: s.id,
+          title: s.title,
+          ...(s.updated ? { updatedAt: s.updated } : {}),
+        })),
+      }),
+    });
   }
 
   /**
    * 发送会话搜索结果卡片
    */
+  /**
+   * 发送会话搜索结果卡片(防御性分批:匹配超 50 时同样流式追加)。
+   */
   async _sendSessionSearchResults(targetId, convType, senderUserId, keyword, sessions) {
-    const limitedSessions = sessions.slice(0, 50);
+    // 与 _sendSessionCard 同构,统一用 sessionList;updated → updatedAt。
+    // 搜索结果通常远少于 50,但防御性截断以防极端情况触发融云体积上限。
+    // 超过 50 时启用分批流式追加(逻辑同 _sendSessionCard)。
+    const MAX_SESSIONS = 50;
+    const displaySessions = sessions.slice(0, MAX_SESSIONS);
+
     const currentSessionId = this.userSessions.get(senderUserId) || '';
     const currentSession = currentSessionId
-      ? limitedSessions.find((s) => s.id === currentSessionId)
+      ? displaySessions.find((s) => s.id === currentSessionId)
       : null;
     const currentSessionTitle = currentSession ? currentSession.title : '';
 
-    const actions = [];
-    for (const s of limitedSessions) {
-      actions.push({
-        id: `session-${s.id}`,
-        label: s.title,
-        sublabel: s.updated || '',
-        action: 'send_text',
-        payload: {
-          text: `/session-use ${s.id}`,
-          sessionId: s.id,
-          sessionTitle: s.title,
-        },
-      });
-    }
+    const listSessions = displaySessions.map((s) => ({
+      id: s.id,
+      title: s.title,
+      ...(s.updated ? { updatedAt: s.updated } : {}),
+    }));
 
-    const cardData = {
-      version: 3,
-      card_id: `card-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-      template: 'ai_streaming',
-      title: '会话搜索结果',
-      description: `搜索 "${keyword}" 找到 ${sessions.length} 个会话`,
-      actions,
-      metadata: {
-        session_id: `ops-assistant-${senderUserId}`,
-        is_streaming: false,
-        is_session_list: true,
-        is_session_search: true,
-        current_session_id: currentSessionId,
-        current_session_title: currentSessionTitle,
-      },
-    };
+    const total = sessions.length;
+    const loading = total > MAX_SESSIONS ? `（显示前 ${MAX_SESSIONS} 个，正在加载剩余…）` : '';
+
+    /** @type {import('../../cardkit/schema').CardSection[]} */
+    const sections = [
+      note(`搜索 "${keyword}" 找到 ${total} 个会话${loading}${currentSessionTitle ? ` | 当前：${currentSessionTitle}` : ''}`),
+      divider(),
+      sessionList({
+        sessions: listSessions,
+        searchCommand: 'session-search',
+        ...(currentSessionId ? { currentSessionId } : {}),
+      }),
+    ];
+
+    const cardId = `card-sessions-search-${senderUserId}-${Date.now()}`;
+    const cardData = card(
+      cardId,
+      '会话搜索结果',
+      sections,
+      { color: 'blue', icon: '🔍' },
+    );
 
     await this.sendCard(targetId, cardData, convType);
+
+    this._streamRemainingBatches({
+      targetId,
+      convType,
+      cardId,
+      allItems: sessions,
+      batchSize: MAX_SESSIONS,
+      sleepMs: 300,
+      buildAppendData: (batch) => ({
+        appendSessions: batch.map((s) => ({
+          id: s.id,
+          title: s.title,
+          ...(s.updated ? { updatedAt: s.updated } : {}),
+        })),
+      }),
+    });
   }
 
   /**
@@ -1002,40 +1100,35 @@ class OpsAssistantSkill extends BaseSkill {
       return;
     }
 
-    const actions = [];
-    for (const p of providers) {
-      // 提供商名称按钮
-      actions.push({
-        id: `prov-${p.name}`,
-        label: p.name,
-        action: 'send_text',
-        payload: { text: p.isLoggedIn ? `/providers-logout ${p.name}` : `/providers-login ${p.name}` },
-      });
+    const loggedInCount = providers.filter((p) => p.isLoggedIn).length;
 
-      // 登录/登出按钮
-      actions.push({
-        id: `prov-action-${p.name}`,
-        label: p.isLoggedIn ? '登出' : '登录',
-        action: 'send_text',
-        style: p.isLoggedIn ? 'danger' : undefined,
-        payload: { text: p.isLoggedIn ? `/providers-logout ${p.name}` : `/providers-login ${p.name}` },
+    /** @type {import('../../cardkit/schema').CardSection[]} */
+    const sections = [
+      note(`共 ${providers.length} 个提供商，${loggedInCount} 个已登录`),
+      divider(),
+    ];
+    for (const p of providers) {
+      const cmd = p.isLoggedIn ? `providers-logout ${p.name}` : `providers-login ${p.name}`;
+      const actionLabel = p.isLoggedIn ? '登出' : '登录';
+      sections.push({
+        kind: 'buttonRow',
+        buttons: [
+          btn(p.name, action.command(cmd), { id: `prov-${p.name}` }),
+          btn(actionLabel, action.command(cmd), {
+            id: `prov-action-${p.name}`,
+            variant: p.isLoggedIn ? 'danger' : 'primary',
+          }),
+        ],
+        layout: 'inline',
       });
     }
 
-    const loggedInCount = providers.filter((p) => p.isLoggedIn).length;
-
-    const cardData = {
-      version: 3,
-      card_id: `card-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-      template: 'ai_streaming',
-      title: '提供商管理',
-      description: `共 ${providers.length} 个提供商，${loggedInCount} 个已登录`,
-      actions,
-      metadata: {
-        session_id: `ops-assistant-${senderUserId}`,
-        is_streaming: false,
-      },
-    };
+    const cardData = card(
+      `card-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      '提供商管理',
+      sections,
+      { color: 'blue', icon: '🔌' },
+    );
 
     await this.sendCard(targetId, cardData, convType);
   }

@@ -13,6 +13,45 @@ const { RongyunMessageTypeEnum } = require('./rongyun-message-types');
 const { createOpencodeSession, deleteOpencodeSession, forwardChatMessage, getOrCreateGatewaySession } = require('./opencode-service');
 const { getMacAddress } = require('./mac-address');
 const { getApiBaseUrl } = require('../config');
+// CardKit 规范卡片构造器(B2:v3 硬编码卡片迁移)
+const { card, md, note, buttons, btn, action } = require('../cardkit/builders');
+
+// ============================================================================
+// B3:StreamDelta + extra 卡片壳构造器(规范 CARD-SPEC.md §7-8,与 ops-assistant 同构)
+// ============================================================================
+
+/**
+ * 构造 StreamDelta 对象(规范 §7,作为 RC:StreamMsg content.content 载荷)。
+ * @param {Object} p
+ * @param {string} [p.content] 本片段文本内容(增量)
+ * @param {string} p.sessionStatus 会话状态机当前态(thinking/responding/completed/error/...)
+ * @param {number} p.seq 序号
+ * @param {boolean} [p.isFinal=false] 是否终态
+ * @param {string} [p.error] 错误信息
+ */
+function buildStreamDelta({ content, sessionStatus, seq, isFinal = false, error }) {
+  const delta = { session_status: sessionStatus, seq };
+  if (content !== undefined && content !== null) delta.content = content;
+  if (isFinal) delta.is_final = true;
+  if (error) delta.error = error;
+  return delta;
+}
+
+/**
+ * 构造 RC:StreamMsg 的 extra 卡片壳(规范 §8.3)。
+ * card_id 必须与初始静态卡一致,前端据此续流。
+ */
+function buildStreamExtra({ cardId, title = 'AI 助手', actions }) {
+  const extra = {
+    stream_type: 'card',
+    card_template: 'ai_streaming',
+    card_id: cardId,
+    title,
+    version: '1.0.0',
+  };
+  if (actions) extra.actions = actions;
+  return extra;
+}
 
 // 客服会话存储（内存缓存，生产环境建议用 Redis）
 const serviceSessions = new Map();
@@ -88,17 +127,25 @@ class RongyunMessageHandler {
 
   /**
    * 发送流式消息片段（直接调用融云 API）
+   * B3:支持 StreamDelta + extra 卡片壳(规范 §8.3 两层包装),透传给 serverAPI.sendStreamPrivate。
+   * B4:删除旧纯文本 content 参数,日志改用 streamDelta.content 预览。
+   *
    * @param {string} fromUserId - 发送者ID
    * @param {string} targetId - 目标用户ID
-   * @param {string} content - 消息内容
    * @param {string} streamId - 流式消息ID
    * @param {boolean} isFirstChunk - 是否首流
    * @param {boolean} isLastChunk - 是否尾流
    * @param {number} seq - 片段序号
+   * @param {Object} [opts={}]
+   * @param {Object} [opts.streamDelta] StreamDelta 对象(必传)
+   * @param {Object} [opts.extra] 卡片壳(仅首流写)
    */
-  async _sendStreamChunk(fromUserId, targetId, content, streamId, isFirstChunk, isLastChunk, seq = 1) {
-    const contentPreview = typeof content === 'string' ? content.substring(0, 100) : JSON.stringify(content).substring(0, 100);
-    this.logInfo(`[RongyunMessageHandler] _sendStreamChunk: target=${targetId}, streamId=${streamId}, seq=${seq}, first=${isFirstChunk}, last=${isLastChunk}, content_len=${content?.length || 0}`);
+  async _sendStreamChunk(fromUserId, targetId, streamId, isFirstChunk, isLastChunk, seq = 1, opts = {}) {
+    const { streamDelta = null, extra = null } = opts;
+    const contentPreview = (streamDelta && typeof streamDelta.content === 'string')
+      ? streamDelta.content.substring(0, 100)
+      : '';
+    this.logInfo(`[RongyunMessageHandler] _sendStreamChunk: target=${targetId}, streamId=${streamId}, seq=${seq}, first=${isFirstChunk}, last=${isLastChunk}, status=${streamDelta?.session_status || 'n/a'}, content_len=${streamDelta?.content?.length || 0}, preview=${contentPreview}`);
 
     if (!this.serverAPI) {
       this.logWarn('[RongyunMessageHandler] _sendStreamChunk skipped: serverAPI not configured');
@@ -114,12 +161,13 @@ class RongyunMessageHandler {
         const result = await this.serverAPI.sendStreamPrivate({
           fromUserId,
           toUserId: targetId,
-          content,
           streamId,
           isFirstChunk,
           isLastChunk,
           seq,
-          messageUID
+          messageUID,
+          streamDelta,
+          extra,
         });
 
         // 首流时存储 RongCloud 返回的 messageUID
@@ -260,29 +308,28 @@ class RongyunMessageHandler {
     const fromUserId = this.config.accountId || '';
 
     try {
-      // 发送初始流式卡片（与 openclaw-clawmessenger 对齐）
-      await this._sendCardMessage(sourceId, {
-        version: 3,
-        card_id: cardId,
-        template: 'ai_streaming',
-        title: 'AI 助手',
-        description: '正在思考...',
-        actions: [
-          {
-            id: 'stop',
-            label: '停止',
-            action: 'stop_stream',
-            style: 'danger',
-            payload: { __card_id__: cardId },
-          },
-        ],
-        metadata: {
-          session_id: `chat-${sourceId}`,
-          is_streaming: true,
-        },
-      });
+      // 发送初始流式卡片(规范 CardModel)
+      //    B2:用 md + buttons 字段对齐规范;B3:停止按钮 action.type='none'(占位,实际停止由前端 StreamDelta 处理)
+      await this._sendCardMessage(sourceId, card(cardId, 'AI 助手', [
+        md('正在思考...'),
+        buttons([
+          btn('停止', action.none(), { id: 'stop', variant: 'danger' }),
+        ], 'inline'),
+        note(`session_id: chat-${sourceId}`),
+      ], { color: 'blue' }));
 
-      // 原有的流式转发逻辑
+      // B3:extra 卡片壳(与上面初始静态卡同 card_id,前端续流依赖)
+      const extra = buildStreamExtra({ cardId, title: 'AI 助手' });
+
+      // B3:发送 thinking 态首流(空 content,seq=0)
+      //    让前端进入"思考中"渲染,extra 壳让前端定位到初始静态卡续流
+      await this._sendStreamChunk(fromUserId, sourceId, streamId, true, false, 0, {
+        streamDelta: buildStreamDelta({ content: '', sessionStatus: 'thinking', seq: 0 }),
+        extra,
+      });
+      hasSentChunk = true;
+
+      // 原有的流式转发逻辑(B3:delta 回调中发 responding 态 StreamDelta)
       await forwardChatMessage(sessionId, content, async (delta) => {
         fullResponse += delta;
         buffer += delta;
@@ -294,10 +341,10 @@ class RongyunMessageHandler {
           const chunkToSend = buffer;
           buffer = ''; // 清空缓冲区
 
-          // 首流时发送首流标记
-          const isFirstChunk = seq === 1;
-          await this._sendStreamChunk(fromUserId, sourceId, chunkToSend, streamId, isFirstChunk, false, seq);
-          hasSentChunk = true;
+          // responding 态增量片段(extra 仅首流已发,此处不传)
+          await this._sendStreamChunk(fromUserId, sourceId, streamId, false, false, seq, {
+            streamDelta: buildStreamDelta({ content: chunkToSend, sessionStatus: 'responding', seq }),
+          });
         }
       }, (level, message) => {
         if (level === 'ERROR') {
@@ -309,40 +356,27 @@ class RongyunMessageHandler {
         }
       }, chatTimeoutMs);
 
-      // 发送剩余缓冲区内容
+      // 发送剩余缓冲区内容(responding 态)
       if (buffer.length > 0) {
         seq += 1;
-        const isFirstChunk = seq === 1;
-        await this._sendStreamChunk(fromUserId, sourceId, buffer, streamId, isFirstChunk, false, seq);
-        hasSentChunk = true;
+        await this._sendStreamChunk(fromUserId, sourceId, streamId, false, false, seq, {
+          streamDelta: buildStreamDelta({ content: buffer, sessionStatus: 'responding', seq }),
+        });
         buffer = '';
       }
 
-      // 发送尾流标记
-      if (hasSentChunk) {
-        seq += 1;
-        await this._sendStreamChunk(fromUserId, sourceId, '', streamId, false, true, seq);
-      }
+      // B3:发送 completed 终态尾流(is_final,完整 content)
+      seq += 1;
+      await this._sendStreamChunk(fromUserId, sourceId, streamId, false, true, seq, {
+        streamDelta: buildStreamDelta({ content: fullResponse, sessionStatus: 'completed', seq, isFinal: true }),
+      });
 
-      // 发送最终持久化卡片（与 openclaw-clawmessenger 对齐）
+      // 发送最终持久化卡片(规范 CardModel)
       try {
-        await this._sendCardMessage(sourceId, {
-          version: 3,
-          card_id: cardId,
-          template: 'ai_streaming',
-          title: 'AI 助手',
-          description: fullResponse,
-          state: {
-            status: 'completed',
-            result: fullResponse,
-            completed_at: Date.now(),
-          },
-          actions: [],
-          metadata: {
-            session_id: `chat-${sourceId}`,
-            is_streaming: false,
-          },
-        });
+        await this._sendCardMessage(sourceId, card(cardId, 'AI 助手', [
+          md(fullResponse),
+          note(`session_id: chat-${sourceId}`),
+        ], { color: 'blue' }));
       } catch (cardErr) {
         this.logWarn(`[RongyunMessageHandler] 发送最终卡片失败: ${cardErr.message}`);
       }
@@ -361,10 +395,18 @@ class RongyunMessageHandler {
       const msg = e instanceof Error ? e.message : String(e);
       this.logError(`聊天消息处理异常: ${msg}`);
 
-      // 如果已经开始流式发送，发送错误标记
+      // B3:如果已经开始流式发送,发 error 终态 StreamDelta(is_final)
       if (hasSentChunk) {
         seq += 1;
-        await this._sendStreamChunk(fromUserId, sourceId, `[错误] 转发失败: ${msg}`, streamId, false, true, seq);
+        await this._sendStreamChunk(fromUserId, sourceId, streamId, false, true, seq, {
+          streamDelta: buildStreamDelta({
+            content: `[错误] 转发失败: ${msg}`,
+            sessionStatus: 'error',
+            seq,
+            isFinal: true,
+            error: msg,
+          }),
+        });
       }
 
       await this.sendResponse(RongyunMessageTypeEnum.CHAT_MESSAGE, {
@@ -668,6 +710,7 @@ class RongyunMessageHandler {
 
   /**
    * 发送卡片消息（与 openclaw-clawmessenger 对齐）
+   * B4:cardData 必须是规范 CardModel(用 id 字段),删除 v3 card_id 兼容。
    */
   async _sendCardMessage(targetId, cardData) {
     if (!this.messageSender) {
@@ -677,7 +720,7 @@ class RongyunMessageHandler {
 
     try {
       await this.messageSender.sendCardMessage(targetId, cardData);
-      this.logInfo(`卡片消息已发送 -> ${targetId}, card_id=${cardData.card_id || 'unknown'}`);
+      this.logInfo(`卡片消息已发送 -> ${targetId}, card_id=${cardData?.id || 'unknown'}`);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       this.logError(`发送卡片消息失败: ${msg}`);

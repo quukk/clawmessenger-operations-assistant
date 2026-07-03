@@ -1,30 +1,55 @@
 /**
- * OpencodeRunner 单元测试（纯 Node.js assert，mock child_process）
+ * OpencodeRunner 单元测试(SSE 异步真实流式版)
+ *
+ * 旧版测试的是 spawn CLI + sendMessage 返回 Promise<string>;
+ * 新版 sendMessage 改为 fire-and-forget,真实回复由 SSE 驱动。
+ *
+ * 本测试用 mock OpencodeClient + mock EventHandler 验证:
+ *   1. sendMessage 复用/创建 session
+ *   2. sendMessage 触发 opencode.promptAsync
+ *   3. sendMessage 注册 SSE 路由映射(registerSession)
+ *   4. session 持久化(sessions.json)
+ *   5. clearSession 清理
  */
 const assert = require('assert');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
-// 保存原始 spawn
-const originalSpawn = require('child_process').spawn;
+/** mock OpencodeClient:记录调用,不真实连 SDK */
+function createMockOpencodeClient() {
+  const calls = { createSession: [], promptAsync: [] };
+  let sessionCounter = 0;
+  return {
+    calls,
+    async createSession() {
+      sessionCounter += 1;
+      const id = `mock-sess-${sessionCounter}`;
+      calls.createSession.push(id);
+      return { id };
+    },
+    async promptAsync(sessionId, text) {
+      calls.promptAsync.push({ sessionId, text });
+    },
+    async subscribeGlobalEvents() {
+      return { stream: (async function* noop() {})() };
+    },
+  };
+}
 
-// 创建一个简单的 EventEmitter 替代
-function createMockChild() {
-  const { EventEmitter } = require('events');
-  const child = new EventEmitter();
-  child.stdin = {
-    written: [],
-    write(data) { this.written.push(data); },
-    end() { this.ended = true; },
+/** mock EventHandler:记录 registerSession 调用 */
+function createMockEventHandler() {
+  const registrations = [];
+  return {
+    isRunning: true,
+    streamStates: new Map(),
+    registrations,
+    registerSession(sessionId, ctx) {
+      registrations.push({ sessionId, ctx });
+    },
+    async start() {},
+    stop() {},
   };
-  child.stdout = new EventEmitter();
-  child.stderr = new EventEmitter();
-  child.kill = (signal) => {
-    child.killedSignal = signal;
-    setImmediate(() => child.emit('close', 0));
-  };
-  return child;
 }
 
 async function run() {
@@ -36,85 +61,77 @@ async function run() {
 
   const sessionFile = path.join(tmpDir, 'sessions.json');
 
-  // mock spawn
-  let spawnedArgs = null;
-  let spawnedEnv = null;
-  const mockChild = createMockChild();
-
-  const childProcess = require('child_process');
-  childProcess.spawn = (cmd, args, opts) => {
-    spawnedArgs = args;
-    spawnedEnv = opts.env;
-
-    // 模拟异步输出
-    setTimeout(() => {
-      mockChild.stdout.emit('data', JSON.stringify({ type: 'text', part: { text: 'Hello ' } }) + '\n');
-      mockChild.stdout.emit('data', JSON.stringify({ type: 'text', part: { text: 'world' } }) + '\n');
-      mockChild.stdout.emit('data', JSON.stringify({ sessionID: 'sess-123' }) + '\n');
-      mockChild.emit('close', 0);
-    }, 10);
-
-    return mockChild;
-  };
-
-  const { OpencodeRunner } = require('../../service/opencode/opencode-runner');
-
-  const logs = [];
   const mockLog = {
     info: () => {},
     warn: () => {},
     error: () => {},
-    debug: (msg) => logs.push(msg),
+    debug: () => {},
   };
+
+  const { OpencodeRunner } = require('../../service/opencode/opencode-runner');
 
   const runner = new OpencodeRunner({
     directory: opencodeDir,
-    opencodeUrl: 'http://127.0.0.1:19877',
-    timeout: 10000,
+    opencodeUrl: 'http://127.0.0.1:4096',
     sessionFile,
     log: mockLog,
   });
 
-  // 1. 测试首次调用会生成正确参数
-  const result = await runner.sendMessage('chat-1', 'hi');
-  assert.strictEqual(result, 'Hello world', '应返回拼接后的完整回复');
-  assert.ok(spawnedArgs.includes('run'), '应调用 opencode run');
-  assert.ok(spawnedArgs.includes('--dir'), '应包含 --dir 参数');
-  assert.ok(spawnedArgs.includes('--format'), '应包含 --format 参数');
-  assert.ok(spawnedArgs.includes('json'), '应使用 json 格式');
+  // 注入 mock(跳过 initSse 的真实 SDK 加载)
+  runner.opencode = createMockOpencodeClient();
+  runner.eventHandler = createMockEventHandler();
+  runner._sseStarted = true;
 
-  // 2. 测试 session 持久化
-  assert.ok(fs.existsSync(sessionFile), 'session 文件应被创建');
-  const sessionData = JSON.parse(fs.readFileSync(sessionFile, 'utf8'));
-  assert.strictEqual(sessionData.sessions['chat-1'].id, 'sess-123', 'session 应被保存');
-
-  // 3. 测试第二次调用带 --continue
-  const mockChild2 = createMockChild();
-  childProcess.spawn = (cmd, args) => {
-    spawnedArgs = args;
-    setTimeout(() => {
-      mockChild2.stdout.emit('data', JSON.stringify({ type: 'text', part: { text: 'continued' } }) + '\n');
-      mockChild2.emit('close', 0);
-    }, 10);
-    return mockChild2;
+  const routeCtx = {
+    targetId: 'user-1',
+    senderUserId: 'user-1',
+    convType: 1,
+    cardId: 'card-1',
+    streamId: 'stream-1',
   };
 
-  await runner.sendMessage('chat-1', 'hi again');
-  assert.ok(spawnedArgs.includes('--continue'), '第二次调用应包含 --continue');
-  assert.ok(spawnedArgs.includes('sess-123'), '第二次调用应使用已保存的 session ID');
+  // 1. 首次调用:应创建 session + 触发 promptAsync + 注册路由
+  await runner.sendMessage('chat-1', 'hello', { routeCtx });
 
-  // 恢复 spawn
-  childProcess.spawn = originalSpawn;
+  assert.strictEqual(runner.opencode.calls.createSession.length, 1, '应创建 1 个 session');
+  assert.strictEqual(runner.opencode.calls.promptAsync.length, 1, '应触发 1 次 promptAsync');
+  assert.strictEqual(runner.opencode.calls.promptAsync[0].text, 'hello');
+  assert.strictEqual(runner.eventHandler.registrations.length, 1, '应注册 1 次路由');
+  assert.strictEqual(runner.eventHandler.registrations[0].ctx.cardId, 'card-1');
+
+  const createdSessionId = runner.opencode.calls.createSession[0];
+
+  // 2. session 持久化
+  assert.ok(fs.existsSync(sessionFile), 'session 文件应被创建');
+  const sessionData = JSON.parse(fs.readFileSync(sessionFile, 'utf8'));
+  assert.strictEqual(sessionData.sessions['chat-1'].id, createdSessionId, 'session 应被保存');
+
+  // 3. 第二次调用同一 chatId:应复用 session(不再 createSession)
+  await runner.sendMessage('chat-1', 'hi again', { routeCtx });
+  assert.strictEqual(runner.opencode.calls.createSession.length, 1, '复用 session,不应再次 createSession');
+  assert.strictEqual(runner.opencode.calls.promptAsync.length, 2, '应再次触发 promptAsync');
+  assert.strictEqual(runner.opencode.calls.promptAsync[1].sessionId, createdSessionId, '复用同一 sessionId');
+
+  // 4. clearSession
+  runner.clearSession('chat-1');
+  assert.ok(!runner.sessions.has('chat-1'), 'clearSession 应删除内存映射');
+  const sessionData2 = JSON.parse(fs.readFileSync(sessionFile, 'utf8'));
+  assert.ok(!sessionData2.sessions['chat-1'], 'clearSession 应删除持久化');
+
+  // 5. sendMessage 缺少 routeCtx 应抛错
+  await assert.rejects(
+    () => runner.sendMessage('chat-2', 'x'),
+    /routeCtx/,
+    '缺少 routeCtx 应抛错',
+  );
 
   // 清理
   fs.rmSync(tmpDir, { recursive: true, force: true });
 
-  console.log('✓ OpencodeRunner tests passed');
+  console.log('✓ OpencodeRunner tests passed (SSE async mode)');
 }
 
 run().catch((err) => {
-  // 确保恢复 spawn
-  require('child_process').spawn = originalSpawn;
   console.error('✗ OpencodeRunner tests failed:', err);
   process.exit(1);
 });

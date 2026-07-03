@@ -17,6 +17,8 @@ const { DeviceRegistration } = require('./modules/device-registration');
 const { getServerUrl, getAppKey, getApiBaseUrl } = require('./config');
 const { SkillLoader } = require('./skills/skill-loader');
 const { SkillRouter } = require('./skills/skill-router');
+// CardKit(B1 基础设施):按钮点击回传入口,实际处理逻辑 B2 接入
+const { dispatchCardAction } = require('./cardkit-action-dispatcher');
 
 const log = createLogger('worker');
 const PORT = process.env.SILENT_SERVICE_PORT ? parseInt(process.env.SILENT_SERVICE_PORT, 10) : 28765;
@@ -454,6 +456,14 @@ async function initRongCloud() {
   // 创建融云服务端API客户端（用于发送流式消息）
   const serverAPI = new RongCloudServerAPI(configManager, log);
 
+  // 启动预热：强制拉取一次融云 appKey/appSecret 并缓存，避免后续每条消息流都请求后端配置接口
+  try {
+    await serverAPI.refreshRongCloudConfig();
+    log.info('[WORKER] 融云 appKey/appSecret 已缓存');
+  } catch (err) {
+    log.error(`[WORKER] 融云 appKey/appSecret 预热失败: ${err.message}`);
+  }
+
   // 创建消息发送器
   const messageSender = new RongyunMessageSender(rongcloudClient, rongcloudConfig, log);
   messageSender.setServerAPI(serverAPI); // 注入 serverAPI，支持发送流式消息
@@ -574,6 +584,10 @@ async function initRongCloud() {
 
         // 协议消息（非聊天类）始终由旧的 RongyunMessageHandler 处理，不进入 Skill 框架
         // 避免 device_status_request 等消息被路由到 ops-assistant 触发 AI 卡片
+        // B1: card_action / card_update / command_result 加入白名单
+        //   - card_action: 小程序点击卡片按钮回传,由 CardActionDispatcher 处理(B1 骨架,B2 接真实逻辑)
+        //   - card_update: 卡片更新指令(插件侧发送,小程序消费;白名单内避免进 Skill 框架)
+        //   - command_result: 按钮处理确认 / 流式 delta 推送载体(双向)
         const protocolMessageTypes = [
           'device_status_request',
           'device_status_report',
@@ -590,8 +604,113 @@ async function initRongCloud() {
           'service_chat_response',
           'command',
           'command_result',
+          'card_action',
+          'card_update',
         ];
         const isProtocolMessage = protocolMessageTypes.includes(parsed.msg_type);
+
+        // B1/B2: card_action 单独入口 —— 按钮点击回传走 CardActionDispatcher
+        // 不进入 Skill 框架(避免触发 AI 回复),也不走旧 RongyunMessageHandler(它不认识 card_action)
+        // B2:注入完整依赖(reinjectMessage/sendCommandResult/opencodeRunner),接真实处理逻辑
+        if (parsed.msg_type === 'card_action') {
+          sendReadReceiptForMessage(msg);
+          try {
+            const actionMsg = {
+              cardId: messageData.cardId,
+              buttonId: messageData.buttonId,
+              action: messageData.action,
+              request_id: messageData.request_id,
+              timestamp: messageData.timestamp,
+            };
+            const senderId = messageData.source_im_id || messageData.senderUserId || messageData.targetId || '';
+            const targetId = messageData.targetId || senderId;
+            const conversationTypeVal = messageData.conversationType || msg.conversationType || 1;
+
+            // reinjectMessage:把命令文本作为新入站消息塞回 SkillRouter 路径
+            //   关键:不经过 card_action 分支(那是独立 msg_type),所以不会无限递归 dispatcher
+            //   路由到 ops-assistant(fallback skill)的 _executeCommand 处理快捷命令
+            const reinjectMessage = async (text, msgCtx = {}) => {
+              const reinjectSenderId = msgCtx.senderId || senderId;
+              const reinjectTargetId = msgCtx.targetId || targetId;
+              const reinjectConvType = msgCtx.conversationType || conversationTypeVal;
+              const messageContext = {
+                msgType: 'service_chat_message', // 触发 OpsAssistantSkill.match 的 msg_type 分支
+                content: text,
+                senderUserId: reinjectSenderId,
+                targetId: reinjectTargetId,
+                conversationType: reinjectConvType,
+                data: {
+                  content: text,
+                  source_im_id: reinjectSenderId,
+                  targetId: reinjectTargetId,
+                  conversationType: reinjectConvType,
+                },
+                rawMsg: null, // 重注入无需原始融云消息
+                config: rongcloudConfig,
+              };
+              log.info(`[WORKER] reinjectMessage: text="${text}", from=${reinjectSenderId}, chatId=${msgCtx.chatId || '(none)'}`);
+              if (skillRouter) {
+                await skillRouter.route(messageContext);
+              } else {
+                log.warn('[WORKER] skillRouter 不可用,reinject 消息被丢弃');
+              }
+            };
+
+            // sendCommandResult:回 command_result 让前端按钮清 loading
+            //   用 messageSender 的 rongcloudClient 直接发 JSON(与 sendProtocolMessage 同模式)
+            const sendCommandResult = async (result) => {
+              const { cardId, requestId, success, updateType, cardState, targetId: tId, conversationType: cType } = result;
+              if (!rongcloudClient || !rongcloudClient.isConnected) {
+                log.warn('[WORKER] command_result 发送跳过:融云未连接');
+                return;
+              }
+              const payload = JSON.stringify({
+                msg_type: 'command_result',
+                card_id: cardId,
+                request_id: requestId || '',
+                success,
+                update_type: updateType || 'action_done',
+                card_state: cardState || { status: success ? 'completed' : 'error' },
+                timestamp: Math.floor(Date.now() / 1000),
+              });
+              try {
+                await rongcloudClient.sendMessage(tId, payload, cType || 1);
+              } catch (err) {
+                log.warn(`[WORKER] command_result 发送失败: ${err.message}`);
+              }
+            };
+
+            await dispatchCardAction(actionMsg, {
+              chatId: `ops-${senderId}`, // 与 OpsAssistantSkill.handle 的 chatId 约定一致
+              senderId,
+              targetId,
+              conversationType: conversationTypeVal,
+              rawMsg: msg,
+              reinjectMessage,
+              sendCommandResult,
+              rongcloudClient,
+              opencodeRunner: fallbackSkill ? fallbackSkill.runner : null,
+              deleteOpencodeSession: (sessionId) => {
+                // 通过 opencode CLI 删除会话(与 OpsAssistantSkill._handleSessionDelete 一致)
+                try {
+                  const { execSync } = require('child_process');
+                  execSync(`opencode session delete ${sessionId}`, {
+                    timeout: 30000,
+                    windowsHide: true,
+                    cwd: fallbackSkill ? path.join(__dirname, 'skills', 'ops-assistant', 'opencode-workdir') : process.cwd(),
+                  });
+                  return Promise.resolve(true);
+                } catch (e) {
+                  log.warn(`[WORKER] deleteOpencodeSession 失败: ${e.message}`);
+                  return Promise.resolve(false);
+                }
+              },
+            });
+          } catch (err) {
+            log.error(`[WORKER] CardActionDispatcher 处理异常: ${err.message}`);
+          }
+          return;
+        }
 
         // 根据 ENABLE_SKILL_FRAMEWORK 决定使用 Skill 框架还是旧的消息处理器
         if (enableSkillFramework && skillRouter && !isProtocolMessage && !msg.isOffLineMessage) {
