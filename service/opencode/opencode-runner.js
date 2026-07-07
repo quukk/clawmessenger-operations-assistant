@@ -58,6 +58,8 @@ class OpencodeRunner {
     this.eventHandler = null;
     /** SSE 是否已启动 */
     this._sseStarted = false;
+    /** cardId → { sessionId, routeCtx } 的活跃流索引,用于 stop 命令 */
+    this.activeStreams = new Map();
   }
 
   _loadSystemPrompt() {
@@ -137,6 +139,9 @@ class OpencodeRunner {
       sendStreamChunk: callbacks.sendStreamChunk,
       sendFinalCard: callbacks.sendFinalCard,
       sendErrorCard: callbacks.sendErrorCard,
+      onStreamEnd: (cardId) => {
+        this.activeStreams.delete(cardId);
+      },
     });
 
     // 连接 SSE 流并启动事件循环
@@ -254,6 +259,10 @@ class OpencodeRunner {
       extra: buildStreamExtra({ cardId: routeCtx.cardId, title: '运维助手' }),
     });
 
+    // 注册活跃流索引,供 stop 命令查找 sessionId
+    this.activeStreams.set(routeCtx.cardId, { sessionId, routeCtx });
+    this.log.info(`[OpencodeRunner] 注册活跃流: cardId=${routeCtx.cardId}, sessionId=${sessionId}`);
+
     // 异步触发 prompt(fire-and-forget,真实回复由 SSE 驱动)
     try {
       await this.opencode.promptAsync(sessionId, message);
@@ -264,6 +273,32 @@ class OpencodeRunner {
       this.eventHandler.streamStates.delete(sessionId);
       throw err;
     }
+  }
+
+  /**
+   * 停止指定 cardId 对应的活跃流
+   * @param {string} cardId
+   * @returns {Promise<{stopped: boolean, reason?: string}>}
+   */
+  async stopStream(cardId) {
+    const entry = this.activeStreams.get(cardId);
+    if (!entry) {
+      this.log.warn(`[OpencodeRunner] stopStream: 未找到 cardId=${cardId} 对应的活跃流`);
+      return { stopped: false, reason: '未找到活跃流' };
+    }
+    const { sessionId, routeCtx } = entry;
+    this.log.info(`[OpencodeRunner] stopStream: cardId=${cardId}, sessionId=${sessionId}`);
+    try {
+      await this.opencode.abortSession(sessionId);
+    } catch (err) {
+      this.log.warn(`[OpencodeRunner] abortSession 失败: ${err.message}`);
+      // 继续:即使 abort 请求失败,也标记本地流已取消,避免无限等待
+    }
+    if (this.eventHandler) {
+      await this.eventHandler.cancelStream(sessionId);
+    }
+    this.activeStreams.delete(cardId);
+    return { stopped: true };
   }
 
   /**

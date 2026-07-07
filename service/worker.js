@@ -155,7 +155,7 @@ const logTimestampValidation = (message) => {
   } catch (e) {
     // 忽略写入错误
   }
-  log.warn(`[TIMESTAMP-VALIDATION] ${message}`);  // 同时记录到主日志
+  // log.warn(`[TIMESTAMP-VALIDATION] ${message}`);  // 同时记录到主日志
 };
 
 log.info(`[WORKER] 业务进程启动，PID: ${process.pid}`);
@@ -546,10 +546,15 @@ async function initRongCloud() {
         }
 
         // Timestamp 校验（5分钟有效期）
+        // 部分上游/客户端下发的 timestamp 是毫秒（13位），统一归一化为秒
         const msgTimestamp = parsed.timestamp;
         if (msgTimestamp) {
+          let normalizedMsgTimestamp = msgTimestamp;
+          if (normalizedMsgTimestamp > 1e12) {
+            normalizedMsgTimestamp = Math.floor(normalizedMsgTimestamp / 1000);
+          }
           const currentTime = Math.floor(Date.now() / 1000);
-          const timeDiff = Math.abs(currentTime - msgTimestamp);
+          const timeDiff = Math.abs(currentTime - normalizedMsgTimestamp);
           if (timeDiff > 300) { // 5分钟 = 300秒
             logTimestampValidation(
               `消息时间戳过期: msg_time=${msgTimestamp}, current_time=${currentTime}, ` +

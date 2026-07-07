@@ -21,6 +21,170 @@
 const { buildStreamDelta, buildStreamExtra } = require('../skills/ops-assistant/stream-builders');
 
 /**
+ * 轻量流式解析器：从模型输出中识别并剥离 <thinking>/<think> 标签。
+ * 用于兼容不单独发送 field='thinking' 的模型（如 Kimi 2.7）。
+ * 支持标签跨多个 delta 分片。
+ */
+class ThinkingTagParser {
+  constructor() {
+    this.inThinking = false;
+    this.buffer = '';
+    this.openTags = ['<thinking>', '<think>'];
+    this.closeTags = ['</thinking>', '</think>'];
+  }
+
+  /**
+   * 处理一段 delta 文本，把标签内内容归入 reasoningContent，外部内容归入 fullContent。
+   * @param {string} text
+   * @param {StreamState} streamState
+   * @returns {{normal:string, reasoning:string}} 本次 delta 新分类出的内容
+   */
+  process(text, streamState) {
+    this.buffer += text;
+    const normalStartLen = streamState.fullContent.length;
+    const reasoningStartLen = streamState.reasoningContent.length;
+
+    while (true) {
+      if (this.inThinking) {
+        const idx = this._findTag(this.closeTags);
+        if (idx === -1) {
+          // 尚未出现完整结束标签；把不可能是结束标签前缀的部分沉淀为 reasoning
+          const partial = this._findPartialTagStart(this.closeTags);
+          if (partial !== -1) {
+            if (partial > 0) {
+              streamState.reasoningContent += this.buffer.slice(0, partial);
+              this.buffer = this.buffer.slice(partial);
+            }
+            break;
+          }
+          streamState.reasoningContent += this.buffer;
+          this.buffer = '';
+          break;
+        }
+        const tagLen = this._matchTagLength(this.closeTags, idx);
+        streamState.reasoningContent += this.buffer.slice(0, idx);
+        this.buffer = this.buffer.slice(idx + tagLen);
+        this.inThinking = false;
+        continue;
+      }
+
+      const idx = this._findTag(this.openTags);
+      if (idx === -1) {
+        const partial = this._findPartialTagStart(this.openTags);
+        if (partial !== -1) {
+          if (partial > 0) {
+            streamState.fullContent += this.buffer.slice(0, partial);
+            this.buffer = this.buffer.slice(partial);
+          }
+          break;
+        }
+        streamState.fullContent += this.buffer;
+        this.buffer = '';
+        break;
+      }
+      const tagLen = this._matchTagLength(this.openTags, idx);
+      streamState.fullContent += this.buffer.slice(0, idx);
+      this.buffer = this.buffer.slice(idx + tagLen);
+      this.inThinking = true;
+      continue;
+    }
+
+    return {
+      normal: streamState.fullContent.slice(normalStartLen),
+      reasoning: streamState.reasoningContent.slice(reasoningStartLen),
+    };
+  }
+
+  /**
+   * session 结束时刷新残留缓冲：未关闭标签内的内容归入 reasoning。
+   * @param {StreamState} streamState
+   */
+  flush(streamState) {
+    if (this.buffer.length === 0) return;
+    if (this.inThinking) {
+      streamState.reasoningContent += this.buffer;
+    } else {
+      streamState.fullContent += this.buffer;
+    }
+    this.buffer = '';
+  }
+
+  _findTag(tags) {
+    let idx = -1;
+    for (const tag of tags) {
+      const i = this.buffer.indexOf(tag);
+      if (i !== -1 && (idx === -1 || i < idx)) idx = i;
+    }
+    return idx;
+  }
+
+  _matchTagLength(tags, idx) {
+    for (const tag of tags) {
+      if (this.buffer.startsWith(tag, idx)) return tag.length;
+    }
+    return 0;
+  }
+
+  _findPartialTagStart(tags) {
+    let pos = -1;
+    for (let i = 0; i < this.buffer.length; i++) {
+      if (this.buffer[i] !== '<') continue;
+      const suffix = this.buffer.slice(i + 1);
+      for (const tag of tags) {
+        const tagBody = tag.slice(1);
+        if (tagBody.startsWith(suffix)) {
+          if (pos === -1 || i < pos) pos = i;
+          break;
+        }
+      }
+    }
+    return pos;
+  }
+}
+
+/**
+ * 内容消毒：移除 <dcp-system-reminder> 及其内部内容。
+ * 支持嵌套、跨行、大小写不敏感。
+ * @param {string} text
+ * @returns {string}
+ */
+function sanitizeContent(text) {
+  if (!text || text.length === 0) return text;
+  const open = '<dcp-system-reminder>';
+  const close = '</dcp-system-reminder>';
+  let result = '';
+  let i = 0;
+  while (i < text.length) {
+    const openIdx = text.toLowerCase().indexOf(open, i);
+    if (openIdx === -1) {
+      result += text.slice(i);
+      break;
+    }
+    result += text.slice(i, openIdx);
+    i = openIdx + open.length;
+    let depth = 1;
+    while (i < text.length && depth > 0) {
+      const nextOpen = text.toLowerCase().indexOf(open, i);
+      const nextClose = text.toLowerCase().indexOf(close, i);
+      if (nextClose === -1) {
+        // 无匹配结束标签，直接丢弃剩余内容
+        i = text.length;
+        break;
+      }
+      if (nextOpen !== -1 && nextOpen < nextClose) {
+        depth += 1;
+        i = nextOpen + open.length;
+      } else {
+        depth -= 1;
+        i = nextClose + close.length;
+      }
+    }
+  }
+  return result;
+}
+
+
+/**
  * 单条会话的流式状态(对应 opencode-clawmessenger 的 StreamState)
  * @typedef {Object} StreamState
  * @property {string} chatId           会话标识(如 ops-<senderUserId>)
@@ -31,8 +195,11 @@ const { buildStreamDelta, buildStreamExtra } = require('../skills/ops-assistant/
  * @property {string} streamId         流 ID
  * @property {number} seq              当前序号(0=thinking 首流,responding 逐 delta 递增)
  * @property {string} fullContent      累积的完整内容(session.idle 时用于持久化卡片)
+ * @property {string} reasoningContent 累积的思考/推理内容(来自 properties.field='thinking'|'reasoning' 或 <thinking> 标签)
  * @property {boolean} hasSentStream   是否已发送过 responding 流片
  * @property {Object|null} extra       首流 extra 卡片壳(已发送后置 null,避免重复写)
+ * @property {ThinkingTagParser} thinkParser  <thinking>/<think> 标签流式解析器
+ * @property {Map<string,string>} partTypes  partID -> 'reasoning'|'text' 类型映射
  */
 
 class EventHandler {
@@ -53,7 +220,7 @@ class EventHandler {
 
     /**
      * 回调注入:发送最终持久化卡片 + 历史 command 消息(session.idle 时)
-     * @type {(ctx:{targetId:string, convType:number, senderUserId:string, cardId:string, fullContent:string}) => Promise<void>}
+     * @type {(ctx:{targetId:string, convType:number, senderUserId:string, cardId:string, fullContent:string, reasoningContent:string}) => Promise<void>}
      */
     this.sendFinalCard = options.sendFinalCard || null;
 
@@ -62,6 +229,12 @@ class EventHandler {
      * @type {(ctx:{targetId:string, convType:number, senderUserId:string, cardId:string, error:string}) => Promise<void>}
      */
     this.sendErrorCard = options.sendErrorCard || null;
+
+    /**
+     * 回调注入:流结束(session.idle/error/cancelled)时清理 runner 的 activeStreams
+     * @type {(cardId:string) => void}
+     */
+    this.onStreamEnd = options.onStreamEnd || null;
 
     this.isRunning = false;
     /** @type {Map<string, StreamState>} sessionId → 状态 */
@@ -95,8 +268,11 @@ class EventHandler {
       streamId: ctx.streamId,
       seq: 0,
       fullContent: '',
+      reasoningContent: '',
       hasSentStream: false,
       extra: ctx.extra || buildStreamExtra({ cardId: ctx.cardId }),
+      thinkParser: new ThinkingTagParser(),
+      partTypes: new Map(),
     });
     // 清除可能的"已完成"标记(同一 session 复用)
     this.sentSessions.delete(sessionId);
@@ -104,7 +280,102 @@ class EventHandler {
   }
 
   /**
-   * 把一个异步任务追加到指定 session 的串行队列后执行。
+   * 取消指定 session 的流式输出,立即发送 cancelled 终态和最终卡片。
+   * @param {string} sessionId
+   */
+  async cancelStream(sessionId) {
+    if (this.sentSessions.has(sessionId)) {
+      this.log.debug(`[EventHandler] cancelStream: session 已结束,跳过: ${sessionId}`);
+      return;
+    }
+    const streamState = this.streamStates.get(sessionId);
+    if (!streamState) {
+      this.log.debug(`[EventHandler] cancelStream: 无路由映射,跳过: ${sessionId}`);
+      return;
+    }
+
+    await this._enqueueStreamTask(sessionId, async () => {
+      try {
+        // 标记已发送终态,后续 session.idle/error 不再重复处理
+        this.sentSessions.add(sessionId);
+
+        if (!streamState.hasSentStream) {
+          // 尚未发送过任何流片:发一个首流(带 extra) + cancelled 终态
+          streamState.seq = 0;
+          if (this.sendStreamChunk) {
+            await this.sendStreamChunk(
+              streamState.targetId,
+              streamState.streamId,
+              true,
+              true,
+              0,
+              {
+                streamDelta: buildStreamDelta({
+                  content: '用户已停止生成',
+                  reasoningContent: streamState.reasoningContent,
+                  sessionStatus: 'cancelled',
+                  seq: 0,
+                  isFinal: true,
+                }),
+                extra: streamState.extra,
+              },
+            );
+          }
+          streamState.hasSentStream = true;
+          streamState.extra = null;
+        } else {
+          streamState.seq += 1;
+          if (this.sendStreamChunk) {
+            await this.sendStreamChunk(
+              streamState.targetId,
+              streamState.streamId,
+              false,
+              true,
+              streamState.seq,
+              {
+                streamDelta: buildStreamDelta({
+                  content: '用户已停止生成',
+                  reasoningContent: streamState.reasoningContent,
+                  sessionStatus: 'cancelled',
+                  seq: streamState.seq,
+                  isFinal: true,
+                }),
+              },
+            );
+          }
+        }
+
+        // 最终持久化卡片:显示已停止
+        if (this.sendFinalCard) {
+          await this.sendFinalCard({
+            targetId: streamState.targetId,
+            convType: streamState.convType,
+            senderUserId: streamState.senderUserId,
+            cardId: streamState.cardId,
+            fullContent: '已停止生成',
+            reasoningContent: streamState.reasoningContent,
+          });
+        }
+
+        // 清理状态
+        const cardId = streamState.cardId;
+        this.streamStates.delete(sessionId);
+        if (this.onStreamEnd) {
+          try {
+            this.onStreamEnd(cardId);
+          } catch (err) {
+            this.log.warn(`[EventHandler] onStreamEnd 回调异常: ${err.message}`);
+          }
+        }
+        this.log.info(`[EventHandler] 流已取消: ${sessionId}, cardId=${cardId}`);
+      } catch (err) {
+        this.log.error(`[EventHandler] cancelStream 失败: ${err.message}, session=${sessionId}`);
+      }
+    });
+  }
+
+  /**
+    * 把一个异步任务追加到指定 session 的串行队列后执行。
    * 不同 session 的队列相互独立(并行),同 session 内保序。
    * 参考 opencode-clawmessenger event-handler.ts:50-60。
    * @template T
@@ -204,6 +475,8 @@ class EventHandler {
       // 心跳降噪
       if (eventType === 'server.heartbeat' || eventType === 'server.connected') return;
 
+      this.log.debug(`[EventHandler] raw event: ${eventType}, ${JSON.stringify(globalEvent)}`);
+
       const props =
         globalEvent.properties ||
         globalEvent.payload?.properties ||
@@ -223,11 +496,14 @@ class EventHandler {
           await this._handleSessionError(props);
           break;
         }
+        case 'message.part.updated': {
+          await this._handleMessagePartUpdated(props);
+          break;
+        }
         case 'session.created':
         case 'session.compacted':
         case 'session.closed':
         case 'chat.message':
-        case 'message.part.updated':
         case 'session.status':
           // ops-assistant 不需要处理这些(权限/问答由 opencode 自身完成)
           this.log.debug(`[EventHandler] 忽略事件: ${eventType}`);
@@ -238,6 +514,64 @@ class EventHandler {
     } catch (err) {
       this.log.error(`[EventHandler] 处理事件异常: ${err.message}`);
     }
+  }
+
+  /**
+   * 处理 message.part.updated —— part 终态快照,用于 Kimi 2.7+ 等模型
+   * 将 reasoning/text 部分类型存入 partTypes 映射,并用最终文本更新状态。
+   *
+   * @param {Object} properties { sessionID, part: { id, type, text } }
+   */
+  async _handleMessagePartUpdated(properties) {
+    const sessionId = properties.sessionID || properties.sessionId;
+    if (!sessionId) return;
+
+    // 已发送过终态的 session,丢弃迟到的更新
+    if (this.sentSessions.has(sessionId)) {
+      this.log.debug(`[EventHandler] session 已完成,丢弃 part.updated: ${sessionId}`);
+      return;
+    }
+
+    const streamState = this.streamStates.get(sessionId);
+    if (!streamState) {
+      this.log.debug(`[EventHandler] part.updated 无路由映射,跳过: ${sessionId}`);
+      return;
+    }
+
+    const part = properties.part || {};
+    const partID = part.id || properties.partID;
+    const partType = part.type;
+    const partText = sanitizeContent(typeof part.text === 'string' ? part.text : '');
+
+    if (!partID) {
+      this.log.debug('[EventHandler] part.updated 缺少 partID,跳过');
+      return;
+    }
+
+    this.log.debug(`[EventHandler] raw part.updated properties: ${JSON.stringify(properties)}`);
+
+    await this._enqueueStreamTask(sessionId, async () => {
+      try {
+        if (partType === 'reasoning') {
+          streamState.partTypes.set(partID, 'reasoning');
+          if (partText.length > 0) {
+            streamState.reasoningContent = partText;
+          }
+        } else if (partType === 'text') {
+          streamState.partTypes.set(partID, 'text');
+          if (partText.length > 0) {
+            // message.part.updated 快照是权威正文，直接覆盖 delta 累积内容
+            streamState.fullContent = partText;
+            this.log.info(`[EventHandler] part.updated text snapshot authoritative: partID=${partID}, preview=${partText.slice(0, 80)}${partText.length > 80 ? '...' : ''}`);
+          }
+        } else {
+          // 未知类型仍记录为 text,让后续 delta 走正文路径
+          streamState.partTypes.set(partID, 'text');
+        }
+      } catch (err) {
+        this.log.error(`[EventHandler] 处理 part.updated 失败: ${err.message}, session=${sessionId}`);
+      }
+    });
   }
 
   /**
@@ -263,14 +597,37 @@ class EventHandler {
     }
 
     // 提取增量文本(兼容多种字段命名)
-    const delta =
+    const rawDelta =
       properties.delta || properties.text || properties.part?.delta || properties.part?.text || '';
+    const delta = sanitizeContent(rawDelta);
     if (typeof delta !== 'string') return;
     // 空字符串 delta 是合法的(无新内容块),不跳过
 
+    // 提取字段标识,区分 thinking/reasoning 与正常内容
+    const field = properties.field || properties.part?.field;
+    const isReasoningField = field === 'thinking' || field === 'reasoning';
+
+    // 通过 partID 查询该 part 的真实类型(Kimi 2.7+ 单独发送 reasoning part)
+    const partID = properties.partID || properties.part?.id;
+    const partType = partID ? streamState.partTypes.get(partID) : undefined;
+    const isReasoningPart = partType === 'reasoning';
+
+    this.log.debug(`[EventHandler] raw delta properties: ${JSON.stringify(properties)}`);
+
     await this._enqueueStreamTask(sessionId, async () => {
       try {
-        streamState.fullContent += delta;
+        let contentToSend = '';
+        if (isReasoningPart) {
+          // 显式 reasoning part 优先级最高,不混入正文
+          streamState.reasoningContent += delta;
+        } else if (isReasoningField) {
+          // field 标识为 thinking/reasoning 的兼容兜底
+          streamState.reasoningContent += delta;
+        } else {
+          // text part 仍使用 <thinking> 标签解析兜底,防止模型把 reasoning 混在正文里
+          const parsed = streamState.thinkParser.process(delta, streamState);
+          contentToSend = parsed.normal;
+        }
 
         // 首流(尚未发送过任何流片):先发 thinking 态(seq=0)让前端进入续流
         if (!streamState.hasSentStream) {
@@ -282,12 +639,18 @@ class EventHandler {
               false,
               0, // seq=0 thinking
               {
-                streamDelta: buildStreamDelta({ content: '', sessionStatus: 'thinking', seq: 0 }),
+                streamDelta: buildStreamDelta({
+                  content: '',
+                  reasoningContent: streamState.reasoningContent,
+                  sessionStatus: 'thinking',
+                  seq: 0,
+                }),
                 extra: streamState.extra,
               },
             );
           }
           streamState.hasSentStream = true;
+          streamState.extra = null; // 首流 extra 已发送,避免后续流片重复携带
         }
 
         // 本次增量跳过空内容(避免无意义的空流片)
@@ -297,19 +660,25 @@ class EventHandler {
 
         streamState.seq += 1;
         if (this.sendStreamChunk) {
+          const opts = {
+            streamDelta: buildStreamDelta({
+              content: contentToSend,
+              reasoningContent: streamState.reasoningContent,
+              sessionStatus: 'responding',
+              seq: streamState.seq,
+            }),
+          };
+          if (streamState.extra) opts.extra = streamState.extra;
           await this.sendStreamChunk(
             streamState.targetId,
             streamState.streamId,
             false, // 非首流
             false,
             streamState.seq,
-            {
-              streamDelta: buildStreamDelta({ content: delta, sessionStatus: 'responding', seq: streamState.seq }),
-              extra: streamState.extra,
-            },
+            opts,
           );
         }
-        this.log.debug(`[EventHandler] delta 已发送: session=${sessionId}, seq=${streamState.seq}, len=${delta.length}`);
+        this.log.debug(`[EventHandler] delta 已发送: session=${sessionId}, seq=${streamState.seq}, len=${delta.length}, field=${field || 'content'}`);
       } catch (err) {
         this.log.error(`[EventHandler] 发送 delta 失败: ${err.message}, session=${sessionId}`);
       }
@@ -338,6 +707,9 @@ class EventHandler {
 
     await this._enqueueStreamTask(sessionId, async () => {
       try {
+        // 刷新未关闭的 <thinking> 标签，残留缓冲内容按标签状态归类
+        streamState.thinkParser.flush(streamState);
+
         // 如果 delta 流片一次都没发过(可能 LLM 直接没产文本,或全部被过滤),
         // 兜底:发一个空 thinking + completed,让前端正确收尾
         if (!streamState.hasSentStream) {
@@ -349,7 +721,12 @@ class EventHandler {
               false,
               0,
               {
-                streamDelta: buildStreamDelta({ content: '', sessionStatus: 'thinking', seq: 0 }),
+                streamDelta: buildStreamDelta({
+                  content: '',
+                  reasoningContent: streamState.reasoningContent,
+                  sessionStatus: 'thinking',
+                  seq: 0,
+                }),
                 extra: streamState.extra,
               },
             );
@@ -357,9 +734,10 @@ class EventHandler {
           streamState.hasSentStream = true;
         }
 
-        // completed 终态(is_final,完整内容)
+        // completed 终态(is_final,内容为空；最终卡片_update承载最终内容)
         const fullContent = streamState.fullContent || '';
         streamState.seq += 1;
+        this.log.info(`[EventHandler] session.idle final fullContent: length=${fullContent.length}, preview=${fullContent.slice(0, 80)}${fullContent.length > 80 ? '...' : ''}`);
         if (this.sendStreamChunk) {
           await this.sendStreamChunk(
             streamState.targetId,
@@ -369,7 +747,8 @@ class EventHandler {
             streamState.seq,
             {
               streamDelta: buildStreamDelta({
-                content: fullContent,
+                content: '',
+                reasoningContent: '',
                 sessionStatus: 'completed',
                 seq: streamState.seq,
                 isFinal: true,
@@ -387,11 +766,22 @@ class EventHandler {
             senderUserId: streamState.senderUserId,
             cardId: streamState.cardId,
             fullContent,
+            reasoningContent: streamState.reasoningContent,
           });
         }
 
+        this.log.info(`[EventHandler] session completed fullContent: ${fullContent}`);
+        this.log.info(`[EventHandler] session completed reasoningContent: ${streamState.reasoningContent}`);
+
         this.sentSessions.add(sessionId);
         this.streamStates.delete(sessionId);
+        if (this.onStreamEnd) {
+          try {
+            this.onStreamEnd(streamState.cardId);
+          } catch (err) {
+            this.log.warn(`[EventHandler] onStreamEnd 回调异常: ${err.message}`);
+          }
+        }
         this.log.info(`[EventHandler] session 完成: ${sessionId}, seq=${streamState.seq}, contentLen=${fullContent.length}`);
       } catch (err) {
         this.log.error(`[EventHandler] session.idle 处理失败: ${err.message}, session=${sessionId}`);
@@ -446,6 +836,7 @@ class EventHandler {
                 seq: streamState.seq,
                 isFinal: true,
                 error: errorMessage,
+                reasoningContent: streamState.reasoningContent,
               }),
             },
           );
@@ -466,6 +857,13 @@ class EventHandler {
 
     this.sentSessions.add(sessionId);
     this.streamStates.delete(sessionId);
+    if (cardId && this.onStreamEnd) {
+      try {
+        this.onStreamEnd(cardId);
+      } catch (err) {
+        this.log.warn(`[EventHandler] onStreamEnd 回调异常: ${err.message}`);
+      }
+    }
     this.log.error(`[EventHandler] session 错误: ${sessionId}, msg=${errorMessage}`);
   }
 }

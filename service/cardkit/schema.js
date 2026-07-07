@@ -326,6 +326,8 @@ const SECTION_KINDS = [
  * @property {CardHeader} header 卡片头部
  * @property {CardSection[]} sections 有序段落数组 —— agent 按需组合
  * @property {CardConfig} [config] 卡片级配置
+ * @property {string} [reasoning] 思考/推理内容(由前端独立展示,不渲染在 sections 中)
+ * @property {boolean} [loading] 是否处于加载状态(占位卡片用,前端显示加载动画)
  */
 
 module.exports = {

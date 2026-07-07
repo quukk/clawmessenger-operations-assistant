@@ -149,6 +149,25 @@ class OpencodeClient {
   }
 
   /**
+   * 中止活跃会话
+   * @param {string} sessionId
+   * @returns {Promise<void>}
+   */
+  async abortSession(sessionId) {
+    const client = await this._getClient();
+    const { error, response } = await client.session.abort({
+      sessionID: sessionId,
+      directory: this.directory,
+    });
+    if (error) {
+      const errStr = serializeError(error);
+      const statusText = response?.statusText ? ` [${response.status} ${response.statusText}]` : '';
+      throw new Error(`中止会话失败: ${errStr}${statusText}`);
+    }
+    this.log.info(`[OpencodeClient] session aborted: ${sessionId}`);
+  }
+
+  /**
    * 异步触发 prompt(fire-and-forget)。
    * 真实回复通过订阅全局 SSE 流(message.part.delta / session.idle)在 EventHandler 中消费。
    *

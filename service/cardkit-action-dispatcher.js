@@ -62,7 +62,11 @@ async function dispatchCardAction(actionMsg, context = {}) {
   try {
     switch (actionType) {
       case 'command':
-        result = await handleCommand(actionObj, context);
+        if (actionObj.name === 'stop') {
+          result = await handleStop(actionObj, actionMsg, context);
+        } else {
+          result = await handleCommand(actionObj, context);
+        }
         break;
       case 'session':
         result = await handleSession(actionObj, context);
@@ -158,6 +162,38 @@ async function handleCommand(actionObj, context) {
   }
 
   return { success: true, confirmText: `已触发 ${commandText}` };
+}
+
+/**
+ * 停止流式生成命令。
+ * 由运维助手 CardKit 卡片的右上角停止按钮触发,
+ * 调用 opencodeRunner.stopStream(cardId) 取消活跃 OpenCode 会话。
+ *
+ * @returns {Promise<{success: boolean, confirmText: string}>}
+ */
+async function handleStop(actionObj, actionMsg, context) {
+  const cardId = actionMsg && actionMsg.cardId;
+  if (!cardId) {
+    log.warn('stop 动作缺少 cardId');
+    return { success: false, confirmText: '缺少卡片 ID' };
+  }
+
+  if (!context.opencodeRunner || typeof context.opencodeRunner.stopStream !== 'function') {
+    log.warn('stop 动作:opencodeRunner.stopStream 未就绪');
+    return { success: false, confirmText: '停止功能未就绪' };
+  }
+
+  log.info(`stop 动作: cardId=${cardId}, chatId=${context.chatId}`);
+  try {
+    const stopResult = await context.opencodeRunner.stopStream(cardId);
+    if (stopResult.stopped) {
+      return { success: true, confirmText: '已停止' };
+    }
+    return { success: false, confirmText: stopResult.reason || '停止失败' };
+  } catch (err) {
+    log.error(`stop 动作失败: ${err.message}`);
+    return { success: false, confirmText: '停止失败' };
+  }
 }
 
 /**

@@ -379,8 +379,30 @@ class RongyunMessageSender {
 
       const size = estimateMessageSize(payload);
       if (size > SAFE_LIMIT) {
-        this.log?.warn(`[RongyunMessageSender] card_update 体积超过安全阈值(${size} > ${SAFE_LIMIT})，拒绝发送`);
-        return { success: false, size, reason: 'too large' };
+        // 尝试通过减半追加列表来降低体积
+        const truncated = { ...appendData };
+        let currentSize = size;
+        while (currentSize > SAFE_LIMIT) {
+          let reduced = false;
+          if (Array.isArray(truncated.appendCommands) && truncated.appendCommands.length > 1) {
+            truncated.appendCommands = truncated.appendCommands.slice(0, Math.max(1, Math.floor(truncated.appendCommands.length / 2)));
+            reduced = true;
+          }
+          if (Array.isArray(truncated.appendSessions) && truncated.appendSessions.length > 1) {
+            truncated.appendSessions = truncated.appendSessions.slice(0, Math.max(1, Math.floor(truncated.appendSessions.length / 2)));
+            reduced = true;
+          }
+          if (!reduced) break;
+          payload = { ...payload, ...truncated };
+          currentSize = estimateMessageSize(payload);
+        }
+
+        if (currentSize > SAFE_LIMIT) {
+          this.log?.warn(`[RongyunMessageSender] card_update 体积超过安全阈值(${currentSize} > ${SAFE_LIMIT})，拒绝发送`);
+          return { success: false, size: currentSize, reason: 'too large' };
+        }
+
+        this.log?.warn(`[RongyunMessageSender] card_update 体积超过安全阈值，已截断追加列表至 ${currentSize} 字节`);
       }
 
       const result = await this.rongcloudClient.sendMessage(

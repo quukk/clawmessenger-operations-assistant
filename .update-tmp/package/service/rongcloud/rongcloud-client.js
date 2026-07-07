@@ -138,24 +138,24 @@ class RongCloudClient {
     // 2. 过滤自己发送的消息（融云 SDK 可能将发送消息回传）
     // messageDirection: 1=发送, 2=接收
     if (message.messageDirection === 1) {
-      this.log?.info('[RongCloudClient] 过滤自己发送的消息 (messageDirection=1)');
+      // this.log?.info('[RongCloudClient] 过滤自己发送的消息 (messageDirection=1)');
       return;
     }
     if (message.senderUserId === this.config.accountId) {
-      this.log?.info(`[RongCloudClient] 过滤自己发送的消息 (senderUserId=${message.senderUserId} === accountId=${this.config.accountId})`);
+      // this.log?.info(`[RongCloudClient] 过滤自己发送的消息 (senderUserId=${message.senderUserId} === accountId=${this.config.accountId})`);
       return;
     }
 
     // 2.5 通过发送缓存过滤：融云 SDK 回传自己消息时，messageDirection/senderUserId 可能不一致
     if (message.messageUId && this.sentMessageUIds.has(message.messageUId)) {
-      this.log?.info(`[RongCloudClient] 过滤自己发送的消息 (messageUId=${message.messageUId} 在发送缓存中)`);
+      // this.log?.info(`[RongCloudClient] 过滤自己发送的消息 (messageUId=${message.messageUId} 在发送缓存中)`);
       return;
     }
 
     // 3. 消息去重：防止同一条消息被多次触发（融云重推或多端同步）
     const dedupKey = message.messageUId || `${message.senderUserId}-${message.sentTime}-${message.messageType}`;
     if (this.processedMessageUIds.has(dedupKey)) {
-      this.log?.info(`[RongCloudClient] 消息去重过滤: dedupKey=${dedupKey}`);
+      // this.log?.info(`[RongCloudClient] 消息去重过滤: dedupKey=${dedupKey}`);
       return;
     }
     this.processedMessageUIds.add(dedupKey);
@@ -209,8 +209,8 @@ class RongCloudClient {
       // 对于媒体消息，保留完整的 JSON 字符串，不要提取 content 字段
       const userContent = parsed && !parsed.msg_type
         ? (['RC:ImgMsg', 'RC:SightMsg', 'RC:FileMsg', 'RC:HQVCMsg'].includes(msgType)
-            ? JSON.stringify(parsed)
-            : (parsed.content || parsed.text || JSON.stringify(parsed)))
+          ? JSON.stringify(parsed)
+          : (parsed.content || parsed.text || JSON.stringify(parsed)))
         : content;
 
       if (!userContent || !userContent.trim || !userContent.trim()) {

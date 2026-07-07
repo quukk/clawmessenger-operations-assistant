@@ -24,6 +24,8 @@ const { CARD_SCHEMA_VERSION } = require('./schema');
  * @property {string} [subtitle]
  * @property {boolean} [wide]
  * @property {boolean} [collapsible]
+ * @property {string} [reasoning] 思考/推理内容,写入 CardModel.reasoning
+ * @property {boolean} [loading] 加载状态,写入 CardModel.loading
  */
 
 /**
@@ -49,6 +51,8 @@ function card(id, title, sections, opts = {}) {
       ...(opts.wide !== undefined ? { wide: opts.wide } : {}),
       ...(opts.collapsible !== undefined ? { collapsible: opts.collapsible } : {}),
     },
+    ...(opts.reasoning !== undefined ? { reasoning: opts.reasoning } : {}),
+    ...(opts.loading !== undefined ? { loading: opts.loading } : {}),
   };
 }
 

@@ -128,9 +128,9 @@ class RongCloudClient {
       this.log?.info('[RongCloudClient] 使用 addEventListener 模式');
 
       RongIMLib.addEventListener(RongIMLib.Events?.MESSAGES || 'MESSAGES', (event) => {
-        this.log?.info(`[RongCloudClient] MESSAGES 事件触发, messages长度=${event?.messages?.length || 0}`);
+        // this.log?.info(`[RongCloudClient] MESSAGES 事件触发, messages长度=${event?.messages?.length || 0}`);
         event.messages?.forEach(msg => {
-          this.log?.debug(`[RongCloudClient] MESSAGES 单条消息: messageType=${msg.messageType}, senderUserId=${msg.senderUserId}, conversationType=${msg.conversationType}, isOffLineMessage=${msg.isOffLineMessage}, messageDirection=${msg.messageDirection}`);
+          // this.log?.debug(`[RongCloudClient] MESSAGES 单条消息: messageType=${msg.messageType}, senderUserId=${msg.senderUserId}, conversationType=${msg.conversationType}, isOffLineMessage=${msg.isOffLineMessage}, messageDirection=${msg.messageDirection}`);
           this.handleReceivedMessage(msg);
         });
       });
@@ -196,17 +196,17 @@ class RongCloudClient {
     // 1. 过滤自己发送的消息（融云 SDK 可能将发送消息回传）
     // messageDirection: 1=发送, 2=接收
     if (message.messageDirection === 1) {
-      this.log?.debug('[RongCloudClient] 过滤自己发送的消息 (messageDirection=1)');
+      // this.log?.debug('[RongCloudClient] 过滤自己发送的消息 (messageDirection=1)');
       return;
     }
     if (message.senderUserId === this.config.accountId) {
-      this.log?.debug(`[RongCloudClient] 过滤自己发送的消息 (senderUserId=${message.senderUserId} === accountId=${this.config.accountId})`);
+      // this.log?.debug(`[RongCloudClient] 过滤自己发送的消息 (senderUserId=${message.senderUserId} === accountId=${this.config.accountId})`);
       return;
     }
 
     // 2. 通过发送缓存过滤：融云 SDK 回传自己消息时，messageDirection/senderUserId 可能不一致
     if (message.messageUId && this.sentMessageUIds.has(message.messageUId)) {
-      this.log?.debug(`[RongCloudClient] 过滤自己发送的消息 (messageUId=${message.messageUId} 在发送缓存中)`);
+      // this.log?.debug(`[RongCloudClient] 过滤自己发送的消息 (messageUId=${message.messageUId} 在发送缓存中)`);
       return;
     }
 
@@ -272,8 +272,8 @@ class RongCloudClient {
       // 对于媒体消息，保留完整的 JSON 字符串，不要提取 content 字段
       const userContent = parsed && !parsed.msg_type
         ? (['RC:ImgMsg', 'RC:SightMsg', 'RC:FileMsg', 'RC:HQVCMsg'].includes(msgType)
-            ? JSON.stringify(parsed)
-            : (parsed.content || parsed.text || JSON.stringify(parsed)))
+          ? JSON.stringify(parsed)
+          : (parsed.content || parsed.text || JSON.stringify(parsed)))
         : content;
 
       if (!userContent || !userContent.trim || !userContent.trim()) {

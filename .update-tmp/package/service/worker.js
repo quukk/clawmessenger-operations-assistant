@@ -125,7 +125,7 @@ const logTimestampValidation = (message) => {
   } catch (e) {
     // 忽略写入错误
   }
-  log.warn(`[TIMESTAMP-VALIDATION] ${message}`);  // 同时记录到主日志
+  // log.warn(`[TIMESTAMP-VALIDATION] ${message}`);  // 同时记录到主日志
 };
 
 log.info(`[WORKER] 业务进程启动，PID: ${process.pid}`);

@@ -240,15 +240,14 @@ class OpsAssistantSkill extends BaseSkill {
     const streamId = `stream-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
     try {
-      // 1. 发送初始静态卡片(规范 CardModel,thinking 占位)
-      //    按钮停止由前端在 StreamDelta 协议层处理(action.type='none' 占位)
+      // 1. 发送初始静态卡片(规范 CardModel,loading 占位)
+      //    停止按钮发送 command.stop 触发后端取消
       await this.sendCard(replyTarget, card(cardId, '运维助手', [
-        md('正在思考...'),
         buttons([
-          btn('停止', action.none(), { id: 'stop', variant: 'danger' }),
+          btn('停止', action.command('stop'), { id: 'stop', variant: 'danger' }),
         ], 'inline'),
         note(`session_id: ops-assistant-${senderUserId}`),
-      ], { color: 'blue' }), convType);
+      ], { color: 'blue', loading: true }), convType);
 
       // 2. 使用 senderUserId 作为 chatId,实现单用户会话隔离
       const chatId = `ops-${senderUserId}`;
@@ -347,17 +346,22 @@ class OpsAssistantSkill extends BaseSkill {
    * @param {string} ctx.senderUserId
    * @param {string} ctx.cardId
    * @param {string} ctx.fullContent
+   * @param {string} [ctx.reasoningContent]
    */
   async _sendFinalCard(ctx) {
-    const { targetId, convType, senderUserId, cardId, fullContent } = ctx;
+    const { targetId, convType, senderUserId, cardId, fullContent, reasoningContent } = ctx;
     const accountId = this.config.accountId || '';
 
     // 最终持久化卡片(规范 CardModel,card_id 复用)
     try {
-      await this.sendCard(targetId, card(cardId, '运维助手', [
+      const sections = [
         md(fullContent || '(空回复)'),
         note(`session_id: ops-assistant-${senderUserId}`),
-      ], { color: 'blue' }), convType);
+      ];
+      await this.sendCard(targetId, card(cardId, '运维助手', sections, {
+        color: 'blue',
+        ...(reasoningContent ? { reasoning: reasoningContent } : {}),
+      }), convType);
     } catch (cardErr) {
       this.log.warn(`[OpsAssistant] 发送最终卡片失败: ${cardErr.message}`);
     }

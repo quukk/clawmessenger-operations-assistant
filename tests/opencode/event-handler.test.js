@@ -82,7 +82,7 @@ async function run() {
   assert.strictEqual(completed.isLast, true, 'completed 应是尾流');
   assert.ok(completed.streamDelta.is_final, 'completed 应 is_final=true');
   assert.strictEqual(completed.streamDelta.session_status, 'completed');
-  assert.strictEqual(completed.streamDelta.content, 'Hello World', 'completed content 应是完整累积内容');
+  assert.strictEqual(completed.streamDelta.content, '', 'completed content 应为空(最终卡片承载内容)');
 
   assert.ok(finalCardCalled, 'sendFinalCard 应被调用');
   assert.strictEqual(finalCardCalled.cardId, 'card-1');
@@ -121,6 +121,294 @@ async function run() {
   assert.ok(errorCardCalled, 'sendErrorCard 应被调用');
   assert.strictEqual(errorCardCalled.error, 'boom');
   assert.strictEqual(errorCardCalled.cardId, 'card-err');
+
+  // === 测试 8:reasoning/thinking 增量不混入正常内容,但随流传递 ===
+  sent.length = 0;
+  finalCardCalled = null;
+  const reasoningSession = 'sess-reason-1';
+  handler.registerSession(reasoningSession, {
+    chatId: 'ops-user3',
+    targetId: 'user3',
+    senderUserId: 'user3',
+    convType: 1,
+    cardId: 'card-reason',
+    streamId: 'stream-reason',
+  });
+  // 第一条为 reasoning 增量
+  await handler._handleEvent({ type: 'message.part.delta', properties: { sessionID: reasoningSession, field: 'thinking', delta: 'Thinking...' } });
+  const reasoningFirst = sent[sent.length - 1];
+  assert.strictEqual(reasoningFirst.streamDelta.session_status, 'responding');
+  assert.strictEqual(reasoningFirst.streamDelta.content, '', 'reasoning 增量不应作为 content 发送');
+  assert.strictEqual(reasoningFirst.streamDelta.reasoning_content, 'Thinking...', 'reasoning 增量应进入 reasoning_content');
+  assert.strictEqual(reasoningFirst.extra, undefined, 'reasoning 后续流不应带 extra');
+  // 第二条为正常内容增量
+  await handler._handleEvent({ type: 'message.part.delta', properties: { sessionID: reasoningSession, delta: 'Answer' } });
+  const reasoningSecond = sent[sent.length - 1];
+  assert.strictEqual(reasoningSecond.streamDelta.content, 'Answer', '正常内容应作为 content 发送');
+  assert.strictEqual(reasoningSecond.streamDelta.reasoning_content, 'Thinking...', 'reasoning 内容应保留并传递');
+  // session.idle 终态与最终卡片应携带 reasoningContent
+  await handler._handleEvent({ type: 'session.idle', properties: { sessionID: reasoningSession } });
+  const completedReasoning = sent[sent.length - 1]; // completed 尾流
+  assert.strictEqual(completedReasoning.streamDelta.session_status, 'completed');
+  assert.strictEqual(completedReasoning.streamDelta.reasoning_content, undefined, 'completed reasoning_content 应为空(已随流发送)');
+  assert.ok(finalCardCalled, 'sendFinalCard 应被调用');
+  assert.strictEqual(finalCardCalled.fullContent, 'Answer');
+  assert.strictEqual(finalCardCalled.reasoningContent, 'Thinking...');
+
+  // === 测试 9:<thinking> 标签跨 delta 分片,reasoning 与正文分离 ===
+  sent.length = 0;
+  finalCardCalled = null;
+  const thinkSession = 'sess-think-1';
+  handler.registerSession(thinkSession, {
+    chatId: 'ops-user4',
+    targetId: 'user4',
+    senderUserId: 'user4',
+    convType: 1,
+    cardId: 'card-think',
+    streamId: 'stream-think',
+  });
+  await handler._handleEvent({ type: 'message.part.delta', properties: { sessionID: thinkSession, delta: 'pre <thi' } });
+  await handler._handleEvent({ type: 'message.part.delta', properties: { sessionID: thinkSession, delta: 'nking>reasoning</th' } });
+  await handler._handleEvent({ type: 'message.part.delta', properties: { sessionID: thinkSession, delta: 'inking> final' } });
+  await handler._handleEvent({ type: 'session.idle', properties: { sessionID: thinkSession } });
+  const completedThink = sent[sent.length - 1];
+  assert.strictEqual(completedThink.streamDelta.session_status, 'completed');
+  assert.strictEqual(completedThink.streamDelta.content, '', 'completed 正文应为空(最终卡片承载内容)');
+  assert.strictEqual(completedThink.streamDelta.reasoning_content, undefined, 'completed reasoning_content 应为空(已随流发送)');
+  assert.ok(finalCardCalled, 'sendFinalCard 应被调用');
+  assert.strictEqual(finalCardCalled.fullContent, 'pre  final');
+  assert.strictEqual(finalCardCalled.reasoningContent, 'reasoning');
+
+  // === 测试 10:Kimi 2.7+ reasoning part 类型分离,reasoning 不混入正文 ===
+  sent.length = 0;
+  finalCardCalled = null;
+  const kimiSession = 'sess-kimi-1';
+  handler.registerSession(kimiSession, {
+    chatId: 'ops-user5',
+    targetId: 'user5',
+    senderUserId: 'user5',
+    convType: 1,
+    cardId: 'card-kimi',
+    streamId: 'stream-kimi',
+  });
+  // 1. part.updated 声明 reasoning part,空文本
+  await handler._handleEvent({
+    type: 'message.part.updated',
+    properties: {
+      sessionID: kimiSession,
+      part: { id: 'part-reason-1', type: 'reasoning', text: '' },
+    },
+  });
+  // 2. delta 携带 field='text' 但 partID 指向 reasoning part
+  await handler._handleEvent({
+    type: 'message.part.delta',
+    properties: {
+      sessionID: kimiSession,
+      partID: 'part-reason-1',
+      field: 'text',
+      delta: 'Let me think step by step. ',
+    },
+  });
+  await handler._handleEvent({
+    type: 'message.part.delta',
+    properties: {
+      sessionID: kimiSession,
+      partID: 'part-reason-1',
+      field: 'text',
+      delta: '2+2=4.',
+    },
+  });
+  // 3. part.updated 给出最终 reasoning 文本
+  await handler._handleEvent({
+    type: 'message.part.updated',
+    properties: {
+      sessionID: kimiSession,
+      part: { id: 'part-reason-1', type: 'reasoning', text: 'Let me think step by step. 2+2=4.' },
+    },
+  });
+  // 4. 正常 answer text part
+  await handler._handleEvent({
+    type: 'message.part.updated',
+    properties: {
+      sessionID: kimiSession,
+      part: { id: 'part-text-1', type: 'text', text: 'The answer is 4.' },
+    },
+  });
+  await handler._handleEvent({ type: 'session.idle', properties: { sessionID: kimiSession } });
+
+  // 流式阶段 reasoning 增量不应作为 content 发送
+  const respondingChunks = sent.filter((s) => s.streamDelta.session_status === 'responding');
+  assert.strictEqual(respondingChunks.length, 2, '应发送 2 个 responding 流片');
+  assert.strictEqual(respondingChunks[0].streamDelta.content, '', 'reasoning 增量不应作为 content 发送');
+  assert.strictEqual(respondingChunks[0].streamDelta.reasoning_content, 'Let me think step by step. ', 'reasoning 应随流累积');
+  assert.strictEqual(respondingChunks[1].streamDelta.content, '', 'reasoning 增量不应作为 content 发送');
+  assert.strictEqual(respondingChunks[1].streamDelta.reasoning_content, 'Let me think step by step. 2+2=4.', 'reasoning 应完整累积');
+
+  const completedKimi = sent[sent.length - 1];
+  assert.strictEqual(completedKimi.streamDelta.session_status, 'completed');
+  assert.strictEqual(completedKimi.streamDelta.content, '', 'completed 正文应为空(最终卡片承载内容)');
+  assert.strictEqual(completedKimi.streamDelta.reasoning_content, undefined, 'completed reasoning_content 应为空(已随流发送)');
+  assert.ok(finalCardCalled, 'sendFinalCard 应被调用');
+  assert.strictEqual(finalCardCalled.fullContent, 'The answer is 4.');
+  assert.strictEqual(finalCardCalled.reasoningContent, 'Let me think step by step. 2+2=4.');
+
+  // === 测试 11:text part 同时有 delta 和 updated 时,正文不应重复 ===
+  sent.length = 0;
+  finalCardCalled = null;
+  const textDupSession = 'sess-text-dup-1';
+  handler.registerSession(textDupSession, {
+    chatId: 'ops-user6',
+    targetId: 'user6',
+    senderUserId: 'user6',
+    convType: 1,
+    cardId: 'card-text-dup',
+    streamId: 'stream-text-dup',
+  });
+  // 先声明 text part 映射
+  await handler._handleEvent({
+    type: 'message.part.updated',
+    properties: {
+      sessionID: textDupSession,
+      part: { id: 'part-text-2', type: 'text', text: '' },
+    },
+  });
+  // 通过 deltas 累积正文
+  await handler._handleEvent({
+    type: 'message.part.delta',
+    properties: {
+      sessionID: textDupSession,
+      partID: 'part-text-2',
+      field: 'text',
+      delta: 'Hello',
+    },
+  });
+  await handler._handleEvent({
+    type: 'message.part.delta',
+    properties: {
+      sessionID: textDupSession,
+      partID: 'part-text-2',
+      field: 'text',
+      delta: ' World',
+    },
+  });
+  // 随后到达 part.updated 快照(与 deltas 内容相同)
+  await handler._handleEvent({
+    type: 'message.part.updated',
+    properties: {
+      sessionID: textDupSession,
+      part: { id: 'part-text-2', type: 'text', text: 'Hello World' },
+    },
+  });
+  await handler._handleEvent({ type: 'session.idle', properties: { sessionID: textDupSession } });
+
+  const completedTextDup = sent[sent.length - 1];
+  assert.strictEqual(completedTextDup.streamDelta.session_status, 'completed');
+  assert.strictEqual(completedTextDup.streamDelta.content, '', 'completed 正文应为空(最终卡片承载内容)');
+  assert.ok(finalCardCalled, 'sendFinalCard 应被调用');
+  assert.strictEqual(finalCardCalled.fullContent, 'Hello World', 'finalCard 正文不应重复');
+
+  // === 测试 12:message.part.updated text 快照即使比 delta 累积短也权威覆盖 ===
+  sent.length = 0;
+  finalCardCalled = null;
+  const snapshotSession = 'sess-snapshot-1';
+  handler.registerSession(snapshotSession, {
+    chatId: 'ops-user7',
+    targetId: 'user7',
+    senderUserId: 'user7',
+    convType: 1,
+    cardId: 'card-snapshot',
+    streamId: 'stream-snapshot',
+  });
+  // 先声明 text part
+  await handler._handleEvent({
+    type: 'message.part.updated',
+    properties: {
+      sessionID: snapshotSession,
+      part: { id: 'part-text-3', type: 'text', text: '' },
+    },
+  });
+  // deltas 累积了较长文本
+  await handler._handleEvent({
+    type: 'message.part.delta',
+    properties: {
+      sessionID: snapshotSession,
+      partID: 'part-text-3',
+      field: 'text',
+      delta: 'Hello World and even more text',
+    },
+  });
+  // 最终快照更短，应覆盖 delta 累积内容
+  await handler._handleEvent({
+    type: 'message.part.updated',
+    properties: {
+      sessionID: snapshotSession,
+      part: { id: 'part-text-3', type: 'text', text: 'Hello World' },
+    },
+  });
+  await handler._handleEvent({ type: 'session.idle', properties: { sessionID: snapshotSession } });
+  assert.ok(finalCardCalled, 'sendFinalCard 应被调用');
+  assert.strictEqual(finalCardCalled.fullContent, 'Hello World', 'text 快照应权威覆盖 delta 累积内容');
+
+  // === 测试 13:<dcp-system-reminder> 块从正文和 reasoning 中剥离 ===
+  sent.length = 0;
+  finalCardCalled = null;
+  const dcpSession = 'sess-dcp-1';
+  handler.registerSession(dcpSession, {
+    chatId: 'ops-user8',
+    targetId: 'user8',
+    senderUserId: 'user8',
+    convType: 1,
+    cardId: 'card-dcp',
+    streamId: 'stream-dcp',
+  });
+  // reasoning 字段中含大小写系统提醒块
+  await handler._handleEvent({
+    type: 'message.part.delta',
+    properties: {
+      sessionID: dcpSession,
+      field: 'thinking',
+      delta: '<DCP-System-Reminder>do not show</dcp-system-reminder>visible reasoning',
+    },
+  });
+  const dcpReasoningChunk = sent[sent.length - 1];
+  assert.strictEqual(dcpReasoningChunk.streamDelta.content, '', 'reasoning 增量不应作为 content 发送');
+  assert.strictEqual(dcpReasoningChunk.streamDelta.reasoning_content, 'visible reasoning', '系统提醒块应从 reasoning 中移除');
+
+  // 正文增量中含跨行系统提醒块
+  await handler._handleEvent({
+    type: 'message.part.delta',
+    properties: {
+      sessionID: dcpSession,
+      delta: 'before <dcp-system-reminder>\nsecret\n</dcp-system-reminder> after',
+    },
+  });
+  const dcpTextChunk = sent[sent.length - 1];
+  assert.strictEqual(dcpTextChunk.streamDelta.content, 'before  after', '系统提醒块应从正文移除');
+
+  // 嵌套系统提醒块
+  await handler._handleEvent({
+    type: 'message.part.delta',
+    properties: {
+      sessionID: dcpSession,
+      delta: 'x<dcp-system-reminder>outer<dcp-system-reminder>inner</dcp-system-reminder>outer</dcp-system-reminder>y',
+    },
+  });
+  const dcpNestedChunk = sent[sent.length - 1];
+  assert.strictEqual(dcpNestedChunk.streamDelta.content, 'xy', '嵌套系统提醒块应完全移除');
+
+  // part.updated 快照也应被消毒
+  await handler._handleEvent({
+    type: 'message.part.updated',
+    properties: {
+      sessionID: dcpSession,
+      part: { id: 'part-dcp-text', type: 'text', text: 'snapshot<dcp-system-reminder>hidden</dcp-system-reminder>end' },
+    },
+  });
+
+  await handler._handleEvent({ type: 'session.idle', properties: { sessionID: dcpSession } });
+  assert.ok(finalCardCalled, 'sendFinalCard 应被调用');
+  assert.strictEqual(finalCardCalled.fullContent, 'snapshotend', '最终卡片正文不应含系统提醒块');
+  assert.strictEqual(finalCardCalled.reasoningContent, 'visible reasoning', '最终卡片 reasoning 不应含系统提醒块');
 
   console.log('✓ EventHandler smoke tests passed');
 }
