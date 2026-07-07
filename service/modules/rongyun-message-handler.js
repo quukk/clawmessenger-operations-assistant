@@ -306,6 +306,7 @@ class RongyunMessageHandler {
     let seq = 0;
     let hasSentChunk = false;
     const fromUserId = this.config.accountId || '';
+    let extra = null;
 
     try {
       // 发送初始流式卡片(规范 CardModel)
@@ -319,7 +320,7 @@ class RongyunMessageHandler {
       ], { color: 'blue' }));
 
       // B3:extra 卡片壳(与上面初始静态卡同 card_id,前端续流依赖)
-      const extra = buildStreamExtra({ cardId, title: 'AI 助手' });
+      extra = buildStreamExtra({ cardId, title: 'AI 助手' });
 
       // B3:发送 thinking 态首流(空 content,seq=0)
       //    让前端进入"思考中"渲染,extra 壳让前端定位到初始静态卡续流
@@ -341,9 +342,10 @@ class RongyunMessageHandler {
           const chunkToSend = buffer;
           buffer = ''; // 清空缓冲区
 
-          // responding 态增量片段(extra 仅首流已发,此处不传)
+          // responding 态增量片段(extra 每个 chunk 都带,确保前端拿到 card_id)
           await this._sendStreamChunk(fromUserId, sourceId, streamId, false, false, seq, {
             streamDelta: buildStreamDelta({ content: chunkToSend, sessionStatus: 'responding', seq }),
+            extra,
           });
         }
       }, (level, message) => {
@@ -361,6 +363,7 @@ class RongyunMessageHandler {
         seq += 1;
         await this._sendStreamChunk(fromUserId, sourceId, streamId, false, false, seq, {
           streamDelta: buildStreamDelta({ content: buffer, sessionStatus: 'responding', seq }),
+          extra,
         });
         buffer = '';
       }
@@ -369,6 +372,7 @@ class RongyunMessageHandler {
       seq += 1;
       await this._sendStreamChunk(fromUserId, sourceId, streamId, false, true, seq, {
         streamDelta: buildStreamDelta({ content: fullResponse, sessionStatus: 'completed', seq, isFinal: true }),
+        extra,
       });
 
       // 发送最终持久化卡片(规范 CardModel)
@@ -406,6 +410,7 @@ class RongyunMessageHandler {
             isFinal: true,
             error: msg,
           }),
+          extra,
         });
       }
 

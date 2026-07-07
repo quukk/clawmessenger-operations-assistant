@@ -22,6 +22,12 @@ class RongCloudClient {
     this.processingQueue = Promise.resolve();
     this.processedMessageUIds = new Set();
     this.messageDedupMaxSize = 1000;
+    // 自定义消息构造函数占位（connect 中注册后填充）
+    this.commandCtor = null;
+    this.commandResultCtor = null;
+    this.cardMessageCtor = null;
+    this.cardUpdateCtor = null;
+    this.serviceChatCtor = null;
     // 发送侧短期缓存：防止融云 SDK 回传自己发送的消息导致机器人自言自语
     this.sentMessageUIds = new Set();
     this.sentMessageDedupMaxSize = 100;
@@ -79,6 +85,35 @@ class RongCloudClient {
       }
     } catch (err) {
       this.log?.warn(`[RongCloudClient] 注册自定义消息类型失败: ${err.message}`);
+    }
+
+    // 同步自定义消息构造函数到统一属性名（供 sendMessage 路由使用）
+    this.commandCtor = this.SystemServiceMessage || null;
+    this.commandResultCtor = this.CommandResult || null;
+    this.cardMessageCtor = this.CardMessage || null;
+    this.cardUpdateCtor = this.CardUpdate || null;
+    this.serviceChatCtor = this.ServiceChatMessage || null;
+
+    // 兜底：Node polyfill 环境下 registerMessageType 可能返回 undefined
+    if (!this.commandCtor && RongIMLib.MessageType && RongIMLib.MessageType.command) {
+      this.commandCtor = RongIMLib.MessageType.command;
+      this.log?.info('[RongCloudClient] command 从 MessageType.command 兜底获取');
+    }
+    if (!this.commandResultCtor && RongIMLib.MessageType && RongIMLib.MessageType.command_result) {
+      this.commandResultCtor = RongIMLib.MessageType.command_result;
+      this.log?.info('[RongCloudClient] command_result 从 MessageType.command_result 兜底获取');
+    }
+    if (!this.cardMessageCtor && RongIMLib.MessageType && RongIMLib.MessageType.card_message) {
+      this.cardMessageCtor = RongIMLib.MessageType.card_message;
+      this.log?.info('[RongCloudClient] card_message 从 MessageType.card_message 兜底获取');
+    }
+    if (!this.cardUpdateCtor && RongIMLib.MessageType && RongIMLib.MessageType.card_update) {
+      this.cardUpdateCtor = RongIMLib.MessageType.card_update;
+      this.log?.info('[RongCloudClient] card_update 从 MessageType.card_update 兜底获取');
+    }
+    if (!this.serviceChatCtor && RongIMLib.MessageType && RongIMLib.MessageType.service_chat) {
+      this.serviceChatCtor = RongIMLib.MessageType.service_chat;
+      this.log?.info('[RongCloudClient] service_chat 从 MessageType.service_chat 兜底获取');
     }
 
     this.log?.info(`[RongCloudClient] SDK Events: ${JSON.stringify(Object.keys(RongIMLib.Events || {}))}`);
@@ -281,28 +316,37 @@ class RongCloudClient {
         ? (RongIMLib.ConversationType?.GROUP || ConversationType.GROUP)
         : (RongIMLib.ConversationType?.PRIVATE || ConversationType.PRIVATE);
 
-      // 检测 card_message / card_update:对齐自定义消息类型路由
-      // card_update 复用与 card_message 相同的显式对象构造方式(已注册为 card_update 类型)
+      // 检测已注册自定义消息类型：对齐自定义消息类型路由
+      // card_message / card_update / command_result / command / service_chat
+      // 均使用注册后的构造函数，content 序列化为 JSON 字符串后传入
       let messageContent = new RongIMLib.TextMessage({ content });
       try {
         const parsed = JSON.parse(content);
-        if (parsed && (parsed.msg_type === 'card_message' || parsed.msg_type === 'card_update')) {
+        if (parsed && parsed.msg_type) {
           const mt = parsed.msg_type;
-          if (mt === 'card_message' && this.CardMessage) {
-            try {
-              const cardMsg = new this.CardMessage(parsed);
-              this.log?.info(`[RongCloudClient] CardMessage objectName=${cardMsg.objectName || '(empty)'}, messageType=${cardMsg.messageType || '(empty)'}, has content=${!!cardMsg.content}`);
-            } catch (e) {
-              this.log?.warn(`[RongCloudClient] CardMessage 构造函数异常: ${e.message}`);
-            }
+          const contentStr = JSON.stringify(parsed);
+
+          if (mt === 'card_message' && this.cardMessageCtor) {
+            messageContent = new this.cardMessageCtor(contentStr);
+            messageContent.messageType = 'card_message';
+            this.log?.info(`[RongCloudClient] card_message 自定义消息对象已构造, objectName=${messageContent.objectName || '(empty)'}, messageType=${messageContent.messageType || '(empty)'}, has content=${!!messageContent.content}`);
+          } else if (mt === 'card_update' && this.cardUpdateCtor) {
+            messageContent = new this.cardUpdateCtor(contentStr);
+            messageContent.messageType = 'card_update';
+            this.log?.info(`[RongCloudClient] card_update 自定义消息对象已构造, objectName=${messageContent.objectName || '(empty)'}, messageType=${messageContent.messageType || '(empty)'}, has content=${!!messageContent.content}`);
+          } else if (mt === 'command_result' && this.commandResultCtor) {
+            messageContent = new this.commandResultCtor(contentStr);
+            messageContent.messageType = 'command_result';
+            this.log?.info(`[RongCloudClient] command_result 自定义消息对象已构造, objectName=${messageContent.objectName || '(empty)'}, messageType=${messageContent.messageType || '(empty)'}, has content=${!!messageContent.content}`);
+          } else if (mt === 'command' && this.commandCtor) {
+            messageContent = new this.commandCtor(contentStr);
+            this.log?.info(`[RongCloudClient] command 自定义消息对象已构造, objectName=${messageContent.objectName || '(empty)'}, messageType=${messageContent.messageType || '(empty)'}, has content=${!!messageContent.content}`);
+          } else if (mt === 'service_chat' && this.serviceChatCtor) {
+            messageContent = new this.serviceChatCtor(contentStr);
+            messageContent.messageType = 'service_chat';
+            this.log?.info(`[RongCloudClient] service_chat 自定义消息对象已构造, objectName=${messageContent.objectName || '(empty)'}, messageType=${messageContent.messageType || '(empty)'}, has content=${!!messageContent.content}`);
           }
-          // 绕过构造函数的 polyfill 兼容写法：显式构造自定义消息对象
-          messageContent = {
-            objectName: mt,
-            messageType: mt,
-            content: parsed,
-          };
-          this.log?.info(`[RongCloudClient] 使用显式 ${mt} 对象`);
+          // 非注册自定义消息(如未知 msg_type)或未识别类型保持 TextMessage fallback
         }
       } catch (_) { /* not JSON, use text */ }
 

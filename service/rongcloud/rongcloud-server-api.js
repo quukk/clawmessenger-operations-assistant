@@ -251,7 +251,7 @@ class RongCloudServerAPI {
       toUserId,
       objectName: 'RC:StreamMsg',
       content: contentBody,
-      isPersisted: 1,
+      isPersisted: isFirstChunk || isLastChunk ? 1 : 0,
       isCounted: isFirstChunk ? 1 : 0,
       disableUpdateLastMsg: !isLastChunk
     };
@@ -294,7 +294,7 @@ class RongCloudServerAPI {
       toGroupId,
       objectName: 'RC:StreamMsg',
       content: contentBody,
-      isPersisted: 1,
+      isPersisted: isFirstChunk || isLastChunk ? 1 : 0,
       isCounted: isFirstChunk ? 1 : 0,
       isIncludeSender: 1,
       disableUpdateLastMsg: !isLastChunk
@@ -331,8 +331,9 @@ class RongCloudServerAPI {
       content: JSON.stringify(streamDelta),
     };
 
-    // 首流写 extra 卡片壳(stream_type 信息在 extra)
-    if (isFirstChunk && extra && typeof extra === 'object') {
+    // 每个 chunk 都写 extra 卡片壳，确保前端无需依赖首流即可拿到 card_id
+    //（首流可能因分页/离线未加载，导致后续流无法定位卡片）
+    if (extra && typeof extra === 'object') {
       contentBody.extra = extra;
     }
 

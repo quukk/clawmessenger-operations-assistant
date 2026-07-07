@@ -7,6 +7,7 @@
 const { RongyunMessageTypeEnum } = require('./rongyun-message-types');
 const { getMacAddress } = require('./mac-address');
 const { generateSecret } = require('./auth');
+const { SAFE_LIMIT, HARD_LIMIT, estimateMessageSize, truncateCardPayload } = require('../utils/message-size');
 
 class RongyunMessageSender {
   constructor(rongcloudClient, config, log) {
@@ -295,14 +296,39 @@ class RongyunMessageSender {
 
     try {
       // 规范 CardModel 直接透传,仅补 msg_type + timestamp
-      const payload = {
+      let payload = {
         ...cardData,
         msg_type: 'card_message',
         timestamp: cardData.timestamp || Date.now(),
       };
+
+      const initialSize = estimateMessageSize(payload);
+      if (initialSize > SAFE_LIMIT) {
+        this.log?.warn(`[RongyunMessageSender] 卡片消息体积(${initialSize} 字节)超过安全阈值 ${SAFE_LIMIT}，执行截断`);
+        payload = truncateCardPayload(payload);
+        const truncatedSize = estimateMessageSize(payload);
+        this.log?.warn(`[RongyunMessageSender] 截断后体积 ${truncatedSize} 字节`);
+
+        if (truncatedSize > HARD_LIMIT) {
+          this.log?.error(`[RongyunMessageSender] 截断后仍超过硬上限 ${HARD_LIMIT}，发送最小化错误卡片`);
+          payload = {
+            schema: '1.0.0',
+            id: cardData.id || `card-error-${Date.now()}`,
+            header: { title: '消息过大', color: 'red' },
+            sections: [
+              { kind: 'markdown', content: '消息内容超过融云单条限制（5KB），无法完整展示。' },
+              { kind: 'note', text: '请减少请求内容或分批查询。' },
+            ],
+            config: {},
+            msg_type: 'card_message',
+            timestamp: Date.now(),
+          };
+        }
+      }
+
       const result = await this.rongcloudClient.sendMessage(
         targetId,
-        JSON.stringify(payload),
+        payload,
         conversationType
       );
 
@@ -335,12 +361,12 @@ class RongyunMessageSender {
    * @param {string} cardId - 首张卡片 ID(必须与首卡一致,前端按此合并)
    * @param {Object} appendData - 增量字段 { appendCommands?: [], appendSessions?: [] }
    * @param {number} [conversationType=1] - 会话类型
-   * @returns {Promise<boolean>}
+   * @returns {Promise<Object>} { success: boolean, size?: number, reason?: string, error?: string }
    */
   async sendCardUpdate(targetId, cardId, appendData, conversationType = 1) {
     if (!this.rongcloudClient?.isConnected) {
       this.log?.error('[RongyunMessageSender] 未连接，无法发送卡片更新');
-      return false;
+      return { success: false, reason: 'not connected' };
     }
 
     try {
@@ -350,9 +376,16 @@ class RongyunMessageSender {
         timestamp: Date.now(),
         ...appendData,
       };
+
+      const size = estimateMessageSize(payload);
+      if (size > SAFE_LIMIT) {
+        this.log?.warn(`[RongyunMessageSender] card_update 体积超过安全阈值(${size} > ${SAFE_LIMIT})，拒绝发送`);
+        return { success: false, size, reason: 'too large' };
+      }
+
       const result = await this.rongcloudClient.sendMessage(
         targetId,
-        JSON.stringify(payload),
+        payload,
         conversationType
       );
 
@@ -365,10 +398,10 @@ class RongyunMessageSender {
         this.log?.warn(`[RongyunMessageSender] card_update 发送失败 -> ${targetId}, cardId=${cardId}`);
       }
 
-      return result;
+      return { success: !!result, size };
     } catch (err) {
       this.log?.error(`[RongyunMessageSender] 发送 card_update 异常: ${err.message}`);
-      return false;
+      return { success: false, reason: 'exception', error: err.message };
     }
   }
 }

@@ -1,3 +1,22 @@
+const { SAFE_LIMIT, estimateMessageSize } = require('../utils/message-size');
+
+/**
+ * 动态分批时单批最多 item 数兜底。
+ */
+const MAX_ITEMS_PER_BATCH = 50;
+
+/**
+ * 构造一个 card_update payload，用于体积估算（timestamp 字段大小可忽略）。
+ */
+function buildUpdatePayload(cardId, appendData) {
+  return {
+    msg_type: 'card_update',
+    cardId,
+    timestamp: Date.now(),
+    ...appendData,
+  };
+}
+
 /**
  * Skill 抽象基类
  *
@@ -180,7 +199,7 @@ class BaseSkill {
    * @param {number} opts.convType - 会话类型
    * @param {string} opts.cardId - 首卡 ID(必须与首卡一致)
    * @param {Array} opts.allItems - 完整数据项数组(含首批)
-   * @param {number} [opts.batchSize=50] - 首批/每批大小(剩余项从 index=batchSize 开始)
+   * @param {number} [opts.batchSize=50] - 首卡已发送的 item 数量（剩余项从 index=batchSize 开始）
    * @param {number} [opts.sleepMs=300] - 批次间隔
    * @param {Function} opts.buildAppendData - (batchItems) => card_update 的 appendData 对象
    * @returns {Promise<void>} 立即 resolve(后台推送不阻塞)
@@ -189,22 +208,63 @@ class BaseSkill {
     targetId, convType, cardId, allItems,
     batchSize = 50, sleepMs = 300, buildAppendData,
   }) {
-    const restCount = Math.max(0, allItems.length - batchSize);
-    if (restCount <= 0) return Promise.resolve();
+    const startIndex = Math.max(0, Math.min(batchSize, allItems.length));
+    const restItems = allItems.slice(startIndex);
+    if (restItems.length === 0) return Promise.resolve();
 
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    const estimateUpdateSize = (items) => {
+      const appendData = buildAppendData(items);
+      return estimateMessageSize(buildUpdatePayload(cardId, appendData));
+    };
+
     (async () => {
-      for (let i = batchSize; i < allItems.length; i += batchSize) {
-        const batch = allItems.slice(i, i + batchSize);
+      let currentBatch = [];
+      let batchNumber = 0;
+      let sentBatchCount = 0;
+
+      const sendCurrentBatch = async () => {
+        if (currentBatch.length === 0) return;
+        batchNumber++;
+        const appendData = buildAppendData(currentBatch);
+        const size = estimateUpdateSize(currentBatch);
+        this.log.info(`batch ${batchNumber} 发送，共 ${currentBatch.length} 项，约 ${size} 字节`);
+
         try {
-          await this.sendCardUpdate(targetId, cardId, buildAppendData(batch), convType);
+          const result = await this.sendCardUpdate(targetId, cardId, appendData, convType);
+          if (result && result.success === false) {
+            this.log.warn(`[BaseSkill._streamRemainingBatches] 批次 ${batchNumber} 发送被拒绝: ${JSON.stringify(result)}`);
+          }
         } catch (err) {
-          this.log.warn(`[BaseSkill._streamRemainingBatches] 批次 i=${i} 发送失败: ${err.message}`);
+          this.log.warn(`[BaseSkill._streamRemainingBatches] 批次 ${batchNumber} 发送失败: ${err.message}`);
         }
-        if (i + batchSize < allItems.length) {
-          await sleep(sleepMs);
+        sentBatchCount++;
+        currentBatch = [];
+      };
+
+      for (const item of restItems) {
+        const candidate = [...currentBatch, item];
+        const candidateSize = estimateUpdateSize(candidate);
+        if (candidateSize > SAFE_LIMIT && currentBatch.length > 0) {
+          await sendCurrentBatch();
+          if (sentBatchCount > 0) {
+            await sleep(sleepMs);
+          }
+          currentBatch = [item];
+        } else {
+          currentBatch.push(item);
+        }
+
+        if (currentBatch.length >= MAX_ITEMS_PER_BATCH) {
+          await sendCurrentBatch();
+          if (sentBatchCount > 0) {
+            await sleep(sleepMs);
+          }
         }
       }
+
+      await sendCurrentBatch();
     })().catch((err) => {
       this.log.warn(`[BaseSkill._streamRemainingBatches] 后台分批推送异常: ${err.message}`);
     });

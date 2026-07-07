@@ -278,7 +278,7 @@ class EventHandler {
             await this.sendStreamChunk(
               streamState.targetId,
               streamState.streamId,
-              true, // isFirstChunk(写 extra 卡片壳)
+              true, // isFirstChunk
               false,
               0, // seq=0 thinking
               {
@@ -288,7 +288,6 @@ class EventHandler {
             );
           }
           streamState.hasSentStream = true;
-          // extra 已在首流写过,后续不再重复写
         }
 
         // 本次增量跳过空内容(避免无意义的空流片)
@@ -306,6 +305,7 @@ class EventHandler {
             streamState.seq,
             {
               streamDelta: buildStreamDelta({ content: delta, sessionStatus: 'responding', seq: streamState.seq }),
+              extra: streamState.extra,
             },
           );
         }
@@ -374,6 +374,7 @@ class EventHandler {
                 seq: streamState.seq,
                 isFinal: true,
               }),
+              extra: streamState.extra,
             },
           );
         }
