@@ -15,6 +15,17 @@
 const path = require('path');
 const fs = require('fs');
 const url = require('url');
+const axios = require('axios');
+
+const REASONING_INSTRUCTION = `CRITICAL RULE — DO NOT IGNORE:
+1. Output ONLY the final answer in the main response text.
+2. ALL internal reasoning, planning, thinking, tool-use process, and self-reflection MUST be placed entirely inside <thinking>...</thinking> tags.
+3. ONLY text outside <thinking> tags will be shown to the user.
+4. NEVER put the answer inside <thinking> tags.
+5. NEVER output raw reasoning outside <thinking> tags.
+6. NEVER interleave reasoning with the answer. The answer must be a continuous, clean response without any internal monologue.
+7. Begin your visible answer immediately; do not start with phrases like "I should", "Let me", "Actually," or "The user wants".
+8. If the user's message is in Chinese, the visible answer should be in Chinese. Any English planning or reflection must be hidden inside <thinking> tags.`;
 
 /** 缓存 SDK 模块,避免每次 promptAsync 都重复 import */
 let _sdkModulePromise = null;
@@ -88,7 +99,9 @@ class OpencodeClient {
   constructor(options) {
     this.baseUrl = options.baseUrl;
     this.directory = options.directory || process.cwd();
-    this.systemPrompt = options.systemPrompt || null;
+    this.systemPrompt = options.systemPrompt
+      ? REASONING_INSTRUCTION + '\n\n' + options.systemPrompt
+      : REASONING_INSTRUCTION;
     this.log = options.log || console;
     this._clientPromise = null;
   }
@@ -119,7 +132,9 @@ class OpencodeClient {
 
   /** 设置/覆盖 system prompt(例如运行时从 prompt.md 加载) */
   setSystemPrompt(prompt) {
-    this.systemPrompt = prompt || null;
+    this.systemPrompt = prompt
+      ? REASONING_INSTRUCTION + '\n\n' + prompt
+      : REASONING_INSTRUCTION;
   }
 
   getDirectory() {
@@ -236,6 +251,64 @@ class OpencodeClient {
       this.log.error(`[OpencodeClient] fetchLastMessageText failed: ${err.message}`);
     }
     return null;
+  }
+
+  /**
+   * 读取当前 OpenCode 配置(用于获取当前模型等)。
+   * @returns {Promise<Object>}
+   */
+  async getConfig() {
+    const client = await this._getClient();
+    const { data, error, response } = await client.config.get({
+      directory: this.directory,
+    });
+    if (error) {
+      const errStr = serializeError(error);
+      const statusText = response?.statusText ? ` [${response.status} ${response.statusText}]` : '';
+      throw new Error(`读取配置失败: ${errStr}${statusText}`);
+    }
+    return data || {};
+  }
+
+  /**
+   * 列出所有可用的 AI 提供商及其模型。
+   * @returns {Promise<Object>}
+   */
+  async listProviders() {
+    const client = await this._getClient();
+    const { data, error, response } = await client.provider.list({
+      directory: this.directory,
+    });
+    if (error) {
+      const errStr = serializeError(error);
+      const statusText = response?.statusText ? ` [${response.status} ${response.statusText}]` : '';
+      throw new Error(`列出提供商失败: ${errStr}${statusText}`);
+    }
+    return data || {};
+  }
+
+  /**
+   * 切换指定会话的模型。
+   * @param {string} sessionId
+   * @param {string} model
+   * @returns {Promise<Object>}
+   */
+  async switchModel(sessionId, model) {
+    const url = `${this.baseUrl.replace(/\/$/, '')}/api/session/${encodeURIComponent(sessionId)}/model`;
+    const headers = {
+      'Content-Type': 'application/json',
+    };
+    if (this.password) {
+      headers.Authorization = `Basic ${Buffer.from(`opencode:${this.password}`).toString('base64')}`;
+    }
+    try {
+      const { data } = await axios.post(url, { model }, { headers });
+      this.log.info(`[OpencodeClient] 会话 ${sessionId} 模型已切换为 ${model}`);
+      return data;
+    } catch (err) {
+      const msg = err.response?.data?.message || err.response?.data?.error || err.message;
+      throw new Error(`切换模型失败: ${msg}`);
+    }
   }
 }
 

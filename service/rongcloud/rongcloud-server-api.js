@@ -14,9 +14,10 @@ const API_HOSTS_CN = [
 ];
 
 class RongCloudServerAPI {
-  constructor(configManager, log) {
+  constructor(configManager, log, streamBuffer = null) {
     this.configManager = configManager;
     this.log = log;
+    this.streamBuffer = streamBuffer;
     this.hosts = API_HOSTS_CN;
     this.currentHostIndex = 0;
     this.timeout = 10000;
@@ -233,6 +234,7 @@ class RongCloudServerAPI {
     extra = null,
   }) {
     const { appKey, appSecret } = await this._getRongCloudConfig();
+    const clientStreamId = streamDelta?.clientStreamId || null;
 
     const contentBody = this._buildStreamContentBody({
       isLastChunk,
@@ -242,7 +244,9 @@ class RongCloudServerAPI {
       extra,
     });
 
-    if (!isFirstChunk && messageUID) {
+    if (isFirstChunk && clientStreamId) {
+      contentBody.messageUID = clientStreamId;
+    } else if (!isFirstChunk && messageUID) {
       contentBody.messageUID = messageUID;
     }
 
@@ -257,7 +261,11 @@ class RongCloudServerAPI {
     };
 
     this.log?.info(`[RongCloudServerAPI] 发送单聊流式消息: to=${toUserId}, streamId=${streamId}, first=${isFirstChunk}, last=${isLastChunk}, seq=${seq}, hasExtra=${!!extra}`);
-    return this.request('/v3/message/private/publish_stream.json', data, appKey, appSecret);
+    const result = await this.request('/v3/message/private/publish_stream.json', data, appKey, appSecret);
+
+    this._appendToStreamBuffer(clientStreamId, streamDelta, seq);
+
+    return result;
   }
 
   /**
@@ -276,6 +284,7 @@ class RongCloudServerAPI {
     extra = null,
   }) {
     const { appKey, appSecret } = await this._getRongCloudConfig();
+    const clientStreamId = streamDelta?.clientStreamId || null;
 
     const contentBody = this._buildStreamContentBody({
       isLastChunk,
@@ -285,7 +294,9 @@ class RongCloudServerAPI {
       extra,
     });
 
-    if (!isFirstChunk && messageUID) {
+    if (isFirstChunk && clientStreamId) {
+      contentBody.messageUID = clientStreamId;
+    } else if (!isFirstChunk && messageUID) {
       contentBody.messageUID = messageUID;
     }
 
@@ -301,7 +312,11 @@ class RongCloudServerAPI {
     };
 
     this.log?.info(`[RongCloudServerAPI] 发送群聊流式消息: to=${toGroupId}, streamId=${streamId}, first=${isFirstChunk}, last=${isLastChunk}, seq=${seq}, hasExtra=${!!extra}`);
-    return this.request('/v3/message/group/publish_stream.json', data, appKey, appSecret);
+    const result = await this.request('/v3/message/group/publish_stream.json', data, appKey, appSecret);
+
+    this._appendToStreamBuffer(clientStreamId, streamDelta, seq);
+
+    return result;
   }
 
   /**
@@ -338,6 +353,36 @@ class RongCloudServerAPI {
     }
 
     return contentBody;
+  }
+
+  /**
+   * 将成功发送的流式片段追加到 StreamBuffer，供前端 HTTP SSE 端点消费。
+   *
+   * @private
+   * @param {string|null} clientStreamId
+   * @param {Object} streamDelta
+   * @param {number} seq
+   */
+  _appendToStreamBuffer(clientStreamId, streamDelta, seq) {
+    if (!this.streamBuffer || !clientStreamId || !streamDelta) {
+      return;
+    }
+
+    try {
+      const chunk = {
+        seq,
+        content: streamDelta.content || '',
+        reasoning_content: streamDelta.reasoning_content || '',
+        session_status: streamDelta.session_status || '',
+        is_final: !!streamDelta.is_final,
+        error: streamDelta.error || '',
+        card_id: streamDelta.card_id || '',
+        timestamp: Date.now(),
+      };
+      this.streamBuffer.append(clientStreamId, chunk);
+    } catch (err) {
+      this.log?.warn(`[RongCloudServerAPI] 流式片段缓冲失败: ${err.message}`);
+    }
   }
 
   /**

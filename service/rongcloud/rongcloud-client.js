@@ -318,37 +318,44 @@ class RongCloudClient {
 
       // 检测已注册自定义消息类型：对齐自定义消息类型路由
       // card_message / card_update / command_result / command / service_chat
-      // 均使用注册后的构造函数，content 序列化为 JSON 字符串后传入
-      let messageContent = new RongIMLib.TextMessage({ content });
-      try {
-        const parsed = JSON.parse(content);
-        if (parsed && parsed.msg_type) {
-          const mt = parsed.msg_type;
-          const contentStr = JSON.stringify(parsed);
+      // 均使用注册后的构造函数，content 直接传解析后的对象（避免 JSON 字符串导致 objectName 为空）
+      let messageContent;
+      let parsed = null;
+      if (typeof content === 'string') {
+        try { parsed = JSON.parse(content); } catch { }
+      } else if (content && typeof content === 'object') {
+        parsed = content;
+      }
 
-          if (mt === 'card_message' && this.cardMessageCtor) {
-            messageContent = new this.cardMessageCtor(contentStr);
-            messageContent.messageType = 'card_message';
-            this.log?.info(`[RongCloudClient] card_message 自定义消息对象已构造, objectName=${messageContent.objectName || '(empty)'}, messageType=${messageContent.messageType || '(empty)'}, has content=${!!messageContent.content}`);
-          } else if (mt === 'card_update' && this.cardUpdateCtor) {
-            messageContent = new this.cardUpdateCtor(contentStr);
-            messageContent.messageType = 'card_update';
-            this.log?.info(`[RongCloudClient] card_update 自定义消息对象已构造, objectName=${messageContent.objectName || '(empty)'}, messageType=${messageContent.messageType || '(empty)'}, has content=${!!messageContent.content}`);
-          } else if (mt === 'command_result' && this.commandResultCtor) {
-            messageContent = new this.commandResultCtor(contentStr);
-            messageContent.messageType = 'command_result';
-            this.log?.info(`[RongCloudClient] command_result 自定义消息对象已构造, objectName=${messageContent.objectName || '(empty)'}, messageType=${messageContent.messageType || '(empty)'}, has content=${!!messageContent.content}`);
-          } else if (mt === 'command' && this.commandCtor) {
-            messageContent = new this.commandCtor(contentStr);
-            this.log?.info(`[RongCloudClient] command 自定义消息对象已构造, objectName=${messageContent.objectName || '(empty)'}, messageType=${messageContent.messageType || '(empty)'}, has content=${!!messageContent.content}`);
-          } else if (mt === 'service_chat' && this.serviceChatCtor) {
-            messageContent = new this.serviceChatCtor(contentStr);
-            messageContent.messageType = 'service_chat';
-            this.log?.info(`[RongCloudClient] service_chat 自定义消息对象已构造, objectName=${messageContent.objectName || '(empty)'}, messageType=${messageContent.messageType || '(empty)'}, has content=${!!messageContent.content}`);
-          }
-          // 非注册自定义消息(如未知 msg_type)或未识别类型保持 TextMessage fallback
+      if (parsed && parsed.msg_type) {
+        const mt = parsed.msg_type;
+
+        if (mt === 'card_message' && this.cardMessageCtor) {
+          messageContent = new this.cardMessageCtor(parsed);
+          messageContent.messageType = 'card_message';
+          this.log?.info(`[RongCloudClient] card_message 自定义消息对象已构造, objectName=${messageContent.objectName || '(empty)'}, messageType=${messageContent.messageType || '(empty)'}, has content=${!!messageContent.content}`);
+        } else if (mt === 'card_update' && this.cardUpdateCtor) {
+          messageContent = new this.cardUpdateCtor(parsed);
+          messageContent.messageType = 'card_update';
+          this.log?.info(`[RongCloudClient] card_update 自定义消息对象已构造, objectName=${messageContent.objectName || '(empty)'}, messageType=${messageContent.messageType || '(empty)'}, has content=${!!messageContent.content}`);
+        } else if (mt === 'command_result' && this.commandResultCtor) {
+          messageContent = new this.commandResultCtor(parsed);
+          messageContent.messageType = 'command_result';
+          this.log?.info(`[RongCloudClient] command_result 自定义消息对象已构造, objectName=${messageContent.objectName || '(empty)'}, messageType=${messageContent.messageType || '(empty)'}, has content=${!!messageContent.content}`);
+        } else if (mt === 'command' && this.commandCtor) {
+          messageContent = new this.commandCtor(parsed);
+          messageContent.messageType = 'command';
+          this.log?.info(`[RongCloudClient] command 自定义消息对象已构造, objectName=${messageContent.objectName || '(empty)'}, messageType=${messageContent.messageType || '(empty)'}, has content=${!!messageContent.content}`);
+        } else if (mt === 'service_chat' && this.serviceChatCtor) {
+          messageContent = new this.serviceChatCtor(parsed);
+          messageContent.messageType = 'service_chat';
+          this.log?.info(`[RongCloudClient] service_chat 自定义消息对象已构造, objectName=${messageContent.objectName || '(empty)'}, messageType=${messageContent.messageType || '(empty)'}, has content=${!!messageContent.content}`);
+        } else {
+          messageContent = new RongIMLib.TextMessage({ content: typeof content === 'string' ? content : JSON.stringify(content) });
         }
-      } catch (_) { /* not JSON, use text */ }
+      } else {
+        messageContent = new RongIMLib.TextMessage({ content: typeof content === 'string' ? content : JSON.stringify(content) });
+      }
 
       const result = await RongIMLib.sendMessage(
         { conversationType: convType, targetId },

@@ -140,6 +140,75 @@ function stripMarkers(text, markers) {
 }
 
 /**
+ * 剥离模型输出中可能混入的 orchestrator/系统标签。
+ * 处理完整标签对、自闭合标签与嵌套同名标签，并截断未闭合的开口。
+ * @param {string} text
+ * @returns {string}
+ */
+function stripOrchestratorTags(text) {
+  let result = '';
+  let i = 0;
+  while (i < text.length) {
+    const open = text.indexOf('<', i);
+    if (open === -1) {
+      result += text.slice(i);
+      break;
+    }
+    result += text.slice(i, open);
+    const close = text.indexOf('>', open);
+    if (close === -1) {
+      break;
+    }
+    const tag = text.slice(open, close + 1);
+    const openMatch = tag.match(/^<(dcp-[^>\s/]*)\s*(\/?)?>$/);
+    if (!openMatch) {
+      result += tag;
+      i = close + 1;
+      continue;
+    }
+    const tagName = openMatch[1];
+    if (tag.endsWith('/>')) {
+      i = close + 1;
+      continue;
+    }
+    const endTag = `</${tagName}>`;
+    let depth = 1;
+    let search = close + 1;
+    let endIdx = -1;
+    while (search < text.length) {
+      const nextOpen = text.indexOf('<', search);
+      if (nextOpen === -1) break;
+      const nextClose = text.indexOf('>', nextOpen);
+      if (nextClose === -1) break;
+      const nextTag = text.slice(nextOpen, nextClose + 1);
+      const nextMatch = nextTag.match(/^<(dcp-[^>\s/]*)\s*(\/?)?>$/);
+      if (nextMatch && nextMatch[1] === tagName) {
+        if (nextTag.endsWith('/>')) {
+          search = nextClose + 1;
+        } else {
+          depth++;
+          search = nextClose + 1;
+        }
+      } else if (nextTag === endTag) {
+        depth--;
+        if (depth === 0) {
+          endIdx = nextOpen;
+          break;
+        }
+        search = nextClose + 1;
+      } else {
+        search = nextClose + 1;
+      }
+    }
+    if (endIdx === -1) {
+      break;
+    }
+    i = endIdx + endTag.length;
+  }
+  return result;
+}
+
+/**
  * 流式安全内容:给定累积内容,返回"剥离所有卡片标记后"的安全流式正文。
  *
  * 用于流式场景:
@@ -155,17 +224,19 @@ function stripMarkers(text, markers) {
  * @returns {string} 剥离所有标记后的安全流式正文
  */
 function streamSafeContent(content) {
+  // 先剥离 orchestrator 系统标签，避免模型输出中的系统提示泄露给用户
+  const sanitized = stripOrchestratorTags(content);
   // 支持的标记 opener:新协议 [CARD][ 与旧协议 [COMMANDS][ 都缓冲
   const openers = ['[CARD][', '[COMMANDS]['];
   let result = '';
   let i = 0;
 
-  while (i < content.length) {
+  while (i < sanitized.length) {
     // 找最早的 opener(任一标记)
     let nextMarker = -1;
     let opener = '';
     for (const op of openers) {
-      const idx = content.indexOf(op, i);
+      const idx = sanitized.indexOf(op, i);
       if (idx !== -1 && (nextMarker === -1 || idx < nextMarker)) {
         nextMarker = idx;
         opener = op;
@@ -173,21 +244,21 @@ function streamSafeContent(content) {
     }
     if (nextMarker === -1) {
       // 无更多标记,追加剩余正文
-      result += content.slice(i);
+      result += sanitized.slice(i);
       break;
     }
 
     // 追加标记前的正文
-    result += content.slice(i, nextMarker);
+    result += sanitized.slice(i, nextMarker);
 
     // 检查这个标记是否已闭合
     const jsonStart = nextMarker + opener.length;
-    if (jsonStart >= content.length) {
+    if (jsonStart >= sanitized.length) {
       // opener 在末尾,JSON 还没开始 → 进行中,截断(不追加 opener)
       break;
     }
 
-    const jsonChar = content[jsonStart];
+    const jsonChar = sanitized[jsonStart];
     if (jsonChar !== '{' && jsonChar !== '[') {
       // opener 后非 JSON 起始,视为普通文本(罕见),跳过 opener 继续
       result += opener;
@@ -195,13 +266,13 @@ function streamSafeContent(content) {
       continue;
     }
 
-    const jsonEnd = findJsonEnd(content, jsonStart);
+    const jsonEnd = findJsonEnd(sanitized, jsonStart);
     if (jsonEnd === -1) {
       // JSON 未闭合 → 进行中,截断(不追加标记)
       break;
     }
 
-    if (content[jsonEnd] !== ']') {
+    if (sanitized[jsonEnd] !== ']') {
       // JSON 闭合但缺闭合符 ] → 畸形进行中,截断
       break;
     }
@@ -212,7 +283,7 @@ function streamSafeContent(content) {
 
   // 前视缓冲:结果末尾若是任一 opener 的部分前缀,也要截断
   // (后续字符可能补全为完整 opener,此时已发出的部分会泄漏)
-  return trimTrailingOpenerPrefix(result);
+  return trimTrailingDcpTagPrefix(trimTrailingOpenerPrefix(result));
 }
 
 /**
@@ -234,6 +305,27 @@ function trimTrailingOpenerPrefix(text) {
     }
   }
   return cut > 0 ? text.slice(0, text.length - cut) : text;
+}
+
+/**
+ * 截断末尾的 orchestrator/dcp 标签部分前缀。
+ * 检查所有 <dcp-...> / </dcp-...> 标签的前缀，防止 token 级流式把系统标签
+ * 的碎片泄漏给用户。
+ * @param {string} text
+ * @returns {string}
+ */
+function trimTrailingDcpTagPrefix(text) {
+  const lastAngle = text.lastIndexOf('<');
+  if (lastAngle === -1) return text;
+
+  const suffix = text.slice(lastAngle).toLowerCase();
+  const openers = ['<dcp-', '</dcp-'];
+  for (const opener of openers) {
+    if (opener.startsWith(suffix) || suffix.startsWith(opener)) {
+      return text.slice(0, lastAngle);
+    }
+  }
+  return text;
 }
 
 /**
@@ -278,5 +370,7 @@ module.exports = {
   stripMarkers,
   streamSafeContent,
   trimTrailingOpenerPrefix,
+  stripOrchestratorTags,
+  trimTrailingDcpTagPrefix,
   streamSafeBoundary,
 };

@@ -41,6 +41,9 @@ const {
   permissionCard, errorCard, noticeCard, statusCard, sessionsCard, commandsCard,
 } = require('./templates');
 
+// 模型选择卡片
+const { buildProviderListCard, buildModelsCard } = require('./model-cards');
+
 module.exports = {
   // 协议定义
   CARD_SCHEMA_VERSION,
@@ -94,4 +97,8 @@ module.exports = {
   statusCard,
   sessionsCard,
   commandsCard,
+
+  // 模型选择卡片
+  buildProviderListCard,
+  buildModelsCard,
 };

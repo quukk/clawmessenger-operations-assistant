@@ -47,12 +47,14 @@ function card(id, title, sections, opts = {}) {
       ...(opts.subtitle !== undefined ? { subtitle: opts.subtitle } : {}),
     },
     sections,
+    ...(opts.reasoning !== undefined && opts.reasoning.length > 0
+      ? { reasoning: opts.reasoning }
+      : {}),
+    ...(opts.loading === true ? { loading: true } : {}),
     config: {
       ...(opts.wide !== undefined ? { wide: opts.wide } : {}),
       ...(opts.collapsible !== undefined ? { collapsible: opts.collapsible } : {}),
     },
-    ...(opts.reasoning !== undefined ? { reasoning: opts.reasoning } : {}),
-    ...(opts.loading !== undefined ? { loading: opts.loading } : {}),
   };
 }
 

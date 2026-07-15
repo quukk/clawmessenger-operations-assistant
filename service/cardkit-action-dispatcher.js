@@ -21,6 +21,8 @@
 'use strict';
 
 const { createLogger } = require('./logger');
+const { buildModelsCard } = require('./cardkit/model-cards');
+const { card: buildCard, note } = require('./cardkit/builders');
 
 const log = createLogger('CardActionDispatcher');
 
@@ -178,18 +180,27 @@ async function handleStop(actionObj, actionMsg, context) {
     return { success: false, confirmText: '缺少卡片 ID' };
   }
 
-  if (!context.opencodeRunner || typeof context.opencodeRunner.stopStream !== 'function') {
-    log.warn('stop 动作:opencodeRunner.stopStream 未就绪');
+  if (!context.opencodeRunner) {
+    log.warn('stop 动作:opencodeRunner 未就绪');
     return { success: false, confirmText: '停止功能未就绪' };
   }
 
   log.info(`stop 动作: cardId=${cardId}, chatId=${context.chatId}`);
   try {
-    const stopResult = await context.opencodeRunner.stopStream(cardId);
-    if (stopResult.stopped) {
+    let stopResult;
+    if (typeof context.opencodeRunner.stopStream === 'function') {
+      stopResult = await context.opencodeRunner.stopStream(cardId);
+    } else if (typeof context.opencodeRunner.stop === 'function') {
+      stopResult = await context.opencodeRunner.stop();
+    } else {
+      log.warn('stop 动作:opencodeRunner 没有可用的停止方法');
+      return { success: false, confirmText: '停止功能未就绪' };
+    }
+
+    if (stopResult && stopResult.stopped) {
       return { success: true, confirmText: '已停止' };
     }
-    return { success: false, confirmText: stopResult.reason || '停止失败' };
+    return { success: false, confirmText: (stopResult && stopResult.reason) || '停止失败' };
   } catch (err) {
     log.error(`stop 动作失败: ${err.message}`);
     return { success: false, confirmText: '停止失败' };
@@ -252,8 +263,8 @@ async function handleSession(actionObj, context) {
 }
 
 /**
- * 自定义动作:透传给 opencode-runner 作为新 prompt。
- * 本项目场景下,custom 通常用于 agent 自定义交互(运维助手暂未使用)。
+ * 自定义动作:默认把 action.payload 作为新 prompt 发回对话。
+ * 特殊 kind(list_models / switch_model)在本层直接处理,不再透传给会话。
  *
  * @returns {Promise<{success: boolean, confirmText: string}>}
  */
@@ -261,12 +272,26 @@ async function handleCustom(actionObj, context) {
   const { kind, payload } = actionObj;
   log.info(`custom 动作: kind=${kind}, chatId=${context.chatId}`);
 
+  if (kind === 'list_models') {
+    return handleListModels(actionObj, context);
+  }
+
+  if (kind === 'switch_model') {
+    return handleSwitchModel(actionObj, context);
+  }
+
   // 优先用 opencodeRunner.sendMessage 把 payload 作为新对话输入
   if (context.opencodeRunner && typeof context.opencodeRunner.sendMessage === 'function') {
     const chatId = context.chatId;
     const promptText = `[用户点击了卡片按钮] 动作: ${kind}\n参数: ${JSON.stringify(payload || {})}`;
     try {
-      await context.opencodeRunner.sendMessage(chatId, promptText);
+      await context.opencodeRunner.sendMessage(chatId, promptText, { routeCtx: {
+        targetId: context.targetId,
+        senderUserId: context.senderId,
+        convType: context.conversationType,
+        cardId: `card-${Date.now()}`,
+        streamId: `stream-${Date.now()}`,
+      }});
       return { success: true, confirmText: '已处理' };
     } catch (err) {
       log.error(`custom 动作 opencodeRunner.sendMessage 失败: ${err.message}`);
@@ -287,6 +312,142 @@ async function handleCustom(actionObj, context) {
   }
 
   return { success: false, confirmText: '自定义动作处理未就绪' };
+}
+
+/**
+ * 发送模型列表卡片。
+ * @param {Object} actionObj
+ * @param {Object} context
+ * @returns {Promise<{success: boolean, confirmText: string}>}
+ */
+async function handleListModels(actionObj, context) {
+  const providerId = actionObj.payload && actionObj.payload.provider;
+  if (!providerId) {
+    return { success: false, confirmText: '缺少服务商 ID' };
+  }
+
+  if (!context.opencodeRunner || !context.opencodeRunner.opencode) {
+    return { success: false, confirmText: '模型列表服务未就绪' };
+  }
+
+  try {
+    const opencode = context.opencodeRunner.opencode;
+    const config = await opencode.getConfig();
+    const currentModel = config && config.model;
+    const providerData = await opencode.listProviders();
+    const allProviders = (providerData && providerData.all) || (providerData && providerData.providers) || providerData || [];
+    const p = allProviders.find((x) => x && x.id === providerId);
+    if (!p) {
+      return { success: false, confirmText: `未找到服务商: ${providerId}` };
+    }
+
+    const provider = {
+      id: p.id,
+      name: p.name || p.id,
+      models: normalizeModels(p.models),
+    };
+
+    if (provider.models.length === 0) {
+      return { success: false, confirmText: `${provider.name} 暂无可用模型` };
+    }
+
+    const card = buildModelsCard(provider, currentModel);
+    await sendCardPayload(context, card);
+    return { success: true, confirmText: '模型列表已发送' };
+  } catch (err) {
+    log.error(`list_models 处理失败: ${err.message}`);
+    return { success: false, confirmText: '加载模型列表失败' };
+  }
+}
+
+/**
+ * 切换模型并返回成功卡片。
+ * @param {Object} actionObj
+ * @param {Object} context
+ * @returns {Promise<{success: boolean, confirmText: string}>}
+ */
+async function handleSwitchModel(actionObj, context) {
+  const payload = actionObj.payload || {};
+  const model = payload.value || payload.model;
+  if (!model) {
+    return { success: false, confirmText: '缺少模型 ID' };
+  }
+
+  if (!context.opencodeRunner || !context.opencodeRunner.opencode) {
+    return { success: false, confirmText: '模型切换服务未就绪' };
+  }
+
+  const chatId = context.chatId;
+  const sessionEntry = context.opencodeRunner.sessions && context.opencodeRunner.sessions.get(chatId);
+  if (!sessionEntry || !sessionEntry.id) {
+    return { success: false, confirmText: '无活跃会话，无法切换模型' };
+  }
+
+  try {
+    await context.opencodeRunner.opencode.switchModel(sessionEntry.id, model);
+    const card = buildCard(
+      `card-switch-model-${Date.now()}`,
+      '✅ 已切换模型',
+      [note(`已切换至 ${model}`)],
+      { color: 'green' },
+    );
+    await sendCardPayload(context, card);
+    return { success: true, confirmText: `已切换至 ${model}` };
+  } catch (err) {
+    log.error(`switch_model 处理失败: ${err.message}`);
+    return { success: false, confirmText: '切换模型失败' };
+  }
+}
+
+/**
+ * 通过融云客户端发送一张卡片 payload。
+ * @param {Object} context
+ * @param {import('./cardkit/schema').CardModel} card
+ */
+async function sendCardPayload(context, card) {
+  const targetId = context.senderId || context.targetId;
+  const conversationType = context.conversationType || 1;
+  const payload = JSON.stringify({
+    msg_type: 'card_message',
+    schema: card.schema,
+    card,
+    timestamp: Date.now(),
+  });
+
+  if (context.rongcloudClient && context.rongcloudClient.isConnected) {
+    await context.rongcloudClient.sendMessage(targetId, payload, conversationType);
+  } else {
+    log.warn('sendCardPayload: 融云客户端未就绪，卡片未发送');
+  }
+}
+
+/**
+ * 把提供商返回的 models 字段统一成 ModelInfo[] 数组。
+ * @param {any} models
+ * @returns {Array<{id: string, name: string}>}
+ */
+function normalizeModels(models) {
+  if (!models) return [];
+  if (Array.isArray(models)) {
+    return models.map((m) => {
+      if (typeof m === 'string') return { id: m, name: m };
+      if (m && typeof m === 'object') {
+        const id = m.id || m.modelId || String(m);
+        return { id, name: m.name || m.label || m.title || id };
+      }
+      return { id: String(m), name: String(m) };
+    });
+  }
+  if (typeof models === 'object') {
+    return Object.entries(models).map(([id, m]) => {
+      if (typeof m === 'string') return { id, name: m };
+      if (m && typeof m === 'object') {
+        return { id, name: m.name || m.label || m.title || id };
+      }
+      return { id, name: id };
+    });
+  }
+  return [];
 }
 
 // ============================================================================

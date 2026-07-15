@@ -18,6 +18,7 @@
 
 const { createLogger } = require('../logger');
 const { card: buildCard, note } = require('./builders');
+const { buildModelsCard } = require('./model-cards');
 
 const log = createLogger('ActionRouter');
 
@@ -37,6 +38,7 @@ const log = createLogger('ActionRouter');
  * @property {string} chatId
  * @property {CardActionMessage} msg
  * @property {Object} opencode OpenCodeClient(opencode/client.ts 的 JS 等价物)
+ * @property {Object} [opencodeRunner] 运维助手 OpencodeRunner 实例(用于 stop 等)
  * @property {Object} sessionManager SessionManager
  * @property {Object} cardTransport CardTransport(融云传输)
  */
@@ -144,6 +146,29 @@ async function handleCommand(ctx) {
   if (!session) {
     return { success: false, confirmText: '无活跃会话' };
   }
+  // stop 命令用于中止当前生成，而不是作为新的 prompt 发送
+  if (a.name === 'stop') {
+    const cardId = ctx.msg.cardId;
+    if (ctx.opencodeRunner && typeof ctx.opencodeRunner.stopStream === 'function') {
+      try {
+        const stopResult = await ctx.opencodeRunner.stopStream(cardId);
+        return { success: stopResult?.stopped !== false, confirmText: stopResult?.reason || '已停止生成' };
+      } catch (err) {
+        log.warn(`Failed to stop stream: ${err.message}, cardId=${cardId}`);
+        return { success: false, confirmText: '停止失败，请重试' };
+      }
+    } else if (ctx.opencodeRunner && typeof ctx.opencodeRunner.stop === 'function') {
+      try {
+        ctx.opencodeRunner.stop();
+        return { success: true, confirmText: '已停止生成' };
+      } catch (err) {
+        log.warn(`Failed to stop runner: ${err.message}, cardId=${cardId}`);
+        return { success: false, confirmText: '停止失败，请重试' };
+      }
+    }
+    // TODO: 当 opencodeRunner 未提供 stopStream/stop 时，接入项目实际的停止能力
+    return { success: false, confirmText: '停止功能未就绪' };
+  }
   await ctx.opencode.sendCommand(session.id, a.name);
   return { success: true, confirmText: `已执行 ${a.name}` };
 }
@@ -232,6 +257,16 @@ async function handleAnswer(ctx) {
  */
 async function handleCustom(ctx) {
   const a = ctx.msg.action;
+
+  // 本地卡片交互:先处理不需要回传会话的特殊动作
+  if (a.kind === 'list_models') {
+    return handleListModels(ctx, a);
+  }
+
+  if (a.kind === 'switch_model') {
+    return handleSwitchModel(ctx, a);
+  }
+
   const session = ctx.sessionManager.getSession(ctx.chatId);
   if (!session) {
     return { success: false, confirmText: '无活跃会话' };
@@ -241,6 +276,110 @@ async function handleCustom(ctx) {
   await ctx.opencode.sendPromptAsync(session.id, promptText);
   log.info(`Custom action forwarded to session: kind=${a.kind}, chatId=${ctx.chatId}`);
   return { success: true, confirmText: '已处理' };
+}
+
+/**
+ * 处理“选择服务商”动作,发送该服务商的模型列表卡片。
+ * @param {ActionContext} ctx
+ * @param {any} a
+ * @returns {Promise<ActionResult>}
+ */
+async function handleListModels(ctx, a) {
+  const providerId = a.payload && a.payload.provider;
+  if (!providerId) {
+    return { success: false, confirmText: '缺少服务商 ID' };
+  }
+  try {
+    const config = await ctx.opencode.getConfig();
+    const currentModel = config && config.model;
+    const providerData = await ctx.opencode.listProviders();
+    const allProviders = (providerData && providerData.all) || (providerData && providerData.providers) || providerData || [];
+    const p = allProviders.find((x) => x && x.id === providerId);
+    if (!p) {
+      return { success: false, confirmText: `未找到服务商: ${providerId}` };
+    }
+    const provider = {
+      id: p.id,
+      name: p.name || p.id,
+      models: normalizeProviderModels(p.models),
+    };
+    if (provider.models.length === 0) {
+      return { success: false, confirmText: `${provider.name} 暂无可用模型` };
+    }
+    const resultCard = buildModelsCard(provider, currentModel);
+    if (ctx.cardTransport && typeof ctx.cardTransport.send === 'function') {
+      await ctx.cardTransport.send(ctx.chatId, resultCard);
+    }
+    return { success: true, confirmText: '模型列表已发送', resultCard };
+  } catch (err) {
+    log.error(`list_models failed: ${err.message}`);
+    return { success: false, confirmText: '加载模型列表失败' };
+  }
+}
+
+/**
+ * 处理“切换模型”动作。
+ * @param {ActionContext} ctx
+ * @param {any} a
+ * @returns {Promise<ActionResult>}
+ */
+async function handleSwitchModel(ctx, a) {
+  const payload = a.payload || {};
+  const value = typeof payload.value === 'string' ? payload.value : '';
+  const [providerId, modelId] = value.split('/');
+  const model = modelId ? `${providerId}/${modelId}` : value;
+  if (!model) {
+    return { success: false, confirmText: '缺少模型 ID' };
+  }
+  const session = ctx.sessionManager.getSession(ctx.chatId);
+  if (!session || !session.id) {
+    return { success: false, confirmText: '无活跃会话，无法切换模型' };
+  }
+  try {
+    await ctx.opencode.switchModel(session.id, model);
+    return {
+      success: true,
+      confirmText: `已切换至 ${model}`,
+      resultCard: buildCard(
+        ctx.msg.cardId,
+        '✅ 模型已切换',
+        [note(`当前模型: ${model}`)],
+        { color: 'green' },
+      ),
+    };
+  } catch (err) {
+    log.warn(`switchModel failed: ${err.message}, model=${model}`);
+    return { success: false, confirmText: '切换模型失败' };
+  }
+}
+
+/**
+ * 把提供商返回的 models 字段统一成 ModelInfo[] 数组。
+ * @param {any} models
+ * @returns {Array<{id: string, name: string}>}
+ */
+function normalizeProviderModels(models) {
+  if (!models) return [];
+  if (Array.isArray(models)) {
+    return models.map((m) => {
+      if (typeof m === 'string') return { id: m, name: m };
+      if (m && typeof m === 'object') {
+        const id = m.id || m.modelId || String(m);
+        return { id, name: m.name || m.label || m.title || id };
+      }
+      return { id: String(m), name: String(m) };
+    });
+  }
+  if (typeof models === 'object') {
+    return Object.entries(models).map(([id, m]) => {
+      if (typeof m === 'string') return { id, name: m };
+      if (m && typeof m === 'object') {
+        return { id, name: m.name || m.label || m.title || id };
+      }
+      return { id, name: id };
+    });
+  }
+  return [];
 }
 
 /**

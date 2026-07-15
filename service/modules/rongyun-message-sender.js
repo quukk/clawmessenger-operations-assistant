@@ -8,6 +8,7 @@ const { RongyunMessageTypeEnum } = require('./rongyun-message-types');
 const { getMacAddress } = require('./mac-address');
 const { generateSecret } = require('./auth');
 const { SAFE_LIMIT, HARD_LIMIT, estimateMessageSize, truncateCardPayload } = require('../utils/message-size');
+const { validateCard } = require('../cardkit/validate');
 
 class RongyunMessageSender {
   constructor(rongcloudClient, config, log) {
@@ -52,7 +53,7 @@ class RongyunMessageSender {
 
       const result = await this.rongcloudClient.sendMessage(
         this.serverImId,
-        JSON.stringify(messagePayload),
+        messagePayload,
         1 // PRIVATE
       );
 
@@ -175,7 +176,7 @@ class RongyunMessageSender {
         // 回退到文本消息（兼容旧版本）
         result = await this.rongcloudClient.sendMessage(
           targetId,
-          JSON.stringify(messagePayload),
+          messagePayload,
           1 // PRIVATE
         );
       }
@@ -210,7 +211,7 @@ class RongyunMessageSender {
    * B3:支持 StreamDelta + extra 卡片壳(规范 §8.3 两层包装),透传给 serverAPI.sendStreamPrivate。
    * B4:删除旧纯文本 content/streamType 参数,强制 streamDelta。
    * 调用方按状态机构造 streamDelta:
-   *   - 初始(思考中): {content:'', session_status:'thinking', seq:0, is_final:false}
+   *   - 初始(思考中): {content:'', session_status:'thinking', seq:1, is_final:false}
    *   - 内容流:       {content: chunk, session_status:'responding', seq:n, is_final:false}
    *   - 最终(完成):   {content: fullText, session_status:'completed', seq:last, is_final:true}
    *   - 失败:         {session_status:'error', is_final:true, error: msg}
@@ -295,23 +296,37 @@ class RongyunMessageSender {
     }
 
     try {
-      // 规范 CardModel 直接透传,仅补 msg_type + timestamp
+      const validation = validateCard(cardData);
+      if (!validation.valid || !validation.sanitized) {
+        this.log?.warn(`[RongyunMessageSender] 卡片校验失败: ${validation.errors.join('; ')}，降级为文本`);
+        const fallbackText = cardData && cardData.header && typeof cardData.header.title === 'string'
+          ? cardData.header.title
+          : '卡片内容无效';
+        return this.rongcloudClient.sendMessage(targetId, fallbackText, conversationType);
+      }
+
+      let card = validation.sanitized;
       let payload = {
-        ...cardData,
         msg_type: 'card_message',
-        timestamp: cardData.timestamp || Date.now(),
+        schema: card.schema,
+        card,
+        timestamp: card.timestamp || Date.now(),
       };
 
-      const initialSize = estimateMessageSize(payload);
-      if (initialSize > SAFE_LIMIT) {
-        this.log?.warn(`[RongyunMessageSender] 卡片消息体积(${initialSize} 字节)超过安全阈值 ${SAFE_LIMIT}，执行截断`);
-        payload = truncateCardPayload(payload);
-        const truncatedSize = estimateMessageSize(payload);
-        this.log?.warn(`[RongyunMessageSender] 截断后体积 ${truncatedSize} 字节`);
+      let size = estimateMessageSize(payload);
+      if (size > SAFE_LIMIT) {
+        this.log?.warn(`[RongyunMessageSender] 卡片消息体积(${size} 字节)超过安全阈值 ${SAFE_LIMIT}，执行截断`);
+        card = truncateCardPayload(card);
+        payload = {
+          ...payload,
+          card,
+        };
+        size = estimateMessageSize(payload);
+        this.log?.warn(`[RongyunMessageSender] 截断后体积 ${size} 字节`);
 
-        if (truncatedSize > HARD_LIMIT) {
+        if (size > HARD_LIMIT) {
           this.log?.error(`[RongyunMessageSender] 截断后仍超过硬上限 ${HARD_LIMIT}，发送最小化错误卡片`);
-          payload = {
+          card = {
             schema: '1.0.0',
             id: cardData.id || `card-error-${Date.now()}`,
             header: { title: '消息过大', color: 'red' },
@@ -320,7 +335,11 @@ class RongyunMessageSender {
               { kind: 'note', text: '请减少请求内容或分批查询。' },
             ],
             config: {},
+          };
+          payload = {
             msg_type: 'card_message',
+            schema: card.schema,
+            card,
             timestamp: Date.now(),
           };
         }
@@ -352,7 +371,7 @@ class RongyunMessageSender {
    * 小程序按 cardId 找到原卡片并将 appendCommands / appendSessions 累积追加到对应 section。
    *
    * 载荷契约(与前端约定):
-   *   { msg_type:'card_update', cardId, appendCommands?: CommandItem[], appendSessions?: SessionItem[] }
+   *   { msg_type:'card_update', cardId, card: { appendCommands?: CommandItem[], appendSessions?: SessionItem[] }, timestamp: number }
    *
    * 复用与 sendCardMessage 相同的 sendMessage 路由,仅 msg_type 设为 'card_update'
    * (rongcloud-client.sendMessage 已对 card_update 做显式对象构造,与 card_message 同构)。
@@ -370,17 +389,18 @@ class RongyunMessageSender {
     }
 
     try {
-      const payload = {
+      let card = appendData;
+      let payload = {
         msg_type: 'card_update',
         cardId,
+        card,
         timestamp: Date.now(),
-        ...appendData,
       };
 
-      const size = estimateMessageSize(payload);
+      let size = estimateMessageSize(payload);
       if (size > SAFE_LIMIT) {
-        // 尝试通过减半追加列表来降低体积
-        const truncated = { ...appendData };
+        // 尝试通过减半追加列表来降低体积(保持 card 嵌套)
+        const truncated = { ...card };
         let currentSize = size;
         while (currentSize > SAFE_LIMIT) {
           let reduced = false;
@@ -393,7 +413,8 @@ class RongyunMessageSender {
             reduced = true;
           }
           if (!reduced) break;
-          payload = { ...payload, ...truncated };
+          card = truncated;
+          payload = { ...payload, card };
           currentSize = estimateMessageSize(payload);
         }
 
@@ -403,6 +424,7 @@ class RongyunMessageSender {
         }
 
         this.log?.warn(`[RongyunMessageSender] card_update 体积超过安全阈值，已截断追加列表至 ${currentSize} 字节`);
+        size = currentSize;
       }
 
       const result = await this.rongcloudClient.sendMessage(

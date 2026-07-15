@@ -109,10 +109,10 @@ function validateCard(input) {
     sections: validSections,
     // config 白名单:仅保留已知布尔字段,拒绝任意嵌套内容透传
     ...sanitizeConfig(raw.config),
-    // reasoning:可选字符串,由前端独立展示
-    ...(typeof raw.reasoning === 'string' ? { reasoning: raw.reasoning } : {}),
-    // loading:可选布尔值,前端据此显示加载占位
-    ...(typeof raw.loading === 'boolean' ? { loading: raw.loading } : {}),
+    // reasoning:仅保留非空字符串
+    ...(typeof raw.reasoning === 'string' && raw.reasoning.length > 0 ? { reasoning: raw.reasoning } : {}),
+    // loading:仅当显式为 true 时保留
+    ...(raw.loading === true ? { loading: true } : {}),
   };
 
   return {
@@ -340,10 +340,9 @@ function validateAction(action, prefix) {
   return errs;
 }
 
+// 内部辅助函数(不再对外导出)
+// validateSection, validateButton, validateAction, sanitizeConfig 均为 validateCard 内部使用。
+
 module.exports = {
   validateCard,
-  validateSection,
-  validateButton,
-  validateAction,
-  sanitizeConfig,
 };

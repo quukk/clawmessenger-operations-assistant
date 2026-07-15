@@ -21,15 +21,17 @@
  * @param {boolean} [p.isFinal=false] 是否终态(completed/error/cancelled)
  * @param {string} [p.error] 错误信息(sessionStatus='error' 时)
  * @param {string} [p.reasoningContent] 思考过程内容(可选)
+ * @param {string} [p.cardId] 卡片 id(与初始静态卡一致,续流关联用)
  * @returns {Object} StreamDelta
  */
-function buildStreamDelta({ content, sessionStatus, seq, isFinal = false, error, reasoningContent }) {
+function buildStreamDelta({ content, sessionStatus, seq, isFinal = false, error, reasoningContent, cardId }) {
   /** @type {Object} */
-  const delta = { session_status: sessionStatus, seq };
+  const delta = { session_status: sessionStatus, seq, msg_type: 'stream_delta' };
   if (content !== undefined && content !== null) delta.content = content;
   if (reasoningContent) delta.reasoning_content = reasoningContent;
   if (isFinal) delta.is_final = true;
   if (error) delta.error = error;
+  if (cardId) delta.card_id = cardId;
   return delta;
 }
 

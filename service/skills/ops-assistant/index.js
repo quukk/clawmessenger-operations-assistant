@@ -5,6 +5,7 @@
  */
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { exec } = require('child_process');
 const { promisify } = require('util');
 const axios = require('axios');
@@ -73,6 +74,8 @@ class OpsAssistantSkill extends BaseSkill {
     this._streamQueue = Promise.resolve();
     // 首流返回的 messageUID：streamId -> messageUID
     this._streamMessageUIDs = new Map();
+    // 前端 HTTP SSE 端点使用的流 ID：streamId -> clientStreamId
+    this._streamClientIds = new Map();
   }
 
   async init() {
@@ -243,10 +246,10 @@ class OpsAssistantSkill extends BaseSkill {
       // 1. 发送初始静态卡片(规范 CardModel,loading 占位)
       //    停止按钮发送 command.stop 触发后端取消
       await this.sendCard(replyTarget, card(cardId, '运维助手', [
+        md('正在思考...'),
         buttons([
           btn('停止', action.command('stop'), { id: 'stop', variant: 'danger' }),
         ], 'inline'),
-        note(`session_id: ops-assistant-${senderUserId}`),
       ], { color: 'blue', loading: true }), convType);
 
       // 2. 使用 senderUserId 作为 chatId,实现单用户会话隔离
@@ -280,7 +283,6 @@ class OpsAssistantSkill extends BaseSkill {
       // 执行失败时发送错误卡片(规范 CardModel)
       await this.sendCard(replyTarget, card(cardId, '运维助手', [
         md(`**执行失败**\n${err.message}`),
-        note(`session_id: ops-assistant-${senderUserId}`),
       ], { color: 'red' }), convType);
     }
   }
@@ -336,9 +338,8 @@ class OpsAssistantSkill extends BaseSkill {
    *
    * SSE 真实流式架构下,真实增量(token 级)已由 message.part.delta 逐片发送,
    * completed 终态(is_final)也已在 EventHandler._handleSessionIdle 中发送。
-   * 这里只负责:
-   *   1. 最终持久化卡片(规范 CardModel,card_id 复用,作为历史记录)
-   *   2. command 历史消息(兼容旧前端)
+   * 这里负责发送最终持久化卡片(规范 CardModel,card_id 复用,作为历史记录),
+   * 并将 reasoning 内容回传给前端展示。
    *
    * @param {Object} ctx
    * @param {string} ctx.targetId
@@ -349,34 +350,18 @@ class OpsAssistantSkill extends BaseSkill {
    * @param {string} [ctx.reasoningContent]
    */
   async _sendFinalCard(ctx) {
-    const { targetId, convType, senderUserId, cardId, fullContent, reasoningContent } = ctx;
-    const accountId = this.config.accountId || '';
+    const { targetId, convType, senderUserId, cardId, fullContent } = ctx;
 
-    // 最终持久化卡片(规范 CardModel,card_id 复用)
+    // 最终持久化卡片(规范 CardModel,card_id 复用, 回传 reasoning 供前端展示)
     try {
-      const sections = [
+      await this.sendCard(targetId, card(cardId, '运维助手', [
         md(fullContent || '(空回复)'),
-        note(`session_id: ops-assistant-${senderUserId}`),
-      ];
-      await this.sendCard(targetId, card(cardId, '运维助手', sections, {
+      ], {
         color: 'blue',
-        ...(reasoningContent ? { reasoning: reasoningContent } : {}),
+        reasoning: ctx.reasoningContent || '',
       }), convType);
     } catch (cardErr) {
       this.log.warn(`[OpsAssistant] 发送最终卡片失败: ${cardErr.message}`);
-    }
-
-    // command 历史消息(兼容旧前端)
-    try {
-      await this.sendReply(targetId, {
-        status: 'success',
-        message: 'Response received',
-        content: fullContent || '',
-        request_id: '',
-        node_id: accountId,
-      });
-    } catch (replyErr) {
-      this.log.warn(`[OpsAssistant] 发送 command 历史消息失败: ${replyErr.message}`);
     }
   }
 
@@ -388,14 +373,17 @@ class OpsAssistantSkill extends BaseSkill {
    * @param {string} ctx.senderUserId
    * @param {string} ctx.cardId
    * @param {string} ctx.error
+   * @param {string} [ctx.reasoningContent]
    */
   async _sendErrorCard(ctx) {
     const { targetId, convType, senderUserId, cardId, error } = ctx;
     try {
       await this.sendCard(targetId, card(cardId, '运维助手', [
         md(`**执行失败**\n${error}`),
-        note(`session_id: ops-assistant-${senderUserId}`),
-      ], { color: 'red' }), convType);
+      ], {
+        color: 'red',
+        reasoning: ctx.reasoningContent || '',
+      }), convType);
     } catch (cardErr) {
       this.log.warn(`[OpsAssistant] 发送错误卡片失败: ${cardErr.message}`);
     }
@@ -419,7 +407,30 @@ class OpsAssistantSkill extends BaseSkill {
       return;
     }
 
-    const { streamDelta = null, extra = null } = opts;
+    const { streamDelta = null } = opts;
+    let { extra = null } = opts;
+
+    // 确保 extra 以对象形式透传给 server-api(如上游误传 JSON 字符串则解析)
+    if (extra && typeof extra === 'string') {
+      try {
+        extra = JSON.parse(extra);
+      } catch (e) {
+        this.log.warn(`[OpsAssistant] extra 不是合法 JSON,已忽略: ${e.message}`);
+        extra = null;
+      }
+    }
+
+    // 生成前端 HTTP SSE 端点使用的 clientStreamId，每个流只生成一次
+    let clientStreamId = this._streamClientIds.get(streamId);
+    if (!clientStreamId) {
+      clientStreamId = this._generateClientStreamId();
+      this._streamClientIds.set(streamId, clientStreamId);
+    }
+
+    // 将 clientStreamId 注入 streamDelta，供 RongCloudServerAPI 写入首流 messageUID 并缓冲
+    const streamDeltaWithClientId = streamDelta
+      ? { ...streamDelta, clientStreamId }
+      : null;
 
     // 使用队列确保流式消息片段串行发送
     this._streamQueue = this._streamQueue.then(async () => {
@@ -432,7 +443,7 @@ class OpsAssistantSkill extends BaseSkill {
           isFirstChunk,
           isLastChunk,
           messageUID,
-          streamDelta,
+          streamDelta: streamDeltaWithClientId,
           extra,
         });
 
@@ -440,6 +451,12 @@ class OpsAssistantSkill extends BaseSkill {
         if (isFirstChunk && result && result.messageUID) {
           this._streamMessageUIDs.set(streamId, result.messageUID);
           this.log.info(`[OpsAssistant] 首流 messageUID 已存储: ${result.messageUID}, streamId=${streamId}`);
+        }
+
+        // 尾流清理该流在内存中的映射，避免长期累积
+        if (isLastChunk) {
+          this._streamMessageUIDs.delete(streamId);
+          this._streamClientIds.delete(streamId);
         }
       } catch (err) {
         this.log.warn(`[OpsAssistant] 发送流式消息失败: ${err.message}, seq=${seq}`);
@@ -1206,6 +1223,21 @@ class OpsAssistantSkill extends BaseSkill {
       process.exit(0);
     }, 1000);
     return '重启指令已发送，服务将在 1 秒后重启...';
+  }
+  /**
+   * 生成前端 HTTP SSE 端点使用的 clientStreamId。
+   * Node >=14.17 使用 crypto.randomUUID，否则使用简易 UUID 兜底。
+   * @returns {string}
+   */
+  _generateClientStreamId() {
+    if (typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+      const r = Math.random() * 16 | 0;
+      const v = c === 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
   }
 }
 

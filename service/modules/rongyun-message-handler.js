@@ -29,11 +29,12 @@ const { card, md, note, buttons, btn, action } = require('../cardkit/builders');
  * @param {boolean} [p.isFinal=false] 是否终态
  * @param {string} [p.error] 错误信息
  */
-function buildStreamDelta({ content, sessionStatus, seq, isFinal = false, error }) {
-  const delta = { session_status: sessionStatus, seq };
+function buildStreamDelta({ content, sessionStatus, seq, isFinal = false, error, cardId }) {
+  const delta = { session_status: sessionStatus, seq, msg_type: 'stream_delta' };
   if (content !== undefined && content !== null) delta.content = content;
   if (isFinal) delta.is_final = true;
   if (error) delta.error = error;
+  if (cardId) delta.card_id = cardId;
   return delta;
 }
 
@@ -322,10 +323,10 @@ class RongyunMessageHandler {
       // B3:extra 卡片壳(与上面初始静态卡同 card_id,前端续流依赖)
       extra = buildStreamExtra({ cardId, title: 'AI 助手' });
 
-      // B3:发送 thinking 态首流(空 content,seq=0)
+      // B3:发送 thinking 态首流(空 content,seq=1)
       //    让前端进入"思考中"渲染,extra 壳让前端定位到初始静态卡续流
-      await this._sendStreamChunk(fromUserId, sourceId, streamId, true, false, 0, {
-        streamDelta: buildStreamDelta({ content: '', sessionStatus: 'thinking', seq: 0 }),
+      await this._sendStreamChunk(fromUserId, sourceId, streamId, true, false, 1, {
+        streamDelta: buildStreamDelta({ content: '', sessionStatus: 'thinking', seq: 1, cardId }),
         extra,
       });
       hasSentChunk = true;
@@ -344,7 +345,7 @@ class RongyunMessageHandler {
 
           // responding 态增量片段(extra 每个 chunk 都带,确保前端拿到 card_id)
           await this._sendStreamChunk(fromUserId, sourceId, streamId, false, false, seq, {
-            streamDelta: buildStreamDelta({ content: chunkToSend, sessionStatus: 'responding', seq }),
+            streamDelta: buildStreamDelta({ content: chunkToSend, sessionStatus: 'responding', seq, cardId }),
             extra,
           });
         }
@@ -362,7 +363,7 @@ class RongyunMessageHandler {
       if (buffer.length > 0) {
         seq += 1;
         await this._sendStreamChunk(fromUserId, sourceId, streamId, false, false, seq, {
-          streamDelta: buildStreamDelta({ content: buffer, sessionStatus: 'responding', seq }),
+          streamDelta: buildStreamDelta({ content: buffer, sessionStatus: 'responding', seq, cardId }),
           extra,
         });
         buffer = '';
@@ -371,7 +372,7 @@ class RongyunMessageHandler {
       // B3:发送 completed 终态尾流(is_final,完整 content)
       seq += 1;
       await this._sendStreamChunk(fromUserId, sourceId, streamId, false, true, seq, {
-        streamDelta: buildStreamDelta({ content: fullResponse, sessionStatus: 'completed', seq, isFinal: true }),
+        streamDelta: buildStreamDelta({ content: fullResponse, sessionStatus: 'completed', seq, isFinal: true, cardId }),
         extra,
       });
 
@@ -409,6 +410,7 @@ class RongyunMessageHandler {
             seq,
             isFinal: true,
             error: msg,
+            cardId,
           }),
           extra,
         });

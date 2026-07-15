@@ -17,12 +17,14 @@ const { DeviceRegistration } = require('./modules/device-registration');
 const { getServerUrl, getAppKey, getApiBaseUrl } = require('./config');
 const { SkillLoader } = require('./skills/skill-loader');
 const { SkillRouter } = require('./skills/skill-router');
+const { StreamBuffer } = require('./stream-buffer');
 // CardKit(B1 基础设施):按钮点击回传入口,实际处理逻辑 B2 接入
 const { dispatchCardAction } = require('./cardkit-action-dispatcher');
 
 const log = createLogger('worker');
 const PORT = process.env.SILENT_SERVICE_PORT ? parseInt(process.env.SILENT_SERVICE_PORT, 10) : 28765;
 const HOST = process.env.SILENT_SERVICE_HOST || '127.0.0.1';
+let streamBuffer = new StreamBuffer({ ttlMs: 5 * 60 * 1000 });
 
 
 // 如果 logger 初始化后，也同步写到 logger
@@ -452,9 +454,9 @@ async function initRongCloud() {
 
   // 创建系统配置管理器（用于融云服务端API）
   const configManager = new SystemConfigManager(rongcloudConfig, log);
-  
-  // 创建融云服务端API客户端（用于发送流式消息）
-  const serverAPI = new RongCloudServerAPI(configManager, log);
+
+  // 创建融云服务端API客户端（用于发送流式消息），注入共享的 StreamBuffer
+  const serverAPI = new RongCloudServerAPI(configManager, log, streamBuffer);
 
   // 启动预热：强制拉取一次融云 appKey/appSecret 并缓存，避免后续每条消息流都请求后端配置接口
   try {
@@ -854,12 +856,15 @@ initRongCloud().catch(err => {
 });
 
 const server = http.createServer((req, res) => {
-  if (req.url === '/health') {
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const pathname = url.pathname;
+
+  if (pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('alive');
     return;
   }
-  if (req.url === '/version') {
+  if (pathname === '/version') {
     try {
       const versionFile = path.join(__dirname, '..', 'version.json');
       const data = JSON.parse(fs.readFileSync(versionFile, 'utf8'));
@@ -871,7 +876,7 @@ const server = http.createServer((req, res) => {
     }
     return;
   }
-  if (req.url === '/rongcloud/status') {
+  if (pathname === '/rongcloud/status') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       enabled: !!rongcloudConfig,
@@ -879,6 +884,60 @@ const server = http.createServer((req, res) => {
     }));
     return;
   }
+
+  // SSE 流式端点：前端从首条 RC:StreamMsg 的 content.messageUID 中提取 clientStreamId
+  const streamMatch = pathname.match(/^\/api\/stream\/([^/]+)$/);
+  if (streamMatch && req.method === 'GET') {
+    const clientStreamId = decodeURIComponent(streamMatch[1]);
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    });
+
+    if (!streamBuffer || !streamBuffer.hasStream(clientStreamId)) {
+      res.write(`data: ${JSON.stringify({ error: 'stream not found' }) }\n\n`);
+      res.end();
+      return;
+    }
+
+    let ended = false;
+
+    // 立即回放已缓冲的片段
+    const existing = streamBuffer.getAll(clientStreamId);
+    for (const chunk of existing) {
+      if (ended) break;
+      res.write(`data: ${JSON.stringify({ delta: chunk.content || '' })}\n\n`);
+      if (chunk.is_final || chunk.error) {
+        ended = true;
+        res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+        res.end();
+        return;
+      }
+    }
+
+    // 订阅新片段
+    const unsubscribe = streamBuffer.subscribe(clientStreamId, (chunk) => {
+      if (ended) return;
+      res.write(`data: ${JSON.stringify({ delta: chunk.content || '' })}\n\n`);
+      if (chunk.is_final || chunk.error) {
+        ended = true;
+        res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+        res.end();
+        unsubscribe();
+      }
+    });
+
+    req.on('close', () => {
+      if (!ended) {
+        unsubscribe();
+      }
+    });
+
+    return;
+  }
+
   res.writeHead(404);
   res.end('not found');
 });
