@@ -42,7 +42,7 @@ function buildStreamDelta({ content, sessionStatus, seq, isFinal = false, error,
  * 构造 RC:StreamMsg 的 extra 卡片壳(规范 §8.3)。
  * card_id 必须与初始静态卡一致,前端据此续流。
  */
-function buildStreamExtra({ cardId, title = 'AI 助手', actions }) {
+function buildStreamExtra({ cardId, title = '', actions }) {
   const extra = {
     stream_type: 'card',
     card_template: 'ai_streaming',
@@ -310,9 +310,9 @@ class RongyunMessageHandler {
     let extra = null;
 
     try {
-      // 发送初始流式卡片(规范 CardModel)
+      // 发送初始流式卡片(规范 CardModel,普通聊天无标题)
       //    B2:用 md + buttons 字段对齐规范;B3:停止按钮 action.type='none'(占位,实际停止由前端 StreamDelta 处理)
-      await this._sendCardMessage(sourceId, card(cardId, 'AI 助手', [
+      await this._sendCardMessage(sourceId, card(cardId, '', [
         md('正在思考...'),
         buttons([
           btn('停止', action.none(), { id: 'stop', variant: 'danger' }),
@@ -321,7 +321,7 @@ class RongyunMessageHandler {
       ], { color: 'blue' }));
 
       // B3:extra 卡片壳(与上面初始静态卡同 card_id,前端续流依赖)
-      extra = buildStreamExtra({ cardId, title: 'AI 助手' });
+      extra = buildStreamExtra({ cardId, title: '' });
 
       // B3:发送 thinking 态首流(空 content,seq=1)
       //    让前端进入"思考中"渲染,extra 壳让前端定位到初始静态卡续流
@@ -376,9 +376,9 @@ class RongyunMessageHandler {
         extra,
       });
 
-      // 发送最终持久化卡片(规范 CardModel)
+      // 发送最终持久化卡片(普通聊天无标题)
       try {
-        await this._sendCardMessage(sourceId, card(cardId, 'AI 助手', [
+        await this._sendCardMessage(sourceId, card(cardId, '', [
           md(fullResponse),
           note(`session_id: chat-${sourceId}`),
         ], { color: 'blue' }));

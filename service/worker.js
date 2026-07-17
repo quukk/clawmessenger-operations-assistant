@@ -14,6 +14,10 @@ const { HeartbeatManager } = require('./modules/heartbeat-dashboard');
 const { getMacAddress } = require('./modules/mac-address');
 const { startOpencodeService, stopOpencodeService } = require('./modules/opencode-starter');
 const { DeviceRegistration } = require('./modules/device-registration');
+const {
+  getOpsConfigPath,
+  migrateLegacyOpsConfig,
+} = require('./modules/config');
 const { getServerUrl, getAppKey, getApiBaseUrl } = require('./config');
 const { SkillLoader } = require('./skills/skill-loader');
 const { SkillRouter } = require('./skills/skill-router');
@@ -174,38 +178,11 @@ try {
 const localConfigPath = path.join(__dirname, '..', 'rongcloud-config.json');
 let rongcloudConfig = null;
 
-/**
- * 获取实际用户主目录
- * Windows 服务以 SYSTEM 运行时 os.homedir() 返回 systemprofile，
- * 优先使用 CLAW_SERVICE_HOME / USERPROFILE 环境变量，最后扫描 C:\Users
- */
-function getRealHomeDir() {
-  const envHome = process.env.CLAW_SERVICE_HOME || process.env.USERPROFILE || process.env.HOME;
-  if (envHome && !envHome.includes('systemprofile')) {
-    return envHome;
-  }
-  const homeDir = os.homedir();
-  if (!homeDir.includes('systemprofile')) {
-    return homeDir;
-  }
-  // SYSTEM 账户兜底：扫描 C:\Users 找包含 .claw-bridge 的实际用户目录
-  const usersDir = 'C:\\Users';
-  if (fs.existsSync(usersDir)) {
-    const entries = fs.readdirSync(usersDir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (entry.isDirectory() && !['Public', 'Default', 'All Users', 'Default User'].includes(entry.name)) {
-        const candidate = path.join(usersDir, entry.name);
-        if (fs.existsSync(path.join(candidate, '.claw-bridge', 'config.json'))) {
-          return candidate;
-        }
-      }
-    }
-  }
-  return homeDir;
-}
+// 启动时一次性迁移旧版运维配置到 opencode-ass/（幂等）
+migrateLegacyOpsConfig('[WORKER]');
 
-const homeDir = getRealHomeDir();
-const clawBridgeConfigPath = path.join(homeDir, '.claw-bridge', 'config.json');
+// getRealHomeDir 与 clawBridgeConfigPath 来自 modules/config，避免重复实现
+const clawBridgeConfigPath = getOpsConfigPath();
 
 async function loadRongCloudConfigWithAutoRegister() {
   let config = {};
@@ -690,6 +667,7 @@ async function initRongCloud() {
             await dispatchCardAction(actionMsg, {
               chatId: `ops-${senderId}`, // 与 OpsAssistantSkill.handle 的 chatId 约定一致
               senderId,
+              senderUserId: senderId, // OpsAssistantSkill 的缓存 key(userModelLists/userSessionLists 用 senderUserId 作 key)
               targetId,
               conversationType: conversationTypeVal,
               rawMsg: msg,
@@ -697,6 +675,13 @@ async function initRongCloud() {
               sendCommandResult,
               rongcloudClient,
               opencodeRunner: fallbackSkill ? fallbackSkill.runner : null,
+              // 模型两级导航:dispatcher 点 provider 后,从此回调取扁平模型缓存
+              // (OpsAssistantSkill.userModelLists: Map<senderUserId, string[]>)
+              getModelList: fallbackSkill
+                ? (uid) => (fallbackSkill.userModelLists
+                    ? fallbackSkill.userModelLists.get(uid) || []
+                    : [])
+                : null,
               deleteOpencodeSession: (sessionId) => {
                 // 通过 opencode CLI 删除会话(与 OpsAssistantSkill._handleSessionDelete 一致)
                 try {
@@ -712,6 +697,28 @@ async function initRongCloud() {
                   return Promise.resolve(false);
                 }
               },
+              // 会话列表:从 OpsAssistantSkill.userSessionLists 取缓存(OpsAssistantSkill._refreshSessionList 写入)
+              getSessionList: fallbackSkill
+                ? (uid) => (fallbackSkill.userSessionLists
+                    ? fallbackSkill.userSessionLists.get(uid) || []
+                    : [])
+                : null,
+              // 当前选中会话:从 OpsAssistantSkill.userSessions 取
+              getCurrentSessionId: fallbackSkill
+                ? (uid) => (fallbackSkill.userSessions
+                    ? fallbackSkill.userSessions.get(uid) || ''
+                    : '')
+                : null,
+              // 删除后从缓存同步移除,避免下次发卡仍带被删会话
+              removeSessionFromCache: fallbackSkill
+                ? (uid, sid) => {
+                    if (!fallbackSkill.userSessionLists) return;
+                    const list = fallbackSkill.userSessionLists.get(uid);
+                    if (!list) return;
+                    const idx = list.findIndex((s) => s.id === sid);
+                    if (idx >= 0) list.splice(idx, 1);
+                  }
+                : null,
             });
           } catch (err) {
             log.error(`[WORKER] CardActionDispatcher 处理异常: ${err.message}`);

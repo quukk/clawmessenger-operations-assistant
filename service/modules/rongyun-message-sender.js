@@ -299,9 +299,11 @@ class RongyunMessageSender {
       const validation = validateCard(cardData);
       if (!validation.valid || !validation.sanitized) {
         this.log?.warn(`[RongyunMessageSender] 卡片校验失败: ${validation.errors.join('; ')}，降级为文本`);
-        const fallbackText = cardData && cardData.header && typeof cardData.header.title === 'string'
+        // fallback 文本优先用 title,但 title 可能为空(普通聊天无标题),此时用通用兜底
+        const titleCandidate = cardData && cardData.header && typeof cardData.header.title === 'string'
           ? cardData.header.title
-          : '卡片内容无效';
+          : '';
+        const fallbackText = titleCandidate.trim() || '卡片内容无效';
         return this.rongcloudClient.sendMessage(targetId, fallbackText, conversationType);
       }
 
@@ -365,24 +367,26 @@ class RongyunMessageSender {
   }
 
   /**
-   * 发送卡片增量更新消息(P2P)。
+   * 发送卡片更新消息(P2P)。
    *
-   * 用于分批流式推送:首张卡片用 sendCardMessage 发出,后续批次用本方法发 card_update,
-   * 小程序按 cardId 找到原卡片并将 appendCommands / appendSessions 累积追加到对应 section。
-   *
-   * 载荷契约(与前端约定):
-   *   { msg_type:'card_update', cardId, card: { appendCommands?: CommandItem[], appendSessions?: SessionItem[] }, timestamp: number }
-   *
-   * 复用与 sendCardMessage 相同的 sendMessage 路由,仅 msg_type 设为 'card_update'
-   * (rongcloud-client.sendMessage 已对 card_update 做显式对象构造,与 card_message 同构)。
+   * 两种模式:
+   *  - append(默认,增量): appendData = { appendCommands?: [], appendSessions?: [] }
+   *      前端按 cardId 找原卡片,将 append* 累积追加到对应 section。
+   *      载荷: { msg_type:'card_update', cardId, card: { appendCommands, ... }, timestamp }
+   *  - replace(整体替换): appendData = 完整 CardModel
+   *      前端按 cardId 找原卡片,整体替换为新的 CardModel(用于级联 select 同卡更新)。
+   *      载荷: { msg_type:'card_update', cardId, card: <CardModel>, timestamp, mode:'replace' }
    *
    * @param {string} targetId - 目标用户ID
-   * @param {string} cardId - 首张卡片 ID(必须与首卡一致,前端按此合并)
-   * @param {Object} appendData - 增量字段 { appendCommands?: [], appendSessions?: [] }
+   * @param {string} cardId - 首张卡片 ID(必须与首卡一致,前端按此合并/替换)
+   * @param {Object} appendData - append 模式:增量字段;replace 模式:完整 CardModel
    * @param {number} [conversationType=1] - 会话类型
+   * @param {Object} [opts] - 选项
+   * @param {('append'|'replace')} [opts.mode='append'] - 更新模式
    * @returns {Promise<Object>} { success: boolean, size?: number, reason?: string, error?: string }
    */
-  async sendCardUpdate(targetId, cardId, appendData, conversationType = 1) {
+  async sendCardUpdate(targetId, cardId, appendData, conversationType = 1, opts = {}) {
+    const mode = opts.mode === 'replace' ? 'replace' : 'append';
     if (!this.rongcloudClient?.isConnected) {
       this.log?.error('[RongyunMessageSender] 未连接，无法发送卡片更新');
       return { success: false, reason: 'not connected' };
@@ -394,12 +398,13 @@ class RongyunMessageSender {
         msg_type: 'card_update',
         cardId,
         card,
+        mode, // 前端按 mode 决定 append 还是整体替换
         timestamp: Date.now(),
       };
 
       let size = estimateMessageSize(payload);
-      if (size > SAFE_LIMIT) {
-        // 尝试通过减半追加列表来降低体积(保持 card 嵌套)
+      if (mode === 'append' && size > SAFE_LIMIT) {
+        // append 模式:尝试通过减半追加列表来降低体积(保持 card 嵌套)
         const truncated = { ...card };
         let currentSize = size;
         while (currentSize > SAFE_LIMIT) {
@@ -419,12 +424,16 @@ class RongyunMessageSender {
         }
 
         if (currentSize > SAFE_LIMIT) {
-          this.log?.warn(`[RongyunMessageSender] card_update 体积超过安全阈值(${currentSize} > ${SAFE_LIMIT})，拒绝发送`);
+          this.log?.warn(`[RongyunMessageSender] card_update(append) 体积超过安全阈值(${currentSize} > ${SAFE_LIMIT})，拒绝发送`);
           return { success: false, size: currentSize, reason: 'too large' };
         }
 
         this.log?.warn(`[RongyunMessageSender] card_update 体积超过安全阈值，已截断追加列表至 ${currentSize} 字节`);
         size = currentSize;
+      } else if (mode === 'replace' && size > HARD_LIMIT) {
+        // replace 模式:整卡替换,体积上限按 HARD_LIMIT,超限直接拒绝(不做破坏性截断)
+        this.log?.error(`[RongyunMessageSender] card_update(replace) 体积(${size})超过硬上限 ${HARD_LIMIT}，拒绝发送`);
+        return { success: false, size, reason: 'too large' };
       }
 
       const result = await this.rongcloudClient.sendMessage(
@@ -434,10 +443,14 @@ class RongyunMessageSender {
       );
 
       if (result) {
-        const summary = [];
-        if (appendData.appendCommands) summary.push(`+${appendData.appendCommands.length} cmd`);
-        if (appendData.appendSessions) summary.push(`+${appendData.appendSessions.length} sess`);
-        this.log?.info(`[RongyunMessageSender] card_update 已发送 -> ${targetId}, cardId=${cardId}, ${summary.join(' ')}`);
+        if (mode === 'replace') {
+          this.log?.info(`[RongyunMessageSender] card_update(replace) 已发送 -> ${targetId}, cardId=${cardId}`);
+        } else {
+          const summary = [];
+          if (appendData.appendCommands) summary.push(`+${appendData.appendCommands.length} cmd`);
+          if (appendData.appendSessions) summary.push(`+${appendData.appendSessions.length} sess`);
+          this.log?.info(`[RongyunMessageSender] card_update 已发送 -> ${targetId}, cardId=${cardId}, ${summary.join(' ')}`);
+        }
       } else {
         this.log?.warn(`[RongyunMessageSender] card_update 发送失败 -> ${targetId}, cardId=${cardId}`);
       }

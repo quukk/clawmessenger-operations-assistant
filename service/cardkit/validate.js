@@ -65,8 +65,10 @@ function validateCard(input) {
   }
   if (typeof raw.header !== 'object' || raw.header === null) {
     errors.push('缺少 header 对象');
-  } else if (typeof raw.header.title !== 'string' || !raw.header.title.trim()) {
-    errors.push('缺少 header.title');
+  } else if (typeof raw.header.title !== 'string') {
+    // title 必须是字符串,但允许为空字符串:
+    // 普通聊天卡片传空 title,前端 v-if="cardKitHeaderTitle" 空值守卫会隐藏整块 header。
+    errors.push('header.title 必须是字符串');
   }
   if (!Array.isArray(raw.sections)) {
     errors.push('sections 必须是数组');
@@ -253,8 +255,25 @@ function validateSection(sec, idx, seenButtonIds) {
       break;
 
     case 'commandPalette':
-      if (!Array.isArray(sec.commands)) {
-        errs.push(`${prefix}(commandPalette): commands 必须是数组`);
+      // commands 和 groups 二选一(有 groups 时不要求 commands)
+      const hasCommands = Array.isArray(sec.commands);
+      const hasGroups = Array.isArray(sec.groups);
+      if (!hasCommands && !hasGroups) {
+        errs.push(`${prefix}(commandPalette): commands 或 groups 至少需要一个数组`);
+      }
+      if (hasGroups) {
+        sec.groups.forEach((g, gi) => {
+          if (typeof g !== 'object' || g === null) {
+            errs.push(`${prefix}(commandPalette).groups[${gi}]: 必须是对象`);
+            return;
+          }
+          if (typeof g.label !== 'string' || !g.label.trim()) {
+            errs.push(`${prefix}(commandPalette).groups[${gi}].label: 不能为空`);
+          }
+          if (!Array.isArray(g.items)) {
+            errs.push(`${prefix}(commandPalette).groups[${gi}].items: 必须是数组`);
+          }
+        });
       }
       break;
 

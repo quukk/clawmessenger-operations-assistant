@@ -43,11 +43,11 @@ function buildStreamDelta({ content, sessionStatus, seq, isFinal = false, error,
  *
  * @param {Object} p
  * @param {string} p.cardId 卡片 id(与初始静态卡一致)
- * @param {string} [p.title='运维助手'] 卡片标题
+ * @param {string} [p.title=''] 卡片标题(普通聊天默认无标题)
  * @param {Array} [p.actions] 按钮列表(与初始静态卡的 buttons 对应)
  * @returns {Object} extra 卡片壳
  */
-function buildStreamExtra({ cardId, title = '运维助手', actions }) {
+function buildStreamExtra({ cardId, title = '', actions }) {
   const extra = {
     stream_type: 'card',
     card_template: 'ai_streaming',

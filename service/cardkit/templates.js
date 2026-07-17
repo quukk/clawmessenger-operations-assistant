@@ -156,7 +156,7 @@ function sessionsCard(sessions, currentSessionId) {
   });
 
   if (sessions.length === 0) sections.push(note('暂无会话'));
-  return card(`sessions_${currentSessionId || 'list'}`, '💬 会话列表', sections, { icon: '💬' });
+  return card(`sessions_${currentSessionId || 'list'}_${Date.now()}`, '会话列表', sections, { icon: '💬' });
 }
 
 // ============================================================================

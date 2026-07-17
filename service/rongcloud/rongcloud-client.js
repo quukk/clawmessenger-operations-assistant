@@ -362,7 +362,8 @@ class RongCloudClient {
         messageContent
       );
 
-      // this.log?.info(`[RongCloudClient] 发送结果: code=${result.code}`);
+      const sentMt = parsed?.msg_type || '(unknown)';
+      this.log?.info(`[RongCloudClient] sendMessage 结果: mt=${sentMt}, code=${result.code}, messageUId=${result.data?.messageUId || '(none)'}`);
 
       if (result.code === 0 || result.code === 200) {
         const sentUId = result.data?.messageUId;

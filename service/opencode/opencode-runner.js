@@ -23,6 +23,27 @@ const { OpencodeClient } = require('./opencode-client');
 const { EventHandler } = require('./event-handler');
 const { buildStreamExtra } = require('../skills/ops-assistant/stream-builders');
 
+/**
+ * 判断错误是否为 session stale(已被 server 删除)。
+ * 匹配特征(任一即成立):
+ *   - error.name === 'NotFoundError'(SDK 错误类型)
+ *   - 消息含 "Session not found" 或 "session not found"
+ *   - 消息含 "[404" 状态标记(opencode-client 抛错格式: `发送消息失败: {...} [404 Not Found]`)
+ *
+ * 用于 _doSendMessage 的自愈兜底:检测到 stale 后清除本地 session 映射并重试。
+ *
+ * @param {Error} err
+ * @returns {boolean}
+ */
+function _isSessionNotFoundError(err) {
+  if (!err || typeof err.message !== 'string') return false;
+  const msg = err.message;
+  if (err.name === 'NotFoundError') return true;
+  if (msg.includes('Session not found') || msg.includes('session not found')) return true;
+  if (msg.includes('[404')) return true;
+  return false;
+}
+
 class OpencodeRunner {
   /**
    * @param {Object} options
@@ -229,48 +250,78 @@ class OpencodeRunner {
       throw new Error('OpencodeRunner 未初始化 SSE(请先调用 initSse)');
     }
 
-    // 复用或创建 session
-    let session = this.sessions.get(chatId);
-    if (!session) {
-      try {
-        const created = await this.opencode.createSession(`ops-assistant ${chatId}`);
-        session = { id: created.id, lastUsed: Date.now() };
-        this.sessions.set(chatId, session);
+    // 复用或创建 session,并注册 SSE 路由。返回 { session, sessionId }。
+    // 抽成内部方法便于 stale session 自愈后重试复用。
+    const resolveAndRegister = async () => {
+      let session = this.sessions.get(chatId);
+      if (!session) {
+        try {
+          const created = await this.opencode.createSession(`ops-assistant ${chatId}`);
+          session = { id: created.id, lastUsed: Date.now() };
+          this.sessions.set(chatId, session);
+          this._saveSessions();
+          this.log.info(`[OpencodeRunner] 新建 session: ${created.id} for chatId=${chatId}`);
+        } catch (err) {
+          throw new Error(`创建会话失败: ${err.message}`);
+        }
+      } else {
+        session.lastUsed = Date.now();
         this._saveSessions();
-        this.log.info(`[OpencodeRunner] 新建 session: ${created.id} for chatId=${chatId}`);
-      } catch (err) {
-        throw new Error(`创建会话失败: ${err.message}`);
       }
-    } else {
-      session.lastUsed = Date.now();
-      this._saveSessions();
-    }
 
-    const sessionId = session.id;
+      const sessionId = session.id;
 
-    // 注册 SSE 路由映射(promptAsync 触发前注册,避免首个 delta 到达时无映射)
-    this.eventHandler.registerSession(sessionId, {
-      chatId,
-      targetId: routeCtx.targetId,
-      senderUserId: routeCtx.senderUserId,
-      convType: routeCtx.convType,
-      cardId: routeCtx.cardId,
-      streamId: routeCtx.streamId,
-      extra: buildStreamExtra({ cardId: routeCtx.cardId, title: '运维助手' }),
-    });
+      // 注册 SSE 路由映射(promptAsync 触发前注册,避免首个 delta 到达时无映射)
+      this.eventHandler.registerSession(sessionId, {
+        chatId,
+        targetId: routeCtx.targetId,
+        senderUserId: routeCtx.senderUserId,
+        convType: routeCtx.convType,
+        cardId: routeCtx.cardId,
+        streamId: routeCtx.streamId,
+        extra: buildStreamExtra({ cardId: routeCtx.cardId, title: '' }),
+      });
 
-    // 注册活跃流索引,供 stop 命令查找 sessionId
-    this.activeStreams.set(routeCtx.cardId, { sessionId, routeCtx });
-    this.log.info(`[OpencodeRunner] 注册活跃流: cardId=${routeCtx.cardId}, sessionId=${sessionId}`);
+      // 注册活跃流索引,供 stop 命令查找 sessionId
+      this.activeStreams.set(routeCtx.cardId, { sessionId, routeCtx });
+      this.log.info(`[OpencodeRunner] 注册活跃流: cardId=${routeCtx.cardId}, sessionId=${sessionId}`);
+
+      return { session, sessionId };
+    };
+
+    const { sessionId } = await resolveAndRegister();
 
     // 异步触发 prompt(fire-and-forget,真实回复由 SSE 驱动)
     try {
       await this.opencode.promptAsync(sessionId, message);
     } catch (err) {
-      // 触发失败:清理刚注册的映射,抛出让调用方发错误卡片
-      // (不删除 session,避免损坏的 session 影响后续;真实损坏由下次 createSession 兜底)
-      // 注意:registerSession 已清除 sentSessions,这里只清状态
+      // 触发失败:清理刚注册的映射。
       this.eventHandler.streamStates.delete(sessionId);
+
+      // 自愈:若失败是 session stale(404 / NotFoundError / Session not found),
+      // 清除本地 session 映射,新建 session 后重试 promptAsync 一次。
+      // 根因:用户通过 /session-use 指定或历史残留了一个已被 server 删除的 sessionId,
+      // runner 复用前不校验存在性,这里作为最后一道兜底。
+      if (_isSessionNotFoundError(err)) {
+        this.log.warn(
+          `[OpencodeRunner] session 不存在(stale),清除本地映射并重试: chatId=${chatId}, sessionId=${sessionId}, err=${err.message}`,
+        );
+        this.clearSession(chatId);
+        // 清理活跃流索引中的旧 entry,resolveAndRegister 会用新 sessionId 覆盖
+        this.activeStreams.delete(routeCtx.cardId);
+        const retry = await resolveAndRegister();
+        try {
+          await this.opencode.promptAsync(retry.sessionId, message);
+          this.log.info(
+            `[OpencodeRunner] stale session 自愈成功: chatId=${chatId}, newSessionId=${retry.sessionId}`,
+          );
+          return;
+        } catch (retryErr) {
+          this.eventHandler.streamStates.delete(retry.sessionId);
+          throw retryErr;
+        }
+      }
+
       throw err;
     }
   }

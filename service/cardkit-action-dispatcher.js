@@ -21,8 +21,12 @@
 'use strict';
 
 const { createLogger } = require('./logger');
-const { buildModelsCard } = require('./cardkit/model-cards');
-const { card: buildCard, note } = require('./cardkit/builders');
+const {
+  buildModelsCard,
+  buildModelCascadeCard,
+  buildModelSwitchedCard,
+} = require('./cardkit/model-cards');
+const { card: buildCard, note, sessionList } = require('./cardkit/builders');
 
 const log = createLogger('CardActionDispatcher');
 
@@ -57,6 +61,9 @@ async function dispatchCardAction(actionMsg, context = {}) {
   const cardId = actionMsg.cardId || '(unknown)';
   const requestId = actionMsg.request_id || '';
   const chatId = context.chatId || '(unknown)';
+
+  // 把 cardId 透传给各处理器(级联 card_update 需要复用原卡 id 整体替换)
+  context.cardId = cardId;
 
   log.info(`dispatchCardAction: type=${actionType}, cardId=${cardId}, chatId=${chatId}, requestId=${requestId}`);
 
@@ -106,12 +113,18 @@ async function dispatchCardAction(actionMsg, context = {}) {
   }
 
   // 无论成功失败,都回 command_result 让前端按钮清 loading
+  // 若处理器返回了 card(如会话删除后重建的卡片),携带在 card_state.card 中,
+  // 前端收到后整体替换原卡片内容(card_update 消息融云不推送,改走 command_result)
+  const cardState = { status: result.success ? 'completed' : 'error' };
+  if (result.card) {
+    cardState.card = result.card;
+  }
   await safeSendCommandResult(context, {
     cardId,
     requestId,
     success: result.success,
     updateType: 'action_done',
-    cardState: { status: result.success ? 'completed' : 'error' },
+    cardState,
   });
 
   return result;
@@ -221,28 +234,66 @@ async function handleSession(actionObj, context) {
   }
 
   if (op === 'delete') {
+    let deleted = false;
     // 调 opencode session delete(若注入了 deleteOpencodeSession)
     if (typeof context.deleteOpencodeSession === 'function') {
       try {
-        await context.deleteOpencodeSession(sessionId);
+        deleted = await context.deleteOpencodeSession(sessionId);
         log.info(`session 删除成功: ${sessionId}`);
-        return { success: true, confirmText: '会话已删除' };
       } catch (err) {
         log.error(`session 删除失败: ${err.message}`);
         return { success: false, confirmText: '删除失败' };
       }
-    }
-    // 未注入删除能力时,转为 /session-delete 命令走 reinject
-    if (typeof context.reinjectMessage === 'function') {
+    } else if (typeof context.reinjectMessage === 'function') {
+      // 未注入删除能力时,转为 /session-delete 命令走 reinject
       await context.reinjectMessage(`/session-delete ${sessionId}`, {
         senderId: context.senderId,
         targetId: context.targetId,
         conversationType: context.conversationType,
         chatId: context.chatId,
       });
-      return { success: true, confirmText: '已触发删除会话' };
+      deleted = true;
     }
-    return { success: false, confirmText: '会话删除能力未就绪' };
+
+    if (!deleted && typeof context.deleteOpencodeSession === 'function') {
+      return { success: false, confirmText: '删除失败' };
+    }
+
+    // 删除后:从缓存移除 + 通过 command_result 的 card_state.card 携带更新后的卡片
+    // (card_update 消息融云不推送到前端,改用 command_result 携带完整 CardModel)
+    if (typeof context.removeSessionFromCache === 'function') {
+      context.removeSessionFromCache(context.senderUserId, sessionId);
+    }
+    const allSessions = typeof context.getSessionList === 'function'
+      ? (context.getSessionList(context.senderUserId) || [])
+      : [];
+    const remaining = allSessions.filter((s) => s.id !== sessionId);
+    let updatedCard;
+    if (remaining.length === 0) {
+      // 全删空 → 更新卡片显示"暂无会话"
+      updatedCard = buildCard(context.cardId || `card-sessions-${Date.now()}`, '会话列表', [
+        note('暂无会话记录'),
+      ], { color: 'blue', icon: '💬' });
+    } else {
+      const listSessions = remaining.map((s) => ({
+        id: s.id,
+        title: s.title,
+        ...(s.updated ? { updatedAt: s.updated } : {}),
+      }));
+      const currentSessionId = (typeof context.getCurrentSessionId === 'function'
+        ? context.getCurrentSessionId(context.senderUserId)
+        : context.currentSessionId) || '';
+      updatedCard = buildCard(context.cardId, '会话列表', [
+        sessionList({
+          sessions: listSessions,
+          searchCommand: 'session-search',
+          ...(currentSessionId && currentSessionId !== sessionId
+            ? { currentSessionId }
+            : {}),
+        }),
+      ], { color: 'blue', icon: '💬' });
+    }
+    return { success: true, confirmText: '会话已删除', card: updatedCard };
   }
 
   if (op === 'switch') {
@@ -315,17 +366,65 @@ async function handleCustom(actionObj, context) {
 }
 
 /**
- * 发送模型列表卡片。
+ * 发送模型列表卡片(级联第二级:供应商选中后,同 card 整体替换出模型 select)。
+ *
+ * 前端约定:select 的 option.value 由前端并入 action.payload.value 回传。
+ * 所以 providerId 从 action.payload.value 取(兼容旧 payload.provider)。
+ *
+ * 数据来源优先级:
+ *  1. context.getModelList(senderUserId) —— OpsAssistantSkill 缓存的扁平模型串
+ *     (来自 CLI `opencode models`,形如 "anthropic/claude-3.5")。按 providerId 过滤。
+ *  2. 兜底:context.opencodeRunner.opencode.listProviders() (SDK 结构化数据)。
+ *
+ * 发送方式:card_update(replace 模式),cardId 复用 context.cardId(原卡片 id)。
+ * 前端按 cardId + mode:'replace' 整体替换卡片。
+ *
  * @param {Object} actionObj
  * @param {Object} context
  * @returns {Promise<{success: boolean, confirmText: string}>}
  */
 async function handleListModels(actionObj, context) {
-  const providerId = actionObj.payload && actionObj.payload.provider;
+  const payload = actionObj.payload || {};
+  // 前端把 select 的 option.value 并入 payload.value;兼容旧 payload.provider
+  const providerId = payload.value || payload.provider;
   if (!providerId) {
     return { success: false, confirmText: '缺少服务商 ID' };
   }
 
+  const cardId = context.cardId;
+  const targetId = context.senderId || context.targetId;
+  const conversationType = context.conversationType || 1;
+
+  // 优先用扁平缓存(ops-assistant 路径)
+  if (typeof context.getModelList === 'function') {
+    try {
+      const allModels = context.getModelList(context.senderUserId) || [];
+      const providerFullModels = filterModelsByProvider(allModels, providerId);
+      if (providerFullModels.length === 0) {
+        return { success: false, confirmText: `${providerId} 暂无可用模型` };
+      }
+      const providerModels = providerFullModels.map((fullId) => {
+        const idx = fullId.indexOf('/');
+        const modelId = idx > 0 ? fullId.slice(idx + 1) : fullId;
+        return { id: modelId, name: modelId };
+      });
+
+      // 重建完整 provider 列表(供供应商 select 渲染 + 选中态切换)
+      const providers = extractProvidersFromFlat(allModels);
+      const currentModel = await safeGetCurrentModel(context);
+
+      const card = buildModelCascadeCard(
+        providers, currentModel, providerId, providerModels, cardId,
+      );
+      await sendCardUpdatePayload(context, card, cardId, targetId, conversationType);
+      return { success: true, confirmText: '模型列表已更新' };
+    } catch (err) {
+      log.error(`list_models(缓存路径)处理失败: ${err.message}`);
+      // 继续走 SDK 兜底
+    }
+  }
+
+  // 兜底:SDK listProviders(结构化数据)
   if (!context.opencodeRunner || !context.opencodeRunner.opencode) {
     return { success: false, confirmText: '模型列表服务未就绪' };
   }
@@ -341,19 +440,22 @@ async function handleListModels(actionObj, context) {
       return { success: false, confirmText: `未找到服务商: ${providerId}` };
     }
 
-    const provider = {
-      id: p.id,
-      name: p.name || p.id,
-      models: normalizeModels(p.models),
-    };
-
-    if (provider.models.length === 0) {
-      return { success: false, confirmText: `${provider.name} 暂无可用模型` };
+    const providerModels = normalizeModels(p.models);
+    if (providerModels.length === 0) {
+      return { success: false, confirmText: `${p.name || p.id} 暂无可用模型` };
     }
 
-    const card = buildModelsCard(provider, currentModel);
-    await sendCardPayload(context, card);
-    return { success: true, confirmText: '模型列表已发送' };
+    // SDK 路径:用 allProviders 作为供应商 select 选项
+    const providers = allProviders.map((x) => ({
+      id: x.id,
+      name: x.name || x.id,
+      models: [],
+    }));
+    const card = buildModelCascadeCard(
+      providers, currentModel, providerId, providerModels, cardId,
+    );
+    await sendCardUpdatePayload(context, card, cardId, targetId, conversationType);
+    return { success: true, confirmText: '模型列表已更新' };
   } catch (err) {
     log.error(`list_models 处理失败: ${err.message}`);
     return { success: false, confirmText: '加载模型列表失败' };
@@ -361,13 +463,88 @@ async function handleListModels(actionObj, context) {
 }
 
 /**
- * 切换模型并返回成功卡片。
+ * 从扁平模型串数组中过滤出指定 provider 的模型(保持原始顺序)。
+ * providerId 比较大小写不敏感;"其他" 分组匹配无 '/' 前缀的模型。
+ * @param {string[]} allModels 形如 ["anthropic/claude-3.5", ...]
+ * @param {string} providerId
+ * @returns {string[]}
+ */
+function filterModelsByProvider(allModels, providerId) {
+  if (!Array.isArray(allModels)) return [];
+  const pidLower = String(providerId).toLowerCase();
+  const otherLower = '其他';
+  return allModels.filter((m) => {
+    const idx = m.indexOf('/');
+    if (pidLower === otherLower) {
+      return idx <= 0;
+    }
+    if (idx <= 0) return false;
+    return m.slice(0, idx).toLowerCase() === pidLower;
+  });
+}
+
+/**
+ * 从扁平模型串解析唯一 provider 列表(保持原始出现顺序,去重)。
+ * 与 ops-assistant 的 _extractProviders 等价,供 dispatcher 自洽使用。
+ * @param {string[]} allModels
+ * @returns {Array<{id: string, name: string, models: Array}>}
+ */
+function extractProvidersFromFlat(allModels) {
+  const seen = new Set();
+  const list = [];
+  if (!Array.isArray(allModels)) return list;
+  for (const m of allModels) {
+    const idx = m.indexOf('/');
+    const pid = idx > 0 ? m.slice(0, idx) : '其他';
+    if (!seen.has(pid)) {
+      seen.add(pid);
+      list.push({ id: pid, name: capitalizeProvider(pid), models: [] });
+    }
+  }
+  return list;
+}
+
+/**
+ * 简单 capitalize;已含大写字母(如 xAI)保留原样。
+ * @param {string} provider
+ * @returns {string}
+ */
+function capitalizeProvider(provider) {
+  if (!provider) return '其他';
+  if (/[A-Z]/.test(provider)) return provider;
+  return provider.charAt(0).toUpperCase() + provider.slice(1);
+}
+
+/**
+ * 安全获取当前模型(尽量不抛,失败返回 '')。
+ * @param {Object} context
+ * @returns {Promise<string>}
+ */
+async function safeGetCurrentModel(context) {
+  try {
+    if (context.opencodeRunner && context.opencodeRunner.opencode) {
+      const config = await context.opencodeRunner.opencode.getConfig();
+      return (config && config.model) || '';
+    }
+  } catch (err) {
+    log.warn(`获取当前模型失败: ${err.message}`);
+  }
+  return '';
+}
+
+/**
+ * 切换模型并反馈(级联第三步:用 card_update 整体替换原卡为成功提示)。
+ *
+ * 前端约定:select 的 option.value(形如 "anthropic/claude-3.5")并入 payload.value。
+ * 兼容旧 payload.model。
+ *
  * @param {Object} actionObj
  * @param {Object} context
  * @returns {Promise<{success: boolean, confirmText: string}>}
  */
 async function handleSwitchModel(actionObj, context) {
   const payload = actionObj.payload || {};
+  // 前端 select value 并入 payload.value;兼容旧 payload.model
   const model = payload.value || payload.model;
   if (!model) {
     return { success: false, confirmText: '缺少模型 ID' };
@@ -385,13 +562,19 @@ async function handleSwitchModel(actionObj, context) {
 
   try {
     await context.opencodeRunner.opencode.switchModel(sessionEntry.id, model);
-    const card = buildCard(
-      `card-switch-model-${Date.now()}`,
-      '✅ 已切换模型',
-      [note(`已切换至 ${model}`)],
-      { color: 'green' },
-    );
-    await sendCardPayload(context, card);
+
+    // 优先:card_update(replace) 把原级联卡替换为成功提示(复用原 cardId)
+    const cardId = context.cardId;
+    const targetId = context.senderId || context.targetId;
+    const conversationType = context.conversationType || 1;
+    if (cardId && cardId !== '(unknown)') {
+      const switchedCard = buildModelSwitchedCard(cardId, model);
+      await sendCardUpdatePayload(context, switchedCard, cardId, targetId, conversationType);
+    } else {
+      // 兜底:发新 card_message
+      const card = buildModelSwitchedCard(`card-switch-model-${Date.now()}`, model);
+      await sendCardPayload(context, card);
+    }
     return { success: true, confirmText: `已切换至 ${model}` };
   } catch (err) {
     log.error(`switch_model 处理失败: ${err.message}`);
@@ -418,6 +601,41 @@ async function sendCardPayload(context, card) {
     await context.rongcloudClient.sendMessage(targetId, payload, conversationType);
   } else {
     log.warn('sendCardPayload: 融云客户端未就绪，卡片未发送');
+  }
+}
+
+/**
+ * 通过融云客户端发送 card_update(replace 模式,整体替换同 cardId 卡片)。
+ *
+ * 载荷与 RongyunMessageSender.sendCardUpdate(mode:'replace') 一致:
+ *   { msg_type:'card_update', cardId, card: <CardModel>, mode:'replace', timestamp }
+ * 前端按 cardId 找原卡片,整体替换为新的 CardModel。
+ *
+ * @param {Object} context
+ * @param {import('./cardkit/schema').CardModel} card 完整卡片(replace 后的新内容)
+ * @param {string} cardId 原卡片 id(必须与首卡一致)
+ * @param {string} targetId
+ * @param {number} conversationType
+ */
+async function sendCardUpdatePayload(context, card, cardId, targetId, conversationType) {
+  if (!cardId || cardId === '(unknown)') {
+    // 没有 cardId 无法做整体替换,降级为新 card_message
+    log.warn('sendCardUpdatePayload: 无 cardId,降级为 card_message');
+    await sendCardPayload(context, card);
+    return;
+  }
+  const payload = JSON.stringify({
+    msg_type: 'card_update',
+    cardId,
+    card,
+    mode: 'replace',
+    timestamp: Date.now(),
+  });
+  if (context.rongcloudClient && context.rongcloudClient.isConnected) {
+    const ok = await context.rongcloudClient.sendMessage(targetId, payload, conversationType);
+    log.info(`sendCardUpdatePayload: cardId=${cardId}, mode=replace, 发送结果=${ok}`);
+  } else {
+    log.warn('sendCardUpdatePayload: 融云客户端未就绪，卡片未更新');
   }
 }
 

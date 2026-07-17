@@ -262,10 +262,25 @@ const ACTION_TYPES = [
  */
 
 /**
+ * 命令面板分组项(当 commandPalette 按分组渲染时使用)。
+ * @typedef {Object} CommandPaletteGroup
+ * @property {string} label 分组显示名(如 provider: "Anthropic")
+ * @property {boolean} [collapsed] 是否默认折叠(默认展开 false)
+ * @property {Array<{name: string, description?: string}>} items 分组内命令项
+ */
+
+/**
  * 命令面板段落(可点击的命令列表)。
+ *
+ * 支持两种渲染形态,二者二选一(有 groups 时不渲染扁平 commands):
+ *  - commands: 扁平列表(向后兼容)
+ *  - groups: 按 provider 等维度分组的列表(新)
+ * 至少提供其一。
+ *
  * @typedef {Object} CommandPaletteSection
  * @property {'commandPalette'} kind
- * @property {Array<{name: string, description?: string}>} commands
+ * @property {Array<{name: string, description?: string}>} [commands] 扁平命令列表(与 groups 二选一)
+ * @property {CommandPaletteGroup[]} [groups] 分组命令列表(与 commands 二选一)
  * @property {string} [searchCommand] 搜索命令名(不含 / 前缀)。前端搜索框输入关键词后,
  *   会触发 {type:'command', name: searchCommand + ' ' + keyword},由 dispatcher reinject
  *   '/<searchCommand> <keyword>' 请求后端返回匹配的子集。仅在列表因体积被截断、

@@ -6,18 +6,23 @@
  *    新版路径：~/.claw-bridge/openclaw/config.json
  *    旧版兼容：~/.claw-bridge/config.json（仅当新版不存在且旧版不含运维账户字段时）
  * 2. 基于 openclaw 的 nodeId 获取/创建运维独立融云账户 /api/claw/om-token/<node_id>
- * 3. 配置持久化到 ~/.claw-bridge/config.json
+ * 3. 配置持久化到 ~/.claw-bridge/opencode-ass/config.json
  * 4. token 失效检测与主动刷新
  */
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
-const { getRealHomeDir } = require('./config');
+const {
+  getRealHomeDir,
+  getOpsConfigPath,
+  migrateLegacyOpsConfig,
+  OPS_DIR_NAME,
+  CLAW_BRIDGE_DIR_NAME,
+  OPS_CONFIG_FILE_NAME,
+} = require('./config');
 const { getMacAddress } = require('./mac-address');
 const { getServerUrl, getAppKey } = require('../config');
 
-const CONFIG_FILE_NAME = 'config.json';
-const CONFIG_DIR_NAME = '.claw-bridge';
 const OPENCLAW_CONFIG_DIR_NAME = 'openclaw';
 const TOKEN_VALIDITY_MS = 7 * 24 * 60 * 60 * 1000; // 7 天
 
@@ -27,12 +32,15 @@ class DeviceRegistration {
    */
   constructor(log) {
     this.log = log || console;
-    this.configPath = path.join(getRealHomeDir(), CONFIG_DIR_NAME, CONFIG_FILE_NAME);
+    // 运维端自有配置：~/.claw-bridge/opencode-ass/config.json
+    migrateLegacyOpsConfig('[DeviceRegistration]');
+    this.configPath = getOpsConfigPath();
+    // openclaw 配置路径（只读，不属于运维端）
     this.openclawConfigPath = path.join(
-      getRealHomeDir(), CONFIG_DIR_NAME, OPENCLAW_CONFIG_DIR_NAME, CONFIG_FILE_NAME
+      getRealHomeDir(), CLAW_BRIDGE_DIR_NAME, OPENCLAW_CONFIG_DIR_NAME, OPS_CONFIG_FILE_NAME
     );
     this.legacyOpenclawConfigPath = path.join(
-      getRealHomeDir(), CONFIG_DIR_NAME, CONFIG_FILE_NAME
+      getRealHomeDir(), CLAW_BRIDGE_DIR_NAME, OPS_CONFIG_FILE_NAME
     );
     this.serverUrl = getServerUrl();
   }

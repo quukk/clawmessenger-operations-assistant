@@ -1,16 +1,16 @@
 /**
  * 消息体积估算工具。
  *
- * 融云自定义消息单条建议 ≤ 5 KB（5,120 字节），本工具提供统一的大小估算
+ * 融云自定义消息单条建议 ≤ 10 KB（10,240 字节，付费用户），本工具提供统一的大小估算
  * 与卡片截断辅助函数，供 card_message / card_update 发送前自检。
  */
 
 'use strict';
 
-/** 安全阈值（4 KB），超过此值即开始截断 / 拆分。 */
-const SAFE_LIMIT = 4096;
-/** 融云硬上限（5 KB），超过此值不允许发送。 */
-const HARD_LIMIT = 5120;
+/** 安全阈值（10 KB），超过此值即开始截断 / 拆分。 */
+const SAFE_LIMIT = 10240;
+/** 融云硬上限（10 KB），超过此值不允许发送。 */
+const HARD_LIMIT = 10240;
 /** markdown 段落首次截断目标字节数。 */
 const MAX_MD_BYTES = 1500;
 /** markdown 段落最小保留字节数。 */
@@ -154,11 +154,23 @@ function truncateCardPayload(payload) {
         }
         break;
       case 'commandPalette':
+        // 扁平 commands 模式:截断列表
         if (Array.isArray(s.commands)) {
           s.commands = s.commands.slice(0, MAX_COMMANDS).map((cmd) => ({
             ...cmd,
             name: typeof cmd.name === 'string' ? truncateTextToBytes(cmd.name, MAX_ITEM_TEXT_BYTES) : cmd.name,
             description: typeof cmd.description === 'string' ? truncateTextToBytes(cmd.description, MAX_ITEM_TEXT_BYTES) : cmd.description,
+          }));
+        }
+        // 分组 groups 模式:限制每组最多 MAX_COMMANDS 项
+        if (Array.isArray(s.groups)) {
+          s.groups = s.groups.slice(0, 30).map((g) => ({
+            ...g,
+            items: Array.isArray(g.items) ? g.items.slice(0, MAX_COMMANDS).map((cmd) => ({
+              ...cmd,
+              name: typeof cmd.name === 'string' ? truncateTextToBytes(cmd.name, MAX_ITEM_TEXT_BYTES) : cmd.name,
+              description: typeof cmd.description === 'string' ? truncateTextToBytes(cmd.description, MAX_ITEM_TEXT_BYTES) : cmd.description,
+            })) : [],
           }));
         }
         break;
@@ -205,6 +217,19 @@ function truncateCardPayload(payload) {
           reduced = true;
         } else if (s.kind === 'commandPalette' && Array.isArray(s.commands) && s.commands.length > 1) {
           s.commands = s.commands.slice(0, Math.max(1, Math.floor(s.commands.length / 2)));
+          reduced = true;
+        } else if (s.kind === 'commandPalette' && Array.isArray(s.groups) && s.groups.length > 1) {
+          // 分组模式:先逐组减半 items,不够再减半组数
+          let groupReduced = false;
+          for (const g of s.groups) {
+            if (Array.isArray(g.items) && g.items.length > 1) {
+              g.items = g.items.slice(0, Math.max(1, Math.floor(g.items.length / 2)));
+              groupReduced = true;
+            }
+          }
+          if (!groupReduced) {
+            s.groups = s.groups.slice(0, Math.max(1, Math.floor(s.groups.length / 2)));
+          }
           reduced = true;
         } else if (s.kind === 'table' && Array.isArray(s.rows) && s.rows.length > 1) {
           s.rows = s.rows.slice(0, Math.max(1, Math.floor(s.rows.length / 2)));

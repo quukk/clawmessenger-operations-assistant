@@ -23,7 +23,8 @@ function createMockLog() {
 
 async function run() {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'device-reg-test-'));
-  const configPath = path.join(tmpDir, '.claw-bridge', 'config.json');
+  const opsConfigDir = path.join(tmpDir, '.claw-bridge', 'opencode-ass');
+  const configPath = path.join(opsConfigDir, 'config.json');
   const openclawConfigDir = path.join(tmpDir, '.claw-bridge', 'openclaw');
   const openclawConfigPath = path.join(openclawConfigDir, 'config.json');
 

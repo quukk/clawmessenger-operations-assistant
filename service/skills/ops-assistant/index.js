@@ -12,13 +12,15 @@ const axios = require('axios');
 const { BaseSkill } = require('../base-skill');
 const { OpencodeRunner } = require('../../opencode/opencode-runner');
 const { RongyunMessageTypeEnum } = require('../../modules/rongyun-message-types');
+const { getOpsPrefsPath, migrateLegacyOpsConfig } = require('../../modules/config');
 // CardKit 规范卡片构造器(B2:v3 硬编码卡片迁移至 builders)
 const {
-  card, md, note, divider, buttons, btn, action,
+  card, md, note, divider, buttons, btn, action, kv,
   sessionList, commandPalette,
 } = require('../../cardkit/builders');
 // B3:StreamDelta + extra 卡片壳构造器(抽离至 stream-builders,供 event-handler 共享)
 const { buildStreamDelta, buildStreamExtra } = require('./stream-builders');
+// NOTE: /models 改用 accordion(commandPalette groups)方案,不再使用 buildModelCascadeCard。
 
 const execAsync = promisify(exec);
 
@@ -27,6 +29,95 @@ const execAsync = promisify(exec);
 // (event-handler.js 与本文件共享,避免循环依赖)
 // 状态机覆盖:thinking → responding → completed(以及 error)
 // ============================================================================
+
+// ============================================================================
+// 模型分组辅助:把扁平模型列表(形如 "provider/model-name")按 provider 分组
+// 用于 /models 卡片的 commandPalette groups 形态
+// ============================================================================
+
+/**
+ * 首字母大写(简单 capitalize)。"anthropic" → "Anthropic","openai" → "Openai"。
+ * 对已是混合大小写的 provider(如 "xAI")保持原样。
+ * @param {string} provider
+ * @returns {string}
+ */
+function providerDisplayName(provider) {
+  if (!provider) return '其他';
+  // 若已含大写字母(如 xAI / MistralAI),保留原样,避免把 xAI 改成 Xai
+  if (/[A-Z]/.test(provider)) return provider;
+  return provider.charAt(0).toUpperCase() + provider.slice(1);
+}
+
+/**
+ * 把 opencode session list 的 "Updated" 列文本解析成毫秒时间戳。
+ * 支持两种格式:
+ *   - "14:42"            → 今天的 HH:mm
+ *   - "17:00 · 2026/7/15" → 指定日期的 HH:mm(年/月/日,中间用 · 分隔)
+ * 解析失败返回 0。
+ * @param {string} text
+ * @returns {number}
+ */
+function parseSessionUpdated(text) {
+  if (!text || typeof text !== 'string') return 0;
+  const t = text.trim();
+  // 格式 2: "HH:mm · YYYY/M/D"
+  const m = t.match(/^(\d{1,2}):(\d{2})\s*[·•]\s*(\d{4})\/(\d{1,2})\/(\d{1,2})$/);
+  if (m) {
+    const d = new Date(Number(m[3]), Number(m[4]) - 1, Number(m[5]), Number(m[1]), Number(m[2]));
+    return d.getTime();
+  }
+  // 格式 1: "HH:mm"(今天)
+  const m2 = t.match(/^(\d{1,2}):(\d{2})$/);
+  if (m2) {
+    const now = new Date();
+    const d = new Date(now.getFullYear(), now.getMonth(), now.getDate(), Number(m2[1]), Number(m2[2]));
+    return d.getTime();
+  }
+  // 兜底:直接尝试 Date 解析(ISO 等)
+  const ts = Date.parse(t);
+  return Number.isNaN(ts) ? 0 : ts;
+}
+
+/**
+ * 取模型的展示名:去掉 provider 前缀。
+ *   "anthropic/claude-3.5" → "claude-3.5"
+ *   "no-slash-model"      → "no-slash-model"
+ * @param {string} model 完整模型串
+ * @returns {string}
+ */
+function prettyModelName(model) {
+  const idx = model.indexOf('/');
+  return idx > 0 ? model.slice(idx + 1) : model;
+}
+
+/**
+ * 把扁平模型列表按 provider 聚合成 commandPalette groups 形态。
+ * 保持原始顺序(Map 维持插入序);无 provider 前缀的归入"其他"。
+ *
+ * @param {string[]} models 完整模型串数组(如 ["anthropic/claude-3.5", "openai/gpt-4o"])
+ * @returns {Array<{label: string, collapsed: boolean, items: Array<{name: string, description: string}>}>}
+ */
+function _buildModelGroups(models) {
+  const buckets = new Map();
+  for (const m of models) {
+    const slashIdx = m.indexOf('/');
+    const provider = slashIdx > 0 ? m.slice(0, slashIdx) : '其他';
+    if (!buckets.has(provider)) buckets.set(provider, []);
+    buckets.get(provider).push(m);
+  }
+  const groups = [];
+  for (const [provider, list] of buckets) {
+    groups.push({
+      label: providerDisplayName(provider),
+      collapsed: false,
+      items: list.slice(0, 5).map((m) => ({
+        name: `use-model ${m}`,
+        description: prettyModelName(m),
+      })),
+    });
+  }
+  return groups;
+}
 
 class OpsAssistantSkill extends BaseSkill {
   constructor(options) {
@@ -54,9 +145,9 @@ class OpsAssistantSkill extends BaseSkill {
     // 用户会话列表缓存：userId -> Array<{id, title, updated}>
     this.userSessionLists = new Map();
 
-    // 持久化用户偏好文件路径
-    const homeDir = process.env.HOME || process.env.USERPROFILE || '.';
-    this._prefsPath = path.join(homeDir, '.claw-bridge', 'user-preferences.json');
+    // 持久化用户偏好文件路径：~/.claw-bridge/opencode-ass/user-preferences.json
+    migrateLegacyOpsConfig('[OpsAssistant]');
+    this._prefsPath = getOpsPrefsPath();
     try {
       if (fs.existsSync(this._prefsPath)) {
         const saved = JSON.parse(fs.readFileSync(this._prefsPath, 'utf8'));
@@ -245,7 +336,8 @@ class OpsAssistantSkill extends BaseSkill {
     try {
       // 1. 发送初始静态卡片(规范 CardModel,loading 占位)
       //    停止按钮发送 command.stop 触发后端取消
-      await this.sendCard(replyTarget, card(cardId, '运维助手', [
+      //    普通聊天卡片不显示标题(前端 header.title 为空时整块 header 不渲染)
+      await this.sendCard(replyTarget, card(cardId, '', [
         md('正在思考...'),
         buttons([
           btn('停止', action.command('stop'), { id: 'stop', variant: 'danger' }),
@@ -280,8 +372,8 @@ class OpsAssistantSkill extends BaseSkill {
     } catch (err) {
       this.log.error(`[OpsAssistant] Failed to handle message: ${err.message}`);
 
-      // 执行失败时发送错误卡片(规范 CardModel)
-      await this.sendCard(replyTarget, card(cardId, '运维助手', [
+      // 执行失败时发送错误卡片(普通聊天路径,无标题)
+      await this.sendCard(replyTarget, card(cardId, '', [
         md(`**执行失败**\n${err.message}`),
       ], { color: 'red' }), convType);
     }
@@ -352,9 +444,9 @@ class OpsAssistantSkill extends BaseSkill {
   async _sendFinalCard(ctx) {
     const { targetId, convType, senderUserId, cardId, fullContent } = ctx;
 
-    // 最终持久化卡片(规范 CardModel,card_id 复用, 回传 reasoning 供前端展示)
+    // 最终持久化卡片(普通聊天路径,无标题)
     try {
-      await this.sendCard(targetId, card(cardId, '运维助手', [
+      await this.sendCard(targetId, card(cardId, '', [
         md(fullContent || '(空回复)'),
       ], {
         color: 'blue',
@@ -378,7 +470,7 @@ class OpsAssistantSkill extends BaseSkill {
   async _sendErrorCard(ctx) {
     const { targetId, convType, senderUserId, cardId, error } = ctx;
     try {
-      await this.sendCard(targetId, card(cardId, '运维助手', [
+      await this.sendCard(targetId, card(cardId, '', [
         md(`**执行失败**\n${error}`),
       ], {
         color: 'red',
@@ -721,10 +813,18 @@ class OpsAssistantSkill extends BaseSkill {
   }
 
   /**
-   * 发送模型列表卡片(分批流式:首卡 50 个 + card_update 增量追加剩余)。
+   * 发送模型选择卡 —— 单卡 accordion 折叠面板(commandPalette groups)。
    *
-   * 用户共 337 个模型,融云单条 card_message ~7KB(50 项约 4.4KB 安全,337 项触发 code 20115)。
-   * 方案:首卡发前 50 个,剩余用 card_update 异步分批推送,前端累积追加到 commandPalette。
+   * 结构:
+   *  1. kv section 显示"当前模型"
+   *  2. commandPalette groups 形态:每个 provider 一个 group,items 是该 provider 的模型
+   *  3. note section 显示模型总数提示
+   *
+   * 每个 group item 的 name 为 `use-model <provider/model>`,
+   * 点击后由 dispatcher.handleCommand 走 command 通道 reinject `/use-model x`。
+   *
+   * 首卡发前 MAX_MODELS(20) 个,剩余通过 appendCommands 分批追加
+   * (扁平数组,前端会重新归并到对应 group)。
    */
   async _sendModelsPage(targetId, convType, senderUserId) {
     const allModels = this.userModelLists.get(senderUserId);
@@ -734,48 +834,24 @@ class OpsAssistantSkill extends BaseSkill {
       return;
     }
 
+    if (allModels.length === 0) {
+      await this.sendText(targetId, '未找到可用模型，请稍后重试 /models', convType);
+      return;
+    }
+
     const currentModel = this.userModels.get(senderUserId) || '';
 
-    const MAX_MODELS = 50;
-    const displayModels = allModels.slice(0, MAX_MODELS);
+    // 一次性发全部模型,不分批流式(避免前端 card_update 闪烁)。
+    // 体积超限时由 truncateCardPayload 自动截断 groups。
+    const groups = _buildModelGroups(allModels);
 
-    // 首卡说明:告知总数 + 正在加载。剩余批次后台异步推送,前端累积追加。
-    const total = allModels.length;
-    const loading = total > MAX_MODELS ? '，正在加载剩余…' : '';
-    const desc = `当前模型：${currentModel || '未选择'} | 默认: opencode | 共 ${total} 个模型（显示前 ${MAX_MODELS} 个${loading}）`;
-
-    const commands = displayModels.map((model) => ({ name: `use-model ${model}`, description: '' }));
-
-    /** @type {import('../../cardkit/schema').CardSection[]} */
-    const sections = [
-      note(desc),
-      divider(),
-      commandPalette({ commands, searchCommand: 'models-search' }),
-    ];
-
-    // 稳定 cardId:首卡与后续 card_update 共用,前端按 cardId 累积合并
     const cardId = `card-models-${senderUserId}-${Date.now()}`;
-    const cardData = card(
-      cardId,
-      `可用模型列表 (共 ${total} 个)`,
-      sections,
-      { color: 'blue', icon: '🤖' },
-    );
+    const cardData = card(cardId, '运维助手', [
+      kv([{ label: '当前模型', value: currentModel || '未设置' }]),
+      commandPalette({ groups }, { searchCommand: 'models-search' }),
+    ], { color: 'blue', icon: '☁️' });
 
     await this.sendCard(targetId, cardData, convType);
-
-    // 分批流式追加剩余模型(fire-and-forget,不阻塞)
-    this._streamRemainingBatches({
-      targetId,
-      convType,
-      cardId,
-      allItems: allModels,
-      batchSize: MAX_MODELS,
-      sleepMs: 300,
-      buildAppendData: (batch) => ({
-        appendCommands: batch.map((model) => ({ name: `use-model ${model}`, description: '' })),
-      }),
-    });
   }
 
   /**
@@ -896,7 +972,7 @@ class OpsAssistantSkill extends BaseSkill {
       // Session ID 必须是 ses_ 开头的 32 字符格式
       if (!/^ses_[a-zA-Z0-9]{20,}$/.test(sid)) continue;
       const title = parts[1] || '(无标题)';
-      const updated = parts[2] || '';
+      const updated = parseSessionUpdated(parts[2] || '');
       sessions.push({ id: sid, title, updated });
     }
 
@@ -913,10 +989,6 @@ class OpsAssistantSkill extends BaseSkill {
     const displaySessions = sessions.slice(0, MAX_SESSIONS);
 
     const currentSessionId = this.userSessions.get(senderUserId) || '';
-    const currentSession = currentSessionId
-      ? displaySessions.find((s) => s.id === currentSessionId)
-      : null;
-    const currentSessionTitle = currentSession ? currentSession.title : '';
 
     // sessionList session 对象字段为 {id, title, updatedAt?}(前端 SectionSessionList 读 updatedAt,
     // 并按 section.currentSessionId 高亮当前会话)。将缓存里的 updated → updatedAt。
@@ -926,13 +998,8 @@ class OpsAssistantSkill extends BaseSkill {
       ...(s.updated ? { updatedAt: s.updated } : {}),
     }));
 
-    const total = sessions.length;
-    const loading = total > MAX_SESSIONS ? `，正在加载剩余…` : '';
-
     /** @type {import('../../cardkit/schema').CardSection[]} */
     const sections = [
-      note(currentSessionTitle ? `当前会话：${currentSessionTitle}` : '未指定会话'),
-      divider(),
       sessionList({
         sessions: listSessions,
         searchCommand: 'session-search',
@@ -944,7 +1011,7 @@ class OpsAssistantSkill extends BaseSkill {
     const cardId = `card-sessions-${senderUserId}-${Date.now()}`;
     const cardData = card(
       cardId,
-      `会话列表 (共 ${total} 个，显示前 ${MAX_SESSIONS} 个${loading})`,
+      `会话列表`,
       sections,
       { color: 'blue', icon: '💬' },
     );

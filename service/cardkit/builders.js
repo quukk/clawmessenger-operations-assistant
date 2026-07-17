@@ -366,14 +366,41 @@ function sessionList(s) {
 
 /**
  * 构造命令面板段落。
- * @param {Object} opts
- * @param {Array<{name: string, description?: string}>} opts.commands
+ *
+ * 兼容三种调用形态:
+ *  - 扁平(旧,向后兼容):commandPalette({ commands: [{name,...}] })
+ *    也可直接传数组:commandPalette([{name,...}, ...])
+ *  - 分组(新):commandPalette({ groups: [{label, collapsed?, items: [{name,...}]}] })
+ *  - 混合(理论支持,但二选一渲染):{ commands?, groups? } —— 有 groups 时渲染器忽略 commands
+ *
+ * @param {Object|Array} optsOrCommands 命令面板配置对象,或扁平命令数组(旧调用兼容)
+ * @param {Object} [opts]
+ * @param {string} [opts.title] 段落标题(可选,某些渲染器用)
  * @param {string} [opts.searchCommand] 搜索命令名(不含 / 前缀),前端搜索框据此触发后端搜索
  * @returns {import('./schema').CommandPaletteSection}
  */
-function commandPalette(opts) {
-  const sec = { kind: 'commandPalette', commands: opts.commands };
-  if (opts.searchCommand !== undefined) sec.searchCommand = opts.searchCommand;
+function commandPalette(optsOrCommands, opts = {}) {
+  // 旧调用兼容:第一个参数是数组 → 视为扁平 commands
+  const config = Array.isArray(optsOrCommands)
+    ? { commands: optsOrCommands }
+    : optsOrCommands || {};
+
+  const sec = { kind: 'commandPalette' };
+
+  // title 来自 config 或 opts,可选
+  const title = config.title !== undefined ? config.title : opts.title;
+  if (title !== undefined) sec.title = title;
+
+  // commands / groups 二选一写入(均来自 config;旧调用经数组归一化后 commands 在 config)
+  if (config.commands !== undefined) sec.commands = config.commands;
+  if (config.groups !== undefined) sec.groups = config.groups;
+
+  // searchCommand 来自 config 或 opts,可选
+  const searchCommand = config.searchCommand !== undefined
+    ? config.searchCommand
+    : opts.searchCommand;
+  if (searchCommand !== undefined) sec.searchCommand = searchCommand;
+
   return sec;
 }
 
