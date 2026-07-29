@@ -1,6 +1,6 @@
 {
   "name": "claw-subagent-service",
-  "version": "1.2.0",
+  "version": "1.4.0",
   "description": "虾说运维助手",
   "main": "cli.js",
   "bin": {

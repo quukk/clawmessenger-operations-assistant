@@ -110,7 +110,7 @@ function _buildModelGroups(models) {
     groups.push({
       label: providerDisplayName(provider),
       collapsed: false,
-      items: list.slice(0, 5).map((m) => ({
+      items: list.slice(0, 10).map((m) => ({
         name: `use-model ${m}`,
         description: prettyModelName(m),
       })),
