@@ -23,10 +23,9 @@
 const { createLogger } = require('./logger');
 const {
   buildModelsCard,
-  buildModelCascadeCard,
   buildModelSwitchedCard,
 } = require('./cardkit/model-cards');
-const { card: buildCard, note, sessionList } = require('./cardkit/builders');
+const { card: buildCard, kv, note, commandPalette, sessionList } = require('./cardkit/builders');
 
 const log = createLogger('CardActionDispatcher');
 
@@ -315,7 +314,7 @@ async function handleSession(actionObj, context) {
 
 /**
  * 自定义动作:默认把 action.payload 作为新 prompt 发回对话。
- * 特殊 kind(list_models / switch_model)在本层直接处理,不再透传给会话。
+ * 特殊 kind(list_models / select_provider / switch_model)在本层直接处理,不再透传给会话。
  *
  * @returns {Promise<{success: boolean, confirmText: string}>}
  */
@@ -323,7 +322,7 @@ async function handleCustom(actionObj, context) {
   const { kind, payload } = actionObj;
   log.info(`custom 动作: kind=${kind}, chatId=${context.chatId}`);
 
-  if (kind === 'list_models') {
+  if (kind === 'list_models' || kind === 'select_provider') {
     return handleListModels(actionObj, context);
   }
 
@@ -403,21 +402,17 @@ async function handleListModels(actionObj, context) {
       if (providerFullModels.length === 0) {
         return { success: false, confirmText: `${providerId} 暂无可用模型` };
       }
-      const providerModels = providerFullModels.map((fullId) => {
-        const idx = fullId.indexOf('/');
-        const modelId = idx > 0 ? fullId.slice(idx + 1) : fullId;
-        return { id: modelId, name: modelId };
-      });
-
-      // 重建完整 provider 列表(供供应商 select 渲染 + 选中态切换)
-      const providers = extractProvidersFromFlat(allModels);
       const currentModel = await safeGetCurrentModel(context);
-
-      const card = buildModelCascadeCard(
-        providers, currentModel, providerId, providerModels, cardId,
+      const resultCard = await sendProviderModelsCard(
+        context,
+        cardId,
+        targetId,
+        conversationType,
+        providerId,
+        providerFullModels,
+        currentModel,
       );
-      await sendCardUpdatePayload(context, card, cardId, targetId, conversationType);
-      return { success: true, confirmText: '模型列表已更新' };
+      return { success: true, confirmText: '模型列表已更新', card: resultCard };
     } catch (err) {
       log.error(`list_models(缓存路径)处理失败: ${err.message}`);
       // 继续走 SDK 兜底
@@ -445,21 +440,55 @@ async function handleListModels(actionObj, context) {
       return { success: false, confirmText: `${p.name || p.id} 暂无可用模型` };
     }
 
-    // SDK 路径:用 allProviders 作为供应商 select 选项
-    const providers = allProviders.map((x) => ({
-      id: x.id,
-      name: x.name || x.id,
-      models: [],
-    }));
-    const card = buildModelCascadeCard(
-      providers, currentModel, providerId, providerModels, cardId,
+    const fullModels = providerModels.map((model) => `${providerId}/${model.id}`);
+    const resultCard = await sendProviderModelsCard(
+      context,
+      cardId,
+      targetId,
+      conversationType,
+      providerId,
+      fullModels,
+      currentModel,
     );
-    await sendCardUpdatePayload(context, card, cardId, targetId, conversationType);
-    return { success: true, confirmText: '模型列表已更新' };
+    return { success: true, confirmText: '模型列表已更新', card: resultCard };
   } catch (err) {
     log.error(`list_models 处理失败: ${err.message}`);
     return { success: false, confirmText: '加载模型列表失败' };
   }
+}
+
+/** 发送指定供应商的完整模型列表，超出单卡容量时继续追加。 */
+async function sendProviderModelsCard(
+  context,
+  cardId,
+  targetId,
+  conversationType,
+  providerId,
+  fullModels,
+  currentModel,
+) {
+  const BATCH_SIZE = 50;
+  const toCommand = (model) => ({
+    name: `use-model ${model}`,
+    description: model.includes('/') ? model.slice(model.indexOf('/') + 1) : model,
+  });
+  const buildModelsResultCard = (models) => buildCard(cardId, `${capitalizeProvider(providerId)} 模型`, [
+    kv([{ label: '当前模型', value: currentModel || '未设置' }]),
+    note(`供应商 ${providerId} · 共 ${fullModels.length} 个模型`),
+    commandPalette({ commands: models.map(toCommand) }),
+  ], { color: 'blue', icon: '🤖' });
+  const card = buildModelsResultCard(fullModels.slice(0, BATCH_SIZE));
+
+  await sendCardUpdatePayload(context, card, cardId, targetId, conversationType);
+  for (let index = BATCH_SIZE; index < fullModels.length; index += BATCH_SIZE) {
+    await sendCardAppendPayload(context, cardId, targetId, conversationType, {
+      appendCommands: fullModels.slice(index, index + BATCH_SIZE).map(toCommand),
+    });
+  }
+
+  // command_result 再携带完整卡片。部分已部署客户端收不到独立 card_update，
+  // 仍可通过这条操作回执一次性恢复完整模型列表。
+  return buildModelsResultCard(fullModels);
 }
 
 /**
@@ -575,7 +604,11 @@ async function handleSwitchModel(actionObj, context) {
       const card = buildModelSwitchedCard(`card-switch-model-${Date.now()}`, model);
       await sendCardPayload(context, card);
     }
-    return { success: true, confirmText: `已切换至 ${model}` };
+    return {
+      success: true,
+      confirmText: `已切换至 ${model}`,
+      ...(cardId && cardId !== '(unknown)' ? { card: buildModelSwitchedCard(cardId, model) } : {}),
+    };
   } catch (err) {
     log.error(`switch_model 处理失败: ${err.message}`);
     return { success: false, confirmText: '切换模型失败' };
@@ -636,6 +669,22 @@ async function sendCardUpdatePayload(context, card, cardId, targetId, conversati
     log.info(`sendCardUpdatePayload: cardId=${cardId}, mode=replace, 发送结果=${ok}`);
   } else {
     log.warn('sendCardUpdatePayload: 融云客户端未就绪，卡片未更新');
+  }
+}
+
+/** 发送 card_update append，用于补齐超出首批容量的模型。 */
+async function sendCardAppendPayload(context, cardId, targetId, conversationType, card) {
+  const payload = JSON.stringify({
+    msg_type: 'card_update',
+    cardId,
+    card,
+    mode: 'append',
+    timestamp: Date.now(),
+  });
+  if (context.rongcloudClient && context.rongcloudClient.isConnected) {
+    await context.rongcloudClient.sendMessage(targetId, payload, conversationType);
+  } else {
+    log.warn('sendCardAppendPayload: 融云客户端未就绪，卡片未追加');
   }
 }
 

@@ -814,17 +814,6 @@ class OpsAssistantSkill extends BaseSkill {
 
   /**
    * 发送模型选择卡 —— 单卡 accordion 折叠面板(commandPalette groups)。
-   *
-   * 结构:
-   *  1. kv section 显示"当前模型"
-   *  2. commandPalette groups 形态:每个 provider 一个 group,items 是该 provider 的模型
-   *  3. note section 显示模型总数提示
-   *
-   * 每个 group item 的 name 为 `use-model <provider/model>`,
-   * 点击后由 dispatcher.handleCommand 走 command 通道 reinject `/use-model x`。
-   *
-   * 首卡发前 MAX_MODELS(20) 个,剩余通过 appendCommands 分批追加
-   * (扁平数组,前端会重新归并到对应 group)。
    */
   async _sendModelsPage(targetId, convType, senderUserId) {
     const allModels = this.userModelLists.get(senderUserId);
@@ -841,8 +830,6 @@ class OpsAssistantSkill extends BaseSkill {
 
     const currentModel = this.userModels.get(senderUserId) || '';
 
-    // 一次性发全部模型,不分批流式(避免前端 card_update 闪烁)。
-    // 体积超限时由 truncateCardPayload 自动截断 groups。
     const groups = _buildModelGroups(allModels);
 
     const cardId = `card-models-${senderUserId}-${Date.now()}`;
