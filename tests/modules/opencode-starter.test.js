@@ -38,8 +38,9 @@ describe('Opencode Starter Module', () => {
 
     const promise = startOpencodeService(mockLog);
     await jest.advanceTimersByTimeAsync(100);
-    await promise;
+    const result = await promise;
 
+    expect(result).toBe(true);
     expect(mockLog.info).toHaveBeenCalledWith('[OPENCODE] 服务已在运行 (port 4096)');
   });
 
@@ -69,9 +70,12 @@ describe('Opencode Starter Module', () => {
 
     const promise = startOpencodeService(mockLog);
     await jest.advanceTimersByTimeAsync(100);
-    await promise;
+    const result = await promise;
 
-    expect(mockLog.error).toHaveBeenCalledWith('[OPENCODE] 自动安装失败');
+    expect(result).toBe(false);
+    expect(mockLog.error).toHaveBeenCalledWith(
+      '[OPENCODE] 自动安装失败，请手动运行: npm install -g opencode-ai@latest'
+    );
   });
 
   test('installs and starts opencode when not installed', async () => {
@@ -85,9 +89,9 @@ describe('Opencode Starter Module', () => {
         setTimeout: jest.fn(),
         once: jest.fn((event, handler) => {
           // Trigger handler immediately
-          if (currentSocket <= 2 && event === 'error') {
+          if (currentSocket === 1 && event === 'error') {
             handler(new Error('Connection refused'));
-          } else if (currentSocket === 3 && event === 'connect') {
+          } else if (currentSocket === 2 && event === 'connect') {
             handler();
           }
         }),
@@ -115,11 +119,10 @@ describe('Opencode Starter Module', () => {
 
     const promise = startOpencodeService(mockLog);
     
-    // Run all timers
-    jest.runAllTimers();
-    
-    await promise;
+    await jest.runAllTimersAsync();
+    const result = await promise;
 
+    expect(result).toBe(true);
     expect(mockLog.info).toHaveBeenCalledWith('[OPENCODE] 服务启动成功');
   }, 15000);
 });
