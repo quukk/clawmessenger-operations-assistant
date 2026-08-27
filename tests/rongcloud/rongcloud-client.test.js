@@ -1,10 +1,11 @@
-// Mock RongIMLib before importing the module
 jest.mock('@rongcloud/imlib-next', () => ({
   default: {
     init: jest.fn(),
     connect: jest.fn(),
-    sendTextMessage: jest.fn(),
+    sendMessage: jest.fn(),
+    TextMessage: jest.fn((content) => content),
     disconnect: jest.fn(),
+    registerMessageType: jest.fn(),
     addEventListener: jest.fn(),
     Events: {
       MESSAGES: 'MESSAGES',
@@ -20,347 +21,176 @@ jest.mock('@rongcloud/imlib-next', () => ({
 
 const { RongCloudClient } = require('../../service/rongcloud/rongcloud-client');
 const RongIMLibModule = require('@rongcloud/imlib-next');
-const RongIMLib = RongIMLibModule.default || RongIMLibLibModule;
-
-// Mock dependencies
-jest.mock('../../service/modules/mac-address', () => ({
-  getMacAddress: jest.fn(() => 'aabbccddeeff')
-}));
-
-jest.mock('../../service/modules/auth', () => ({
-  generateSecret: jest.fn((mac, secretKey) => `secret_${mac}_${secretKey}`)
-}));
+const RongIMLib = RongIMLibModule.default || RongIMLibModule;
 
 describe('RongCloudClient', () => {
   let client;
   let mockLog;
   let mockHandler;
-  let mockSendTextMessage;
 
   beforeEach(() => {
     jest.clearAllMocks();
-    mockSendTextMessage = RongIMLib.sendTextMessage;
     mockLog = {
+      debug: jest.fn(),
       info: jest.fn(),
       error: jest.fn(),
       warn: jest.fn()
     };
     mockHandler = {
-      handleMessage: jest.fn(),
-      handleStructuredMessage: jest.fn()
+      handleMessage: jest.fn().mockResolvedValue(undefined)
     };
     client = new RongCloudClient({
       appKey: 'test_app_key',
       token: 'test_token',
-      accountId: 'test_account',
-      secretKey: 'test_secret_key'
+      accountId: 'test_account'
     }, mockLog);
   });
 
-  describe('sendStructuredMessage', () => {
-    test('should return false when not connected', async () => {
-      client.isConnected = false;
-      const result = await client.sendStructuredMessage('test_type', { data: 'test' });
+  describe('sendMessage', () => {
+    test('returns false without calling the SDK when disconnected', async () => {
+      const result = await client.sendMessage('user1', 'hello', 1);
+
       expect(result).toBe(false);
       expect(mockLog.error).toHaveBeenCalledWith('[RongCloudClient] 未连接，无法发送消息');
+      expect(RongIMLib.sendMessage).not.toHaveBeenCalled();
     });
 
-    test('should send structured message successfully', async () => {
+    test('sends a private text message and remembers its message id', async () => {
       client.isConnected = true;
-      mockSendTextMessage.mockResolvedValue({ code: 0 });
+      RongIMLib.sendMessage.mockResolvedValue({ code: 200, data: { messageUId: 'sent-1' } });
 
-      const result = await client.sendStructuredMessage('test_type', { data: 'test' }, 'req_123');
+      const result = await client.sendMessage('user1', 'hello', 1);
 
       expect(result).toBe(true);
-      expect(mockSendTextMessage).toHaveBeenCalledWith(
-        {
-          conversationType: 1,
-          targetId: 'guardserver'
-        },
-        {
-          content: expect.stringContaining('"msg_type":"test_type"')
-        }
+      expect(RongIMLib.TextMessage).toHaveBeenCalledWith({ content: 'hello' });
+      expect(RongIMLib.sendMessage).toHaveBeenCalledWith(
+        { conversationType: 1, targetId: 'user1' },
+        { content: 'hello' }
       );
-
-      const sentContent = JSON.parse(mockSendTextMessage.mock.calls[0][1].content);
-      expect(sentContent).toMatchObject({
-        msg_type: 'test_type',
-        source_im_id: 'test_account',
-        destination_im_id: 'guardserver',
-        mac: 'aabbccddeeff',
-        secret: 'secret_aabbccddeeff_test_secret_key',
-        content: '{"data":"test"}',
-        request_id: 'req_123'
-      });
-      expect(sentContent.timestamp).toBeDefined();
+      expect(client.sentMessageUIds.has('sent-1')).toBe(true);
     });
 
-    test('should send structured message without requestId', async () => {
+    test('serializes an unregistered structured group message as text', async () => {
       client.isConnected = true;
-      mockSendTextMessage.mockResolvedValue({ code: 200 });
+      RongIMLib.sendMessage.mockResolvedValue({ code: 0, data: {} });
+      const content = { msg_type: 'custom_event', data: 'test' };
 
-      const result = await client.sendStructuredMessage('test_type', { data: 'test' });
+      const result = await client.sendMessage('group1', content, 3);
 
       expect(result).toBe(true);
-      const sentContent = JSON.parse(mockSendTextMessage.mock.calls[0][1].content);
-      expect(sentContent.request_id).toBe('');
+      expect(RongIMLib.sendMessage).toHaveBeenCalledWith(
+        { conversationType: 3, targetId: 'group1' },
+        { content: JSON.stringify(content) }
+      );
     });
 
-    test('should return false when send fails', async () => {
+    test('returns false when the SDK rejects the message', async () => {
       client.isConnected = true;
-      mockSendTextMessage.mockResolvedValue({ code: 500 });
+      RongIMLib.sendMessage.mockResolvedValue({ code: 500, data: {} });
 
-      const result = await client.sendStructuredMessage('test_type', { data: 'test' });
-
-      expect(result).toBe(false);
+      await expect(client.sendMessage('user1', 'hello', 1)).resolves.toBe(false);
+      expect(mockLog.error).toHaveBeenCalledWith('[RongCloudClient] 发送失败, code: 500');
     });
 
-    test('should return false on exception', async () => {
+    test('returns false when the SDK throws', async () => {
       client.isConnected = true;
-      mockSendTextMessage.mockRejectedValue(new Error('Network error'));
+      RongIMLib.sendMessage.mockRejectedValue(new Error('Network error'));
 
-      const result = await client.sendStructuredMessage('test_type', { data: 'test' });
-
-      expect(result).toBe(false);
+      await expect(client.sendMessage('user1', 'hello', 1)).resolves.toBe(false);
       expect(mockLog.error).toHaveBeenCalledWith('[RongCloudClient] 发送异常: Network error');
     });
   });
 
-  describe('processStructuredMessage', () => {
-    test('should process valid structured message', async () => {
-      client.handler = mockHandler;
-      const message = {
-        content: {
-          content: JSON.stringify({
-            msg_type: 'custom_type',
-            source_im_id: 'user1',
-            destination_im_id: 'guardserver',
-            mac: '112233445566',
-            secret: 'test_secret',
-            content: '{"key":"value"}',
-            request_id: 'req_456',
-            timestamp: 1234567890
-          })
-        },
-        senderUserId: 'user1',
-        targetId: 'guardserver',
-        conversationType: 1,
-        messageUId: 'msg_123',
-        sentTime: 1234567890000
-      };
-
-      const result = client.processStructuredMessage(message);
-      expect(result).toBe(true);
-
-      // Wait for async processing
-      await new Promise(resolve => setTimeout(resolve, 10));
-
-      expect(mockHandler.handleStructuredMessage).toHaveBeenCalledWith(
-        expect.objectContaining({
-          msgType: 'custom_type',
-          sourceImId: 'user1',
-          destinationImId: 'guardserver',
-          mac: '112233445566',
-          secret: 'test_secret',
-          content: '{"key":"value"}',
-          requestId: 'req_456',
-          timestamp: 1234567890,
-          senderUserId: 'user1',
-          targetId: 'guardserver',
-          conversationType: 1,
-          messageUId: 'msg_123',
-          sentTime: 1234567890000
-        })
-      );
-    });
-
-    test('should return false for invalid JSON', () => {
-      const message = {
-        content: {
-          content: 'invalid json'
-        }
-      };
-
-      const result = client.processStructuredMessage(message);
-      expect(result).toBe(false);
-      expect(mockLog.warn).toHaveBeenCalledWith('[RongCloudClient] 无法解析结构化消息');
-    });
-
-    test('should return false for missing msg_type', () => {
-      const message = {
-        content: {
-          content: JSON.stringify({ data: 'no msg_type' })
-        }
-      };
-
-      const result = client.processStructuredMessage(message);
-      expect(result).toBe(false);
-      expect(mockLog.warn).toHaveBeenCalledWith('[RongCloudClient] 消息缺少 msg_type 字段');
-    });
-
-    test('should warn when handler does not support structured messages', async () => {
-      client.handler = { handleMessage: jest.fn() }; // No handleStructuredMessage
-      const message = {
-        content: {
-          content: JSON.stringify({ msg_type: 'test' })
-        }
-      };
-
-      const result = client.processStructuredMessage(message);
-      expect(result).toBe(true);
-
-      await new Promise(resolve => setTimeout(resolve, 10));
-      expect(mockLog.warn).toHaveBeenCalledWith('[RongCloudClient] 处理器未设置或不支持结构化消息');
-    });
-
-    test('should use default values for missing fields', async () => {
-      client.handler = mockHandler;
-      const message = {
-        content: {
-          content: JSON.stringify({ msg_type: 'minimal' })
-        }
-      };
-
-      client.processStructuredMessage(message);
-      await new Promise(resolve => setTimeout(resolve, 10));
-
-      expect(mockHandler.handleStructuredMessage).toHaveBeenCalledWith(
-        expect.objectContaining({
-          msgType: 'minimal',
-          sourceImId: 'unknown',
-          destinationImId: 'guardserver',
-          mac: '',
-          secret: '',
-          content: '',
-          requestId: '',
-          senderUserId: 'unknown',
-          targetId: 'guardserver',
-          conversationType: 1
-        })
-      );
-    });
-  });
-
   describe('handleReceivedMessage', () => {
-    test('should route structured messages to processStructuredMessage', () => {
+    test('routes structured content through the common handler', () => {
       client.handler = mockHandler;
-      const processSpy = jest.spyOn(client, 'processStructuredMessage').mockReturnValue(true);
-
-      const message = {
-        messageType: 'RC:TxtMsg',
-        senderUserId: 'user1',
-        content: {
-          content: JSON.stringify({
-            msg_type: 'custom_event',
-            source_im_id: 'other_user'
-          })
-        }
+      const content = {
+        msg_type: 'custom_event',
+        source_im_id: 'origin-user',
+        payload: { key: 'value' }
       };
 
-      client.handleReceivedMessage(message);
+      client.handleReceivedMessage({
+        messageType: 'command',
+        senderUserId: 'relay-user',
+        targetId: 'test_account',
+        conversationType: 1,
+        content,
+        messageUId: 'msg-1',
+        sentTime: 1234567890000
+      });
 
-      expect(processSpy).toHaveBeenCalledWith(message);
-      expect(mockHandler.handleMessage).not.toHaveBeenCalled();
-
-      processSpy.mockRestore();
+      expect(mockHandler.handleMessage).toHaveBeenCalledWith(expect.objectContaining({
+        senderUserId: 'origin-user',
+        targetId: 'test_account',
+        conversationType: 1,
+        content: JSON.stringify(content),
+        messageType: 'command',
+        messageUId: 'msg-1',
+        sentTime: 1234567890000
+      }));
     });
 
-    test('should ignore system message types', () => {
+    test('ignores messages sent by this account', () => {
       client.handler = mockHandler;
-      const processSpy = jest.spyOn(client, 'processStructuredMessage');
 
-      const message = {
-        messageType: 'RC:TxtMsg',
-        senderUserId: 'server',
-        content: {
-          content: JSON.stringify({
-            msg_type: 'command',
-            source_im_id: 'server'
-          })
-        }
-      };
-
-      client.handleReceivedMessage(message);
-
-      expect(processSpy).not.toHaveBeenCalled();
-      expect(mockHandler.handleMessage).not.toHaveBeenCalled();
-
-      processSpy.mockRestore();
-    });
-
-    test('should ignore messages from self', () => {
-      client.handler = mockHandler;
-      const processSpy = jest.spyOn(client, 'processStructuredMessage');
-
-      const message = {
+      client.handleReceivedMessage({
         messageType: 'RC:TxtMsg',
         senderUserId: 'test_account',
-        content: {
-          content: JSON.stringify({
-            msg_type: 'custom_event',
-            source_im_id: 'test_account'
-          })
-        }
-      };
+        content: { content: 'hello' }
+      });
 
-      client.handleReceivedMessage(message);
-
-      expect(processSpy).not.toHaveBeenCalled();
       expect(mockHandler.handleMessage).not.toHaveBeenCalled();
-
-      processSpy.mockRestore();
     });
 
-    test('should handle plain text messages', async () => {
+    test('ignores structured messages sourced from this account', () => {
       client.handler = mockHandler;
-      const message = {
+
+      client.handleReceivedMessage({
+        messageType: 'command',
+        senderUserId: 'relay-user',
+        content: { msg_type: 'custom_event', source_im_id: 'test_account' }
+      });
+
+      expect(mockHandler.handleMessage).not.toHaveBeenCalled();
+    });
+
+    test('passes plain-text metadata to the common handler', () => {
+      client.handler = mockHandler;
+
+      client.handleReceivedMessage({
         messageType: 'RC:TxtMsg',
         senderUserId: 'user1',
         targetId: 'user2',
         conversationType: 1,
-        content: {
-          content: 'Hello world'
-        },
-        messageUId: 'msg_123',
+        content: { content: 'Hello world' },
+        messageUId: 'msg-2',
         sentTime: 1234567890000
-      };
+      });
 
-      client.handleReceivedMessage(message);
-
-      await new Promise(resolve => setTimeout(resolve, 10));
-
-      expect(mockHandler.handleMessage).toHaveBeenCalledWith(
-        expect.objectContaining({
-          senderUserId: 'user1',
-          targetId: 'user2',
-          conversationType: 1,
-          content: 'Hello world',
-          messageType: 'RC:TxtMsg',
-          messageUId: 'msg_123',
-          sentTime: 1234567890000
-        })
-      );
+      expect(mockHandler.handleMessage).toHaveBeenCalledWith(expect.objectContaining({
+        senderUserId: 'user1',
+        targetId: 'user2',
+        conversationType: 1,
+        content: 'Hello world',
+        messageType: 'RC:TxtMsg',
+        messageUId: 'msg-2',
+        sentTime: 1234567890000
+      }));
     });
 
-    test('should handle JSON content without msg_type', async () => {
+    test('extracts text from JSON without a message type', () => {
       client.handler = mockHandler;
-      const message = {
+
+      client.handleReceivedMessage({
         messageType: 'RC:TxtMsg',
         senderUserId: 'user1',
-        content: {
-          content: JSON.stringify({ text: 'Hello from JSON' })
-        }
-      };
+        content: { content: JSON.stringify({ text: 'Hello from JSON' }) }
+      });
 
-      client.handleReceivedMessage(message);
-
-      await new Promise(resolve => setTimeout(resolve, 10));
-
-      expect(mockHandler.handleMessage).toHaveBeenCalledWith(
-        expect.objectContaining({
-          content: 'Hello from JSON'
-        })
-      );
+      expect(mockHandler.handleMessage).toHaveBeenCalledWith(expect.objectContaining({
+        content: 'Hello from JSON'
+      }));
     });
   });
 });

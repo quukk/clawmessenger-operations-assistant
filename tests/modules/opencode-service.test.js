@@ -12,11 +12,6 @@ jest.mock('axios');
 describe('Opencode Service Module', () => {
   beforeEach(() => {
     jest.resetAllMocks();
-    jest.useFakeTimers();
-  });
-
-  afterEach(() => {
-    jest.useRealTimers();
   });
 
   describe('createOpencodeSession', () => {
@@ -65,20 +60,20 @@ describe('Opencode Service Module', () => {
   });
 
   describe('getOrCreateGatewaySession', () => {
-    test('returns first existing session id', async () => {
+    test('returns a validated fallback session id', async () => {
       axios.get.mockResolvedValue({
-        data: [{ id: 'existing-session', title: 'Chat' }]
+        status: 200,
+        data: { id: 'fallback', title: 'Chat' }
       });
 
       const result = await getOrCreateGatewaySession('fallback');
 
-      expect(result).toBe('existing-session');
+      expect(result).toBe('fallback');
     });
 
-    test('returns session_id if id not present', async () => {
-      axios.get.mockResolvedValue({
-        data: [{ session_id: 'sess-456' }]
-      });
+    test('returns session_id from a newly created session', async () => {
+      axios.get.mockResolvedValue({ status: 404 });
+      axios.post.mockResolvedValue({ data: { session_id: 'sess-456' } });
 
       const result = await getOrCreateGatewaySession('fallback');
 
@@ -86,32 +81,31 @@ describe('Opencode Service Module', () => {
     });
 
     test('creates new session when none exist', async () => {
-      axios.get.mockResolvedValue({ data: [] });
+      axios.get.mockResolvedValue({ status: 404 });
       axios.post.mockResolvedValue({ data: { id: 'new-session' } });
 
       const result = await getOrCreateGatewaySession('fallback');
 
       expect(axios.post).toHaveBeenCalledWith(
-        'http://127.0.0.1:4096/api/sessions',
+        'http://127.0.0.1:4096/session',
         { title: 'Chat session' },
         { headers: { 'Content-Type': 'application/json' }, timeout: 5000 }
       );
       expect(result).toBe('new-session');
     });
 
-    test('returns fallback on complete failure', async () => {
+    test('throws when fallback validation and session creation fail', async () => {
       axios.get.mockRejectedValue(new Error('Network error'));
       axios.post.mockRejectedValue(new Error('Network error'));
 
-      const result = await getOrCreateGatewaySession('fallback-id');
-
-      expect(result).toBe('fallback-id');
+      await expect(getOrCreateGatewaySession('fallback-id'))
+        .rejects.toThrow('无法获取或创建有效的 session ID');
     });
   });
 
   describe('forwardChatMessage', () => {
     test('extracts text from top-level field and streams chunks', async () => {
-      axios.get.mockResolvedValue({ data: [] });
+      axios.get.mockResolvedValue({ status: 200, data: {} });
       axios.post.mockResolvedValue({
         data: { text: 'Hello world this is a test message' },
         status: 200
@@ -130,7 +124,7 @@ describe('Opencode Service Module', () => {
     });
 
     test('extracts text from parts array', async () => {
-      axios.get.mockResolvedValue({ data: [] });
+      axios.get.mockResolvedValue({ status: 200, data: {} });
       axios.post.mockResolvedValue({
         data: {
           parts: [
@@ -152,7 +146,7 @@ describe('Opencode Service Module', () => {
     });
 
     test('extracts text from info object', async () => {
-      axios.get.mockResolvedValue({ data: [] });
+      axios.get.mockResolvedValue({ status: 200, data: {} });
       axios.post.mockResolvedValue({
         data: {
           info: { text: 'Info text content' }
@@ -168,7 +162,7 @@ describe('Opencode Service Module', () => {
     });
 
     test('simulates streaming with 50-char chunks', async () => {
-      axios.get.mockResolvedValue({ data: [] });
+      axios.get.mockResolvedValue({ status: 200, data: {} });
       const longText = 'A'.repeat(120);
       axios.post.mockResolvedValue({
         data: { text: longText },
@@ -180,12 +174,7 @@ describe('Opencode Service Module', () => {
         deltas.push(chunk);
       });
 
-      const promise = forwardChatMessage('sess-1', 'Hi', onDelta);
-      
-      // Fast-forward all timers to resolve setTimeout promises
-      await jest.runAllTimersAsync();
-      
-      const result = await promise;
+      const result = await forwardChatMessage('sess-1', 'Hi', onDelta);
 
       expect(result).toBe(longText);
       expect(deltas.length).toBe(3);
@@ -194,8 +183,8 @@ describe('Opencode Service Module', () => {
       expect(deltas[2]).toBe('A'.repeat(20));
     });
 
-    test('throws error when no content found', async () => {
-      axios.get.mockResolvedValue({ data: [] });
+    test('returns the pending response when no content is available', async () => {
+      axios.get.mockResolvedValue({ status: 200, data: {} });
       axios.post.mockResolvedValue({
         data: { parts: [] },
         status: 200
@@ -203,11 +192,13 @@ describe('Opencode Service Module', () => {
 
       const onDelta = jest.fn();
 
-      await expect(forwardChatMessage('sess-1', 'Hi', onDelta)).rejects.toThrow('Gateway 返回空内容');
+      await expect(forwardChatMessage('sess-1', 'Hi', onDelta))
+        .resolves.toBe('消息已发送，正在处理中...');
+      expect(onDelta).toHaveBeenCalledWith('消息已发送，正在处理中...');
     });
 
     test('uses custom timeout', async () => {
-      axios.get.mockResolvedValue({ data: [] });
+      axios.get.mockResolvedValue({ status: 200, data: {} });
       axios.post.mockResolvedValue({
         data: { text: 'Quick response' },
         status: 200
@@ -225,7 +216,7 @@ describe('Opencode Service Module', () => {
     });
 
     test('calls logFn when provided', async () => {
-      axios.get.mockResolvedValue({ data: [] });
+      axios.get.mockResolvedValue({ status: 200, data: {} });
       axios.post.mockResolvedValue({
         data: { text: 'Test' },
         status: 200
