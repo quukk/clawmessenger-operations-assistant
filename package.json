@@ -7,6 +7,7 @@
     "claw-subagent-service": "cli.js"
   },
   "scripts": {
+    "test": "jest --runInBand --silent --roots tests --runTestsByPath tests/modules/auth.test.js tests/modules/config.test.js tests/modules/opencode-service.test.js tests/modules/opencode-starter.test.js tests/rongcloud/message-handler.test.js tests/rongcloud/message-types.test.js tests/rongcloud/rongcloud-client.test.js && node --test tests/opencode/event-handler.test.js tests/opencode/opencode-runner.test.js tests/skills/skill-loader.test.js tests/skills/skill-router.test.js tests/modules/device-registration.test.js tests/modules/mac-address.test.js tests/package-metadata.test.js",
     "postinstall": "node scripts/post-install.js",
     "preuninstall": "node scripts/pre-uninstall.js",
     "install-service": "node scripts/install-silent.js",
@@ -32,14 +33,17 @@
   "dependencies": {
     "@opencode-ai/sdk": "^1.17.13",
     "@rongcloud/imlib-next": "^5.36.6",
-    "axios": "^1.15.2",
+    "axios": "^1.20.0",
     "fake-indexeddb": "^6.2.5",
     "jsdom": "^24.0.0",
     "node-windows": "^1.0.0-beta.8",
-    "ws": "^8.16.0"
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
   },
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=18.0.0"
   },
   "license": "MIT"
 }
